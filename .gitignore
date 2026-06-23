@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# Node / Next.js
+node_modules/
+.next/
+*.tsbuildinfo
+
+# Docker
+.env
+
+# Sensitive credentials
+xianyu_cookie.json
+*.cookie.json
+
+# Temp files
+_temp_*
+
+# OS
+.DS_Store
+Thumbs.db
