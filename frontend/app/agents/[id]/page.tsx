@@ -1,177 +1,358 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { useParams } from 'next/navigation';
+import { T, S, inputField, labelField, btnPrimary } from '@/app/theme';
+import { PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Wrench, Brain, ChevronDown, ChevronRight } from 'lucide-react';
+import McpToolBinding from '../_components/McpToolBinding';
 
-const AGENTS: Record<string, { name: string; desc: string }> = {
-  '1': { name: '客服 Agent 1.1', desc: '通用客服机器人' },
-  '2': { name: '售后专家 Agent', desc: '专注售后服务场景' },
-  '3': { name: '物流助手 Agent', desc: '查询快递状态' },
+const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const TENANT_ID = 1;
+
+const MODEL_BASE_URLS: Record<string, string> = {
+  'deepseek-chat': 'https://api.deepseek.com',
+  'deepseek-reasoner': 'https://api.deepseek.com',
+  'deepseek-v4-pro': 'https://api.deepseek.com',
+  'gpt-5.5': 'https://api.openai.com',
+  'gpt-5.4': 'https://api.openai.com',
+  'gpt-5.4-mini': 'https://api.openai.com',
+  'gpt-4o': 'https://api.openai.com',
 };
 
-interface ChatMsg {
-  role: 'user' | 'agent';
-  content: string;
+const AGENT_DEFAULTS: Record<string, { model: string; base_url: string }> = {
+  faqagent:     { model: 'deepseek-chat', base_url: 'https://api.deepseek.com' },
+  order_agent:  { model: 'deepseek-chat', base_url: 'https://api.deepseek.com' },
+  ticket_agent: { model: 'deepseek-chat', base_url: 'https://api.deepseek.com' },
+  supervisor:   { model: 'deepseek-chat', base_url: 'https://api.deepseek.com' },
+};
+
+function getVisitorId(agentKey: string): string {
+  if (typeof window === 'undefined') return '';
+  const key = `visitor_${agentKey}`;
+  let id = localStorage.getItem(key);
+  if (!id) { id = crypto.randomUUID(); localStorage.setItem(key, id); }
+  return id;
 }
+
+function getSavedConversationId(agentKey: string): number | null {
+  if (typeof window === 'undefined') return null;
+  const saved = sessionStorage.getItem(`conv_${agentKey}`);
+  return saved ? parseInt(saved) : null;
+}
+
+interface TraceStep {
+  step: number; type: 'llm' | 'tool'; content?: string;
+  tool?: string; args?: Record<string,any>; output?: any;
+  latency_ms?: number;
+}
+interface ChatMsg {
+  role: 'user' | 'agent'; content: string; time: string;
+  trace?: { tier: string; total_ms: number; steps?: TraceStep[] };
+}
+
+const DEFAULT_CONFIG = { system_prompt: '', fallback_reply: '', api_key: '', base_url: '', model: '', max_steps: 5 };
 
 export default function AgentDetailPage() {
   const { id } = useParams<{ id: string }>();
-  const agent = AGENTS[id] || { name: '未知 Agent', desc: '' };
+  const agentKey = id as string;
 
-  const [systemPrompt, setSystemPrompt] = useState(
-    '你是一个专业的客服助手，请用友好、耐心的语气回答用户的问题。',
-  );
-  const [model, setModel] = useState('deepseek-v4-pro');
-  const [temperature, setTemperature] = useState(0.7);
-
+  const [agentName, setAgentName] = useState('');
+  const [agentDesc, setAgentDesc] = useState('');
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [trace, setTrace] = useState<ChatMsg['trace'] | null>(null);
+  const [conversationId, setConversationId] = useState<number | null>(getSavedConversationId(agentKey));
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
+  useEffect(() => {
+    if (sessionStorage.getItem(`conv_${agentKey}`)) setLoadingHistory(true);
+  }, [agentKey]);
+
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const [config, setConfig] = useState(DEFAULT_CONFIG);
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState('');
+  const [leftOpen, setLeftOpen] = useState(true);
+  const [rightOpen, setRightOpen] = useState(true);
+  const [expandedSteps, setExpandedSteps] = useState<Record<number, boolean>>({});
+  const VISITOR_ID = getVisitorId(agentKey);
+
+  useEffect(() => {
+    fetch(`${API}/api/agents/${agentKey}/config`).then(r => r.json()).then(d => {
+      if (d.config) {
+        const def = AGENT_DEFAULTS[agentKey];
+        setConfig({
+          system_prompt: d.config.system_prompt ?? '',
+          fallback_reply: d.config.fallback_reply ?? '',
+          api_key: d.config.api_key ?? '',
+          base_url: d.config.base_url || def?.base_url || '',
+          model: d.config.model || def?.model || '',
+          max_steps: d.config.max_steps ?? 5,
+        });
+      }
+    }).catch(() => {});
+  }, [agentKey]);
+
+  useEffect(() => {
+    // Load agent info from list
+    fetch(`${API}/api/agents`).then(r => r.json()).then(list => {
+      const a = (list as any[]).find((x: any) => x.key === agentKey);
+      if (a) { setAgentName(a.name); setAgentDesc(a.desc); }
+    }).catch(() => {});
+  }, [agentKey]);
+
+  useEffect(() => {
+    if (!conversationId) { setLoadingHistory(false); return; }
+    fetch(`${API}/api/chat/conversations/${conversationId}/messages`, { headers: { 'X-Tenant-ID': String(TENANT_ID) } })
+      .then(r => r.json()).then(data => {
+        const items = data.items || [];
+        if (items.length > 0) {
+          const msgs: ChatMsg[] = [];
+          for (const m of items) {
+            const time = m.created_at ? new Date(m.created_at).toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' }) : '';
+            const meta = m.metadata || {};
+            if (m.role === 'agent') msgs.push({ role:'agent', content:m.content, time, trace: meta.trace || undefined });
+            else if (m.role === 'customer') msgs.push({ role:'user', content:m.content, time });
+          }
+          setMessages(msgs);
+        }
+      }).catch(() => {}).finally(() => setLoadingHistory(false));
+  }, [conversationId]);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth' }); }, [messages]);
+
+  async function handleSaveConfig() {
+    setSaving(true); setSaveMsg('');
+    try {
+      const r = await fetch(`${API}/api/agents/${agentKey}/config`, { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config) });
+      setSaveMsg(r.ok ? '保存成功' : '保存失败');
+    } catch { setSaveMsg('保存失败'); }
+    finally { setSaving(false); }
+  }
+
+  function handleNewChat() { setMessages([]); setConversationId(null); setTrace(null); sessionStorage.removeItem(`conv_${agentKey}`); }
 
   async function handleSend() {
     if (!input.trim() || sending) return;
-    const userMsg: ChatMsg = { role: 'user', content: input };
-    setMessages(prev => [...prev, userMsg]);
-    setInput('');
-    setSending(true);
-
-    setTimeout(() => {
-      setMessages(prev => [...prev, { role: 'agent', content: `你好！我是 ${agent.name}，正在建设中。你的问题：${input}` }]);
-      setSending(false);
-    }, 800);
+    const now = new Date().toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' });
+    setMessages(prev => [...prev, { role:'user', content:input, time:now }]);
+    setInput(''); setSending(true);
+    try {
+      const body: any = { question: input, visitor_id: VISITOR_ID };
+      if (conversationId) body.conversation_id = conversationId;
+      const r = await fetch(`${API}/api/agents/${agentKey}/chat`, { method:'POST', headers:{'Content-Type':'application/json','X-Tenant-ID':String(TENANT_ID)}, body:JSON.stringify(body) });
+      const data = await r.json();
+      if (data.conversation_id && !conversationId) { setConversationId(data.conversation_id); sessionStorage.setItem(`conv_${agentKey}`, String(data.conversation_id)); }
+      const tr = data.trace ? { tier: data.tier, total_ms: data.trace.total_ms, steps: data.trace.steps } : undefined;
+      setMessages(prev => [...prev, { role:'agent', content:data.answer||'抱歉，暂时无法处理。', time:new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}), trace: tr }]);
+      setTrace(tr || null);
+    } catch {
+      setMessages(prev => [...prev, { role:'agent', content:'请求失败，请稍后重试。', time:new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}) }]);
+    } finally { setSending(false); }
   }
 
+  const preSmall: React.CSSProperties = { margin:0, padding:'6px 8px', background:T.bg, borderRadius:4, fontSize:11, fontFamily:'monospace', color:T.text, lineHeight:1.5, overflow:'auto', maxHeight:200, whiteSpace:'pre-wrap', wordBreak:'break-all' };
+
+  const tierLabel = (tier: string) => tier==='llm'?'AI 回答':tier==='fallback'?'兜底回复':tier;
+  const tierColor = (tier: string) => tier==='llm'?T.accent:tier==='fallback'?T.warning:T.success;
+  const tierBg = (tier: string) => tier==='llm'?T.accentBg:'#FFF7E6';
+
   return (
-    <div style={{ display: 'flex', height: '100vh' }}>
-      {/* 左侧设计面板 */}
+    <div style={{ display:'flex', height:'100vh', background:T.bg, color:T.text, fontFamily:"system-ui,-apple-system,'Segoe UI',sans-serif" }}>
+      {/* Left config panel */}
       <div style={{
-        width: 360, background: '#fff', borderRight: '1px solid #e8e8e8',
-        display: 'flex', flexDirection: 'column', flexShrink: 0, overflow: 'auto',
+        width: leftOpen ? 300 : 0, minWidth: leftOpen ? 300 : 0,
+        background:T.surface, borderRight: leftOpen ? `1px solid ${T.border}` : 'none',
+        display:'flex', flexDirection:'column', flexShrink:0,
+        transition:'width .18s ease, min-width .18s ease',
+        overflow:'hidden',
       }}>
-        <div style={{ padding: '16px 20px', borderBottom: '1px solid #f0f0f0' }}>
-          <h3 style={{ margin: 0, fontSize: 16 }}>{agent.name}</h3>
-          <p style={{ margin: '4px 0 0', fontSize: 12, color: '#999' }}>{agent.desc}</p>
+        <div style={{ padding:`${S.lg}px ${S.xl}px ${S.base}px` }}>
+          <h3 style={{ margin:0, fontSize:16, fontWeight:600, color:T.text }}>{agentName || agentKey}</h3>
+          <p style={{ margin:0, marginTop:S.xs, fontSize:13, color:T.secondary }}>{agentDesc || '自定义智能体'}</p>
         </div>
-
-        <div style={{ flex: 1, padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
-          <div>
-            <label style={{ display: 'block', fontSize: 13, fontWeight: 500, marginBottom: 6, color: '#333' }}>
-              系统提示词
-            </label>
-            <textarea
-              value={systemPrompt}
-              onChange={e => setSystemPrompt(e.target.value)}
-              rows={6}
-              style={{
-                width: '100%', padding: '10px 12px', border: '1px solid #d9d9d9', borderRadius: 6,
-                fontSize: 13, fontFamily: 'monospace', lineHeight: 1.6, resize: 'vertical',
-                boxSizing: 'border-box',
-              }}
-            />
-          </div>
-
-          <div>
-            <label style={{ display: 'block', fontSize: 13, fontWeight: 500, marginBottom: 6, color: '#333' }}>
-              模型
-            </label>
-            <select
-              value={model}
-              onChange={e => setModel(e.target.value)}
-              style={{
-                width: '100%', padding: '8px 12px', border: '1px solid #d9d9d9', borderRadius: 6,
-                fontSize: 13, background: '#fff', boxSizing: 'border-box',
-              }}
-            >
-              <option value="deepseek-v4-pro">DeepSeek V4 Pro</option>
-              <option value="deepseek-v4-flash">DeepSeek V4 Flash</option>
-              <option value="gpt-4o">GPT-4o</option>
-              <option value="claude-opus-4-7">Claude Opus 4.7</option>
+        <div style={{ flex:1, padding:`0 ${S.xl}px`, display:'flex', flexDirection:'column', gap:S.md, overflow:'auto', paddingBottom:S.xl }}>
+          <div style={{ fontSize:11, fontWeight:600, color:T.secondary, letterSpacing:'0.04em', textTransform:'uppercase' }}>LLM 配置</div>
+          <label style={labelField}>API Key
+            <input type="password" value={config.api_key} onChange={e => setConfig(p=>({...p, api_key:e.target.value.trim()}))}
+              placeholder="sk-xxx" style={{...inputField, fontFamily:'monospace'}} />
+          </label>
+          <label style={labelField}>Base URL
+            <input type="text" value={config.base_url} onChange={e => setConfig(p=>({...p, base_url:e.target.value.trim()}))}
+              placeholder="https://api.deepseek.com" style={{...inputField, fontFamily:'monospace'}} />
+          </label>
+          <label style={labelField}>Model
+            <select value={config.model} onChange={e => { const m = e.target.value; setConfig(p => ({ ...p, model: m, base_url: (!p.base_url || Object.values(MODEL_BASE_URLS).includes(p.base_url)) ? (MODEL_BASE_URLS[m] || '') : p.base_url })); }}
+              style={{...inputField, padding:'8px 10px'}}>
+              <option value="">未选择</option>
+              <optgroup label="DeepSeek">
+                <option value="deepseek-chat">DeepSeek V4 Flash (chat)</option>
+                <option value="deepseek-reasoner">DeepSeek V4 Flash (reasoner)</option>
+                <option value="deepseek-v4-pro">DeepSeek V4 Pro</option>
+              </optgroup>
+              <optgroup label="OpenAI">
+                <option value="gpt-5.5">GPT-5.5</option>
+                <option value="gpt-5.4">GPT-5.4</option>
+                <option value="gpt-5.4-mini">GPT-5.4 Mini</option>
+                <option value="gpt-4o">GPT-4o</option>
+              </optgroup>
+              <optgroup label="Anthropic">
+                <option value="claude-opus-4-8">Claude Opus 4.8</option>
+                <option value="claude-opus-4-7">Claude Opus 4.7</option>
+                <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+                <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
+              </optgroup>
+              <optgroup label="Google">
+                <option value="gemini-3.1-pro">Gemini 3.1 Pro</option>
+                <option value="gemini-3.5-flash">Gemini 3.5 Flash</option>
+              </optgroup>
             </select>
+          </label>
+
+          <div style={{ paddingTop:S.sm }}>
+            <McpToolBinding agentKey={agentKey} />
           </div>
 
-          <div>
-            <label style={{ display: 'block', fontSize: 13, fontWeight: 500, marginBottom: 6, color: '#333' }}>
-              温度: {temperature}
-            </label>
-            <input
-              type="range" min="0" max="2" step="0.1"
-              value={temperature}
-              onChange={e => setTemperature(parseFloat(e.target.value))}
-              style={{ width: '100%' }}
-            />
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#999' }}>
-              <span>精准</span><span>平衡</span><span>创意</span>
-            </div>
-          </div>
+          <div style={{ fontSize:11, fontWeight:600, color:T.secondary, letterSpacing:'0.04em', textTransform:'uppercase', marginTop:S.sm }}>回复设置</div>
+          <label style={labelField}>系统提示词
+            <textarea rows={6} value={config.system_prompt} onChange={e => setConfig(p=>({...p, system_prompt:e.target.value}))}
+              style={{ ...inputField, resize:'vertical', minHeight:80 }} />
+          </label>
+          <label style={labelField}>兜底回复
+            <textarea rows={3} value={config.fallback_reply} onChange={e => setConfig(p=>({...p, fallback_reply:e.target.value}))}
+              style={{ ...inputField, resize:'vertical', minHeight:50 }} />
+          </label>
         </div>
 
-        <div style={{ padding: '16px 20px', borderTop: '1px solid #f0f0f0' }}>
-          <button style={{
-            width: '100%', padding: '8px 0', borderRadius: 6, fontSize: 14, cursor: 'pointer',
-            background: '#1677ff', color: '#fff', border: 'none',
-          }}>
-            保存配置
-          </button>
+        <div style={{ padding:`${S.base}px ${S.xl}px ${S.lg}px` }}>
+          {saveMsg && <div style={{ fontSize:12, marginBottom:S.sm, color:saveMsg==='保存成功'?T.success:T.danger }}>{saveMsg}</div>}
+          <button onClick={handleSaveConfig} disabled={saving} style={{...btnPrimary, width:'100%', padding:'10px 0', fontSize:14, opacity:saving?0.5:1 }}>{saving?'保存中...':'保存配置'}</button>
         </div>
       </div>
 
-      {/* 右侧聊天界面 */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: '#fafafa' }}>
-        <div style={{
-          padding: '12px 20px', background: '#fff', borderBottom: '1px solid #e8e8e8',
-          fontSize: 14, fontWeight: 500, display: 'flex', alignItems: 'center', gap: 8,
-        }}>
-          <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: '#faad14' }} />
-          测试对话
+      {/* Center: chat */}
+      <div style={{ flex:1, display:'flex', flexDirection:'column', background:T.bg }}>
+        <div style={{ padding:`${S.md}px ${S.xl}px`, display:'flex', alignItems:'center', gap:S.sm, borderBottom:`1px solid ${T.border}` }}>
+          <button onClick={() => setLeftOpen(!leftOpen)} title={leftOpen?'收起配置':'展开配置'} style={{
+            width:28, height:28, borderRadius:6, border:`1px solid ${T.border}`, background:T.surface,
+            display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', color:T.secondary,
+          }}>
+            {leftOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
+          </button>
+          <span style={{ width:7, height:7, borderRadius:'50%', background:T.accent }} />
+          <span style={{ fontSize:14, fontWeight:500, color:T.text }}>测试对话</span>
+          <div style={{ flex:1 }} />
+          {trace && (
+            <span style={{ fontSize:11, padding:'3px 10px', borderRadius:12, fontWeight:500, background:tierBg(trace.tier), color:tierColor(trace.tier) }}>
+              {tierLabel(trace.tier)} {trace.total_ms>0 ? `· ${trace.total_ms}ms` : ''}
+            </span>
+          )}
+          <button onClick={() => setRightOpen(!rightOpen)} title={rightOpen?'收起调用链':'展开调用链'} style={{
+            width:28, height:28, borderRadius:6, border:`1px solid ${T.border}`, background:T.surface,
+            display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', color:T.secondary,
+          }}>{rightOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}</button>
+          <button onClick={handleNewChat} style={{ padding:'5px 14px', borderRadius:6, border:`1px solid ${T.border}`, background:T.surface, color:T.text, fontSize:12, cursor:'pointer' }}>新建会话</button>
         </div>
 
-        <div style={{ flex: 1, padding: 20, overflow: 'auto' }}>
-          {messages.length === 0 && (
-            <div style={{ textAlign: 'center', color: '#ccc', marginTop: 80, fontSize: 14 }}>
-              在左侧配置 Agent 后，在此测试对话效果
-            </div>
-          )}
-          {messages.map((msg, i) => (
-            <div key={i} style={{ marginBottom: 16, display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
-              <div style={{
-                maxWidth: '75%', padding: '10px 16px', borderRadius: 8,
-                background: msg.role === 'user' ? '#1677ff' : '#fff',
-                color: msg.role === 'user' ? '#fff' : '#333',
-                fontSize: 14, lineHeight: 1.6,
-                whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                border: msg.role === 'agent' ? '1px solid #e8e8e8' : 'none',
-              }}>
-                {msg.content}
+        <div style={{ flex:1, padding:S.xl, overflow:'auto' }}>
+          {loadingHistory && <div style={{ textAlign:'center', color:T.secondary, marginTop:S.huge, fontSize:14 }}>加载历史消息...</div>}
+          {!loadingHistory && messages.length===0 && <div style={{ textAlign:'center', color:T.secondary, marginTop:S.huge, fontSize:14 }}>输入消息，测试智能体</div>}
+          {messages.map((msg, i) => {
+            const isUser = msg.role === 'user';
+            return (
+              <div key={i} style={{ marginBottom:S.lg, display:'flex', flexDirection:'column', alignItems:isUser?'flex-end':'flex-start' }}>
+                <div style={{ fontSize:12, color:T.secondary, marginBottom:6 }}>{isUser?'测试用户':(agentName||agentKey)} · {msg.time}</div>
+                <div style={{ maxWidth:'72%' }}>
+                  <div style={{
+                    padding:`${S.md}px ${S.base}px`, borderRadius:8, fontSize:14, lineHeight:1.55,
+                    whiteSpace:'pre-wrap', wordBreak:'break-word',
+                    background:isUser?T.accent:T.surface, color:isUser?'#fff':T.text,
+                    border:isUser?'none':`1px solid ${T.border}`, borderBottomRightRadius:isUser?2:8, borderBottomLeftRadius:isUser?8:2,
+                  }}>{msg.content}</div>
+                </div>
+              </div>
+            );
+          })}
+          {sending && <div style={{ color:T.secondary, fontSize:13 }}>Agent 回复中...</div>}
+          <div ref={bottomRef} />
+        </div>
+
+        <div style={{ padding:`${S.base}px ${S.xl}px ${S.lg}px` }}>
+          <div style={{ display:'flex', gap:S.sm }}>
+            <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key==='Enter'&&handleSend()}
+              placeholder="输入消息测试 Agent..."
+              style={{ flex:1, padding:'10px 14px', background:T.surface, border:`1px solid ${T.border}`, borderRadius:6, fontSize:14, color:T.text, outline:'none', boxSizing:'border-box', fontFamily:'inherit' }} />
+            <button onClick={handleSend} disabled={!input.trim()||sending} style={{...btnPrimary, padding:'10px 22px', fontSize:14, opacity:!input.trim()||sending?0.4:1 }}>发送</button>
+          </div>
+        </div>
+      </div>
+
+      {/* Right: Trace Panel */}
+      <div style={{
+        width: rightOpen ? 360 : 0, minWidth: rightOpen ? 360 : 0,
+        background:T.surface, borderLeft: rightOpen ? `1px solid ${T.border}` : 'none',
+        display:'flex', flexDirection:'column', flexShrink:0,
+        transition:'width .18s ease, min-width .18s ease', overflow:'hidden',
+      }}>
+        <div style={{ padding:`${S.md}px ${S.xl}px`, borderBottom:`1px solid ${T.border}`, minWidth:340 }}>
+          <span style={{ fontSize:13, fontWeight:600, color:T.text }}>调用链</span>
+          <span style={{ fontSize:11, color:T.tertiary, marginLeft:S.sm }}>Tool Calling Trace</span>
+        </div>
+        <div style={{ flex:1, overflow:'auto', padding:S.xl, minWidth:340 }}>
+          {!trace || !trace.steps || trace.steps.length===0 ? (
+            <div style={{ textAlign:'center', color:T.tertiary, marginTop:S.huge, fontSize:13 }}>暂无调用记录</div>
+          ) : (
+            <div style={{ display:'flex', flexDirection:'column', gap:S.sm }}>
+              {trace.steps.map((step, i) => {
+                const expanded = expandedSteps[i] ?? (i === trace.steps!.length - 1);
+                return (
+                  <div key={i} style={{
+                    padding:S.md, borderRadius:8, border:`1px solid ${T.border}`,
+                    background: step.type==='tool' ? '#FFF7E6' : T.accentBg,
+                  }}>
+                    <div style={{ display:'flex', alignItems:'center', gap:S.sm, cursor:'pointer' }}
+                      onClick={() => setExpandedSteps(p => ({...p, [i]: !expanded}))}>
+                      <span style={{
+                        display:'inline-flex', alignItems:'center', gap:3,
+                        padding:'1px 7px', borderRadius:4, fontSize:10, fontWeight:600,
+                        background: step.type==='tool' ? '#F59E0B18' : `${T.accent}18`,
+                        color: step.type==='tool' ? '#F59E0B' : T.accent,
+                      }}>
+                        {step.type==='tool' ? <Wrench size={10} /> : <Brain size={10} />}
+                        {step.type==='tool' ? `调用: ${step.tool}` : 'LLM 决策'}
+                      </span>
+                      <span style={{ fontSize:10, color:T.tertiary, marginLeft:'auto' }}>Step {step.step+1} · {step.latency_ms}ms</span>
+                      {expanded ? <ChevronDown size={12} color={T.tertiary} /> : <ChevronRight size={12} color={T.tertiary} />}
+                    </div>
+                    {expanded && (
+                      <div style={{ marginTop:S.sm, fontSize:12 }}>
+                        {step.type==='tool' ? (
+                          <>
+                            <div style={{ marginBottom:S.xs }}>
+                              <span style={{ fontWeight:600, color:T.secondary }}>参数</span>
+                              <pre style={preSmall}>{JSON.stringify(step.args || {}, null, 2)}</pre>
+                            </div>
+                            <div>
+                              <span style={{ fontWeight:600, color:T.secondary }}>返回</span>
+                              <pre style={preSmall}>{JSON.stringify(step.output, null, 2)}</pre>
+                            </div>
+                          </>
+                        ) : (
+                          <div style={{ color:T.text, whiteSpace:'pre-wrap', lineHeight:1.5 }}>
+                            {step.content || '(无文本输出 — LLM 决定调用工具)'}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              <div style={{ fontSize:11, color:T.tertiary, textAlign:'center', padding:S.sm }}>
+                总耗时 {trace.total_ms}ms · {trace.steps.length} 步
               </div>
             </div>
-          ))}
-          {sending && <div style={{ textAlign: 'left', color: '#999', fontSize: 13 }}>Agent 回复中...</div>}
-        </div>
-
-        <div style={{ padding: '12px 20px', background: '#fff', borderTop: '1px solid #e8e8e8' }}>
-          <div style={{ display: 'flex', gap: 10 }}>
-            <input
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && handleSend()}
-              placeholder="输入消息测试 Agent..."
-              style={{
-                flex: 1, padding: '8px 14px', border: '1px solid #d9d9d9', borderRadius: 6,
-                fontSize: 14, outline: 'none', boxSizing: 'border-box',
-              }}
-            />
-            <button
-              onClick={handleSend}
-              disabled={!input.trim() || sending}
-              style={{
-                padding: '8px 20px', borderRadius: 6, fontSize: 14, cursor: 'pointer',
-                background: '#1677ff', color: '#fff', border: 'none',
-                opacity: !input.trim() || sending ? 0.5 : 1,
-              }}
-            >
-              发送
-            </button>
-          </div>
+          )}
         </div>
       </div>
     </div>

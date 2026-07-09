@@ -1,4 +1,4 @@
-"""闲鱼连接管理器：单例管理 XianyuLive 的启停 + 消息存储"""
+"""闲鱼连接管理器：单例管理 XianyuLive 的启停 + 数据库持久化"""
 import asyncio
 import json
 import logging
@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.xianyu.live import XianyuLive
+from backend.chat import service as chat_service
 
 logger = logging.getLogger(__name__)
 
@@ -16,25 +17,22 @@ if os.path.exists("/app"):
 else:
     _COOKIE_FILE = Path(__file__).parent.parent.parent / "xianyu_cookie.json"
 
+DEFAULT_TENANT_ID = int(os.getenv("XIANYU_TENANT_ID", "1"))
+
 # 连接状态
 _live: XianyuLive | None = None
 _task: asyncio.Task | None = None
 _connected_at: datetime | None = None
-
-# 消息存储：cid → [消息, ...]
-_conversations: dict[str, list[dict]] = {}
 
 # 前端 WebSocket 订阅者列表
 _subscribers: list = []
 
 
 def subscribe(callback):
-    """注册前端 WebSocket 消息回调"""
     _subscribers.append(callback)
 
 
 def unsubscribe(callback):
-    """取消注册"""
     try:
         _subscribers.remove(callback)
     except ValueError:
@@ -54,7 +52,6 @@ def _cookie_changed(new_cookie: str) -> bool:
 
 
 def get_saved_cookie() -> str:
-    """读取保存的 Cookie"""
     try:
         if _COOKIE_FILE.exists():
             data = json.loads(_COOKIE_FILE.read_text("utf-8"))
@@ -65,7 +62,6 @@ def get_saved_cookie() -> str:
 
 
 def get_cached_token() -> tuple[str, str]:
-    """读取缓存的 token 和 device_id"""
     try:
         if _COOKIE_FILE.exists():
             data = json.loads(_COOKIE_FILE.read_text("utf-8"))
@@ -76,7 +72,6 @@ def get_cached_token() -> tuple[str, str]:
 
 
 def save_cookie_to_file(cookie: str, token: str = "", device_id: str = ""):
-    """保存 Cookie 到文件（含可选的 token 缓存）"""
     _COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
     existing = {}
     if _COOKIE_FILE.exists():
@@ -93,14 +88,31 @@ def save_cookie_to_file(cookie: str, token: str = "", device_id: str = ""):
 
 
 async def _on_message(msg: dict):
-    """收到新消息，存入内存，并通知前端 WebSocket 订阅者"""
+    """收到新消息，写入数据库，并通知前端 WebSocket 订阅者"""
     cid = msg["cid"]
     if not cid:
         return
-    msg["time"] = datetime.now(timezone.utc).isoformat()
-    if cid not in _conversations:
-        _conversations[cid] = []
-    _conversations[cid].append(msg)
+
+    now = datetime.now(timezone.utc).isoformat()
+    msg["time"] = now
+
+    try:
+        conv = chat_service.get_or_create_conversation(
+            DEFAULT_TENANT_ID, "xianyu", cid,
+            customer_name=msg.get("sender_name", ""),
+            customer_id=msg.get("sender_id", ""),
+        )
+        chat_service.create_message(
+            DEFAULT_TENANT_ID, conv.id,
+            chat_service.MessageCreate(
+                role="customer",
+                sender_name=msg.get("sender_name", ""),
+                content=msg.get("content", ""),
+            ),
+        )
+    except Exception as e:
+        logger.error(f"写入消息到数据库失败: {e}")
+
     logger.info(f"[闲鱼消息] cid={cid} {msg['sender_name']}: {msg['content'][:80]}")
 
     for cb in _subscribers:
@@ -118,43 +130,78 @@ def get_status() -> dict:
 
 
 def get_conversations() -> list[dict]:
-    """返回会话列表，每个会话含最新消息摘要"""
+    """返回会话列表（从数据库读取），兼容前端旧格式"""
+    try:
+        rows = chat_service.list_conversations_with_summary(
+            DEFAULT_TENANT_ID, channel="xianyu", page_size=200,
+        )
+    except Exception as e:
+        logger.error(f"从数据库读取会话列表失败: {e}")
+        return []
+
     result = []
-    for cid, msgs in _conversations.items():
-        last = msgs[-1] if msgs else {}
+    for r in rows:
         result.append({
-            "cid": cid,
-            "buyer_name": last.get("sender_name", ""),
-            "last_msg": last.get("content", "")[:50],
-            "last_time": last.get("time", ""),
-            "count": len(msgs),
+            "id": r["id"],
+            "cid": r["channel_conversation_id"] or "",
+            "buyer_name": r["customer_name"] or "",
+            "last_msg": (r["last_msg"] or "")[:50],
+            "last_time": r["last_time"].isoformat() if r["last_time"] else "",
+            "count": r["msg_count"] or 0,
         })
-    def _ts(x):
-        t = x.get("last_time", 0)
-        return t if isinstance(t, (int, float)) else 0
-    result.sort(key=_ts, reverse=True)
     return result
 
 
 def get_messages(cid: str) -> list[dict]:
-    return _conversations.get(cid, [])
+    """返回指定会话的消息列表（从数据库读取），兼容前端旧格式"""
+    try:
+        msgs = chat_service.get_messages_by_channel_cid(
+            DEFAULT_TENANT_ID, cid, page_size=500,
+        )
+    except Exception as e:
+        logger.error(f"从数据库读取消息失败: {e}")
+        return []
+
+    return [
+        {
+            "cid": cid,
+            "sender_id": m.sender_name or "",  # 前端用 sender_id 展示
+            "sender_name": m.sender_name or "",
+            "content": m.content,
+            "time": m.created_at.isoformat(),
+        }
+        for m in msgs
+    ]
 
 
 async def fetch_history(cid: str):
-    """拉取指定会话的历史消息并存入内存"""
+    """拉取指定会话的历史消息并写入数据库"""
     global _live
     if not _live:
         raise RuntimeError("未连接闲鱼")
     history = await _live.list_all_conversations(cid)
-    existing = _conversations.get(cid, [])
-    existing_ids = {(m.get("content"), m.get("time")) for m in existing}
+
+    try:
+        conv = chat_service.get_or_create_conversation(
+            DEFAULT_TENANT_ID, "xianyu", cid,
+        )
+    except Exception as e:
+        logger.error(f"查找会话失败: {e}")
+        return 0
+
+    inserted = 0
     for msg in history:
-        key = (msg.get("content"), msg.get("time"))
-        if key not in existing_ids:
-            msg["time"] = datetime.now(timezone.utc).isoformat()
-            existing.insert(0, msg)
-    _conversations[cid] = existing
-    return len(history)
+        try:
+            chat_service.insert_message_raw(
+                DEFAULT_TENANT_ID, conv.id,
+                role="customer",
+                sender_name=msg.get("sender_name", ""),
+                content=msg.get("content", ""),
+            )
+            inserted += 1
+        except Exception as e:
+            logger.warning(f"写入历史消息失败: {e}")
+    return inserted
 
 
 async def auto_connect():
@@ -171,20 +218,18 @@ async def auto_connect():
 
 async def connect(cookie: str) -> str | None:
     """连接闲鱼。返回 None 表示成功，返回字符串表示错误信息"""
-    global _live, _task, _connected_at, _conversations
+    global _live, _task, _connected_at
 
     if _live and _task and not _task.done():
         raise RuntimeError("已连接，请先断开")
 
     cached_token, cached_device_id = get_cached_token()
-    # 如果 cookie 变了（_m_h5_tk 不同），旧 token 自动失效
     if cached_token and _cookie_changed(cookie):
         logger.warning("Cookie 已变更，清除旧 token")
         cached_token = ""
     save_cookie_to_file(cookie, token=cached_token, device_id=cached_device_id)
 
     async def _on_registered():
-        """IM 注册完成后拉取会话"""
         logger.warning("[on_ready] IM 注册完成，开始拉取会话")
         await _fetch_conversations()
 
@@ -199,7 +244,6 @@ async def connect(cookie: str) -> str | None:
         await disconnect()
         return error
 
-    # 持久化 token
     token = _live.xianyu._cached_token
     if token:
         save_cookie_to_file(cookie, token=token, device_id=_live.device_id)
@@ -209,37 +253,55 @@ async def connect(cookie: str) -> str | None:
 
 
 async def _fetch_conversations():
-    global _live, _conversations
+    global _live
     logger.warning("[拉会话] _fetch_conversations 已启动")
     try:
         convs = await _live.list_newest_conversations()
         logger.warning(f"[拉会话] list_newest_conversations 返回 {len(convs)} 条")
-        for c in convs:
-            cid = c["cid"]
-            if cid and cid not in _conversations:
-                _conversations[cid] = []
-        logger.info(f"加载 {len(convs)} 个会话")
-        # 拉取每个会话的完整聊天记录
+
         for i, c in enumerate(convs):
             cid = c["cid"]
-            if not cid or _conversations.get(cid):
+            if not cid:
                 continue
             try:
-                if i > 0:
-                    await asyncio.sleep(1.5)  # 避免请求太密集
+                chat_service.get_or_create_conversation(
+                    DEFAULT_TENANT_ID, "xianyu", cid,
+                    customer_name=c.get("buyer_name", ""),
+                    customer_id=c.get("buyer_id", ""),
+                )
+            except Exception as e:
+                logger.warning(f"[拉会话] 创建会话失败 cid={cid}: {e}")
+                continue
+
+            if i > 0:
+                await asyncio.sleep(1.5)
+            try:
                 history = await _live.list_all_conversations(cid)
                 if history:
-                    _conversations[cid] = history
-                    logger.warning(f"[拉历史] cid={cid} 拉取 {len(history)} 条消息")
+                    conv = chat_service.get_or_create_conversation(
+                        DEFAULT_TENANT_ID, "xianyu", cid,
+                    )
+                    for msg in history:
+                        try:
+                            chat_service.insert_message_raw(
+                                DEFAULT_TENANT_ID, conv.id,
+                                role="customer",
+                                sender_name=msg.get("sender_name", ""),
+                                content=msg.get("content", ""),
+                            )
+                        except Exception:
+                            pass
+                    logger.warning(f"[拉历史] cid={cid} 写入 {len(history)} 条消息到数据库")
             except Exception as e:
                 logger.warning(f"[拉历史] cid={cid} 失败: {e}")
-                _conversations[cid] = []
+
+        logger.info(f"会话列表已同步到数据库，共 {len(convs)} 个会话")
     except Exception as e:
         logger.warning(f"拉取会话列表失败: {e}")
 
 
 async def disconnect():
-    global _live, _task, _connected_at, _conversations
+    global _live, _task, _connected_at
 
     if not _live:
         return
@@ -255,5 +317,4 @@ async def disconnect():
     _live = None
     _task = None
     _connected_at = None
-    _conversations = {}
     logger.info("闲鱼连接已断开")

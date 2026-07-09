@@ -26,7 +26,17 @@ async def on_new_message(msg: dict):
     """manager 收到新消息时广播给所有前端 WS 客户端"""
     convs = manager.get_conversations()
     conv = next((c for c in convs if c["cid"] == msg["cid"]), None)
-    await _broadcast({"type": "new_message", "data": msg, "conversation": conv})
+    await _broadcast({
+        "type": "new_message",
+        "data": {
+            "role": "customer",
+            "sender_name": msg.get("sender_name", ""),
+            "content": msg.get("content", ""),
+            "time": msg.get("time", ""),
+        },
+        "conversation": conv,
+        "conversation_id": conv["id"] if conv else None,
+    })
 
 
 manager.subscribe(on_new_message)
