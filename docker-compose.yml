@@ -12,23 +12,32 @@ services:
 
   backend:
     build: ./backend
-    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
       - .:/app
+      - npm_cache:/root/.npm
+      - uv_cache:/root/.cache/uv
     environment:
       DATABASE_URL: postgresql://saas:saas@db:5432/saas
       JWT_SECRET: dev-secret
       OLLAMA_HOST: http://host.docker.internal:11434
     ports:
       - "8000:8000"
+      - "9001:9001"
     depends_on:
       - db
 
   frontend:
     build: ./frontend
+    command: npx next dev -p 3003 -H 0.0.0.0
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000
       BACKEND_URL: http://backend:8000
+      WATCHPACK_POLLING: "true"
     ports:
       - "3003:3003"
     depends_on:
@@ -36,3 +45,5 @@ services:
 
 volumes:
   pgdata:
+  npm_cache:
+  uv_cache:

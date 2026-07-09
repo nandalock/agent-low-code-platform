@@ -1,0 +1,11 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - generic [ref=e5]: CS
+      - heading "智能客服" [level=1] [ref=e6]
+      - paragraph [ref=e7]: 登录到管理后台
+    - generic [ref=e8]:
+      - textbox "账号" [ref=e9]
+      - textbox "密码" [ref=e10]
+    - button "登录" [ref=e11] [cursor=pointer]
+  - alert [ref=e12]

@@ -19,5 +19,5 @@ class BaseAgent:
     status: str = "active"  # "active" | "draft"
     template: dict = {}
 
-    async def reply(self, tenant_id: int, question: str) -> AgentReply:
+    async def reply(self, tenant_id: int, question: str, context: dict | None = None) -> AgentReply:
         raise NotImplementedError

@@ -1,208 +1,89 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { T, S } from '@/app/theme';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
-interface PlatformCard {
-  key: string;
-  name: string;
-  logo: string;
-  connected: boolean;
-}
-
-const PLATFORMS: PlatformCard[] = [
-  { key: 'xianyu', name: '闲鱼', logo: '/xianyu-logo.ico', connected: false },
-];
+interface PlatformCard { key:string; name:string; logo:string; connected:boolean; }
+const PLATFORMS: PlatformCard[] = [{ key:'xianyu', name:'闲鱼', logo:'/xianyu-logo.ico', connected:false }];
 
 export default function IntegrationsPage() {
   const [platforms, setPlatforms] = useState(PLATFORMS);
-  const [activeManage, setActiveManage] = useState<string | null>(null);
+  const [activeManage, setActiveManage] = useState<string|null>(null);
   const [cookie, setCookie] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
 
-  // Load status & saved cookie on mount
-  useEffect(() => {
-    fetch(`${API}/api/xianyu/status`)
-      .then(r => r.json())
-      .then(data => {
-        setPlatforms(prev => prev.map(p =>
-          p.key === 'xianyu' ? { ...p, connected: data.is_online } : p
-        ));
-      })
-      .catch(() => {});
-    fetch(`${API}/api/xianyu/cookie`)
-      .then(r => r.json())
-      .then(data => {
-        if (data.cookie) setCookie(data.cookie);
-      })
-      .catch(() => {});
-  }, []);
+  useEffect(()=>{
+    fetch(`${API}/api/xianyu/status`).then(r=>r.json()).then(d=>{ setPlatforms(p=>p.map(x=>x.key==='xianyu'?{...x,connected:d.is_online}:x)); }).catch(()=>{});
+    fetch(`${API}/api/xianyu/cookie`).then(r=>r.json()).then(d=>{ if(d.cookie) setCookie(d.cookie); }).catch(()=>{});
+  },[]);
 
-  function openManage(key: string) {
-    setActiveManage(key);
-    setError('');
-  }
-
-  async function handleSaveCookie() {
-    setSaving(true);
-    setError('');
+  function openManage(key:string){ setActiveManage(key); setError(''); }
+  async function handleSaveCookie(){
+    setSaving(true); setError('');
     try {
-      const res = await fetch(`${API}/api/xianyu/connect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cookie }),
-      });
+      const res = await fetch(`${API}/api/xianyu/connect`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie})});
       const data = await res.json();
-      if (res.ok) {
-        setPlatforms(prev =>
-          prev.map(p => p.key === activeManage ? { ...p, connected: true } : p)
-        );
-        setActiveManage(null);
-      } else {
-        setError(data.detail || '连接失败');
-      }
-    } catch (err) {
-      setError('网络错误');
-    } finally {
-      setSaving(false);
-    }
+      if(res.ok){ setPlatforms(p=>p.map(x=>x.key===activeManage?{...x,connected:true}:x)); setActiveManage(null); }
+      else setError(data.detail||'连接失败');
+    } catch { setError('网络错误'); } finally { setSaving(false); }
   }
-
-  async function handleDisconnect() {
-    await fetch(`${API}/api/xianyu/disconnect`, { method: 'POST' });
-    setPlatforms(prev =>
-      prev.map(p => p.key === activeManage ? { ...p, connected: false } : p)
-    );
+  async function handleDisconnect(){
+    await fetch(`${API}/api/xianyu/disconnect`,{method:'POST'});
+    setPlatforms(p=>p.map(x=>x.key===activeManage?{...x,connected:false}:x));
     setActiveManage(null);
   }
 
   return (
     <div>
-      <h2 style={{ margin: 0, fontSize: 18, marginBottom: 20 }}>集成管理</h2>
-
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(4, 1fr)',
-        gap: 16,
-      }}>
-        {platforms.map(p => (
-          <div key={p.key} style={{
-            background: '#fff', borderRadius: 10, padding: 24,
-            display: 'flex', flexDirection: 'column', alignItems: 'center',
-            border: '1px solid #f0f0f0',
-          }}>
-            {/* Logo */}
-            <div style={{
-              width: 80, height: 80, borderRadius: 20,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              marginBottom: 12, overflow: 'hidden',
-            }}>
-              <img
-                src={p.logo}
-                alt={p.name}
-                style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-                onError={e => {
-                  (e.target as HTMLImageElement).style.display = 'none';
-                }}
-              />
+      <h2 style={{ margin:0, fontSize:18, fontWeight:600, color:T.text, marginBottom:S.xl }}>集成管理</h2>
+      <div style={{ display:'grid', gridTemplateColumns:'repeat(4, 1fr)', gap:S.base }}>
+        {platforms.map(p=>(
+          <div key={p.key} style={{ background:T.surface, borderRadius:10, padding:S.xl, display:'flex', flexDirection:'column', alignItems:'center', border:`1px solid ${T.border}` }}>
+            <div style={{ width:64, height:64, borderRadius:14, overflow:'hidden', marginBottom:S.md, display:'flex', alignItems:'center', justifyContent:'center', background:T.bg }}>
+              <img src={p.logo} alt={p.name} style={{ width:'100%',height:'100%',objectFit:'contain' }} onError={e=>{(e.target as HTMLImageElement).style.display='none'}} />
             </div>
-
-            {/* Name */}
-            <span style={{ fontSize: 15, fontWeight: 500, marginBottom: 8 }}>{p.name}</span>
-
-            {/* Status */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 16 }}>
-              <span style={{
-                width: 8, height: 8, borderRadius: '50%',
-                background: p.connected ? '#52c41a' : '#d9d9d9',
-                display: 'inline-block',
-              }} />
-              <span style={{ fontSize: 13, color: p.connected ? '#52c41a' : '#999' }}>
-                {p.connected ? '已连接' : '未连接'}
-              </span>
+            <span style={{ fontSize:15, fontWeight:600, color:T.text, marginBottom:S.sm }}>{p.name}</span>
+            <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:S.base }}>
+              <span style={{ width:7, height:7, borderRadius:'50%', background:p.connected?T.success:T.tertiary }} />
+              <span style={{ fontSize:13, color:p.connected?T.success:T.secondary }}>{p.connected?'已连接':'未连接'}</span>
             </div>
-
-            {/* Manage Button */}
-            <button onClick={() => openManage(p.key)} style={{
-              padding: '6px 20px', borderRadius: 6, fontSize: 13, cursor: 'pointer',
-              background: '#fff', border: '1px solid #d9d9d9', color: '#333',
-            }}>
-              管理
-            </button>
+            <button onClick={()=>openManage(p.key)} style={{ padding:`${S.xs}px ${S.base}px`, borderRadius:6, fontSize:13, cursor:'pointer', background:T.surface, border:`1px solid ${T.border}`, color:T.text }}>管理</button>
           </div>
         ))}
       </div>
-
-      {/* Manage Modal */}
+      {/* Modal */}
       {activeManage && (
-        <div onClick={() => setActiveManage(null)} style={{
-          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
-        }}>
-          <div onClick={e => e.stopPropagation()} style={{
-            background: '#fff', borderRadius: 12, padding: 24, width: 480,
-          }}>
-            <h3 style={{ margin: '0 0 20px', fontSize: 16 }}>
-              {platforms.find(p => p.key === activeManage)?.name} — 连接方式
+        <div onClick={()=>setActiveManage(null)} style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.4)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:1000 }}>
+          <div onClick={e=>e.stopPropagation()} style={{ background:T.surface, borderRadius:12, padding:S.xl, width:480, boxShadow:'0 8px 32px rgba(0,0,0,0.10)' }}>
+            <h3 style={{ margin:0, fontSize:16, fontWeight:600, color:T.text, marginBottom:S.lg }}>
+              {platforms.find(p=>p.key===activeManage)?.name} — 连接方式
             </h3>
-
-            {/* Method tabs */}
-            <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
-              {[
-                { key: 'cookie', label: 'Cookie', active: true },
-                { key: 'qrcode', label: '二维码', active: false, disabled: true },
-                { key: 'oauth', label: 'OAuth', active: false, disabled: true },
-              ].map(tab => (
-                <button key={tab.key} disabled={tab.disabled} style={{
-                  padding: '6px 16px', borderRadius: 6, fontSize: 13, cursor: tab.disabled ? 'not-allowed' : 'pointer',
-                  border: tab.active ? '1px solid #1677ff' : '1px solid #d9d9d9',
-                  background: tab.active ? '#e6f4ff' : '#fff',
-                  color: tab.active ? '#1677ff' : tab.disabled ? '#ccc' : '#666',
-                }}>
-                  {tab.label}
-                </button>
+            <div style={{ display:'flex', gap:S.sm, marginBottom:S.lg }}>
+              {[{key:'cookie',label:'Cookie',active:true},{key:'qrcode',label:'二维码',disabled:true},{key:'oauth',label:'OAuth',disabled:true}].map(tab=>(
+                <button key={tab.key} disabled={(tab as any).disabled} style={{
+                  padding:`${S.xs}px ${S.md}px`, borderRadius:6, fontSize:13,
+                  cursor:(tab as any).disabled?'not-allowed':'pointer',
+                  border:tab.active?`1px solid ${T.accent}`:`1px solid ${T.border}`,
+                  background:tab.active?T.accentBg:T.surface,
+                  color:tab.active?T.accent:(tab as any).disabled?T.tertiary:T.secondary,
+                }}>{tab.label}</button>
               ))}
             </div>
-
-            {/* Cookie input */}
-            {error && (
-              <p style={{ color: '#ff4d4f', fontSize: 13, margin: '0 0 12px' }}>{error}</p>
-            )}
-            <textarea
-              value={cookie}
-              onChange={e => { setCookie(e.target.value); setError(''); }}
-              placeholder="粘贴闲鱼 Cookie..."
-              rows={5}
-              style={{
-                width: '100%', padding: '10px 14px', border: `1px solid ${error ? '#ff4d4f' : '#d9d9d9'}`,
-                borderRadius: 6, fontSize: 13, resize: 'vertical',
-                fontFamily: 'monospace', boxSizing: 'border-box',
-              }}
-            />
-
-            <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end', marginTop: 16 }}>
-              {platforms.find(p => p.key === activeManage)?.connected && (
-                <button onClick={handleDisconnect} style={{
-                  padding: '8px 20px', borderRadius: 6, fontSize: 14, cursor: 'pointer',
-                  background: '#fff', border: '1px solid #ff4d4f', color: '#ff4d4f',
-                }}>
-                  断开
-                </button>
+            {error && <p style={{ color:T.danger, fontSize:13, marginBottom:S.md }}>{error}</p>}
+            <textarea value={cookie} onChange={e=>{setCookie(e.target.value);setError('');}} placeholder="粘贴闲鱼 Cookie..."
+              rows={5} style={{ width:'100%', padding:'10px 14px', background:T.surface, border:`1px solid ${error?T.danger:T.border}`, borderRadius:8, fontSize:13, resize:'vertical', fontFamily:'monospace', color:T.text, outline:'none', boxSizing:'border-box' }} />
+            <div style={{ display:'flex', gap:S.md, justifyContent:'flex-end', marginTop:S.base }}>
+              {platforms.find(p=>p.key===activeManage)?.connected && (
+                <button onClick={handleDisconnect} style={{ padding:`${S.sm}px ${S.lg}px`, borderRadius:6, fontSize:13, cursor:'pointer', background:T.surface, border:`1px solid ${T.danger}`, color:T.danger }}>断开</button>
               )}
-              <button onClick={() => setActiveManage(null)} style={{
-                padding: '8px 20px', borderRadius: 6, fontSize: 14, cursor: 'pointer',
-                background: '#fff', border: '1px solid #d9d9d9',
-              }}>
-                取消
-              </button>
-              <button onClick={handleSaveCookie} disabled={saving || !cookie.trim()} style={{
-                padding: '8px 20px', borderRadius: 6, fontSize: 14, cursor: 'pointer',
-                background: cookie.trim() ? '#1677ff' : '#d9d9d9', color: '#fff', border: 'none',
-              }}>
-                {saving ? '保存中...' : '保存'}
-              </button>
+              <button onClick={()=>setActiveManage(null)} style={{ padding:`${S.sm}px ${S.lg}px`, borderRadius:6, fontSize:13, cursor:'pointer', background:T.surface, border:`1px solid ${T.border}`, color:T.text }}>取消</button>
+              <button onClick={handleSaveCookie} disabled={saving||!cookie.trim()} style={{
+                padding:`${S.sm}px ${S.lg}px`, borderRadius:6, fontSize:13, cursor:'pointer', fontWeight:500,
+                background:cookie.trim()?T.accent:'#C9CDD4', color:'#fff', border:'none',
+              }}>{saving?'保存中...':'保存'}</button>
             </div>
           </div>
         </div>
