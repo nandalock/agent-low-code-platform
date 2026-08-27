@@ -23,3 +23,23 @@ _temp_*
 # OS
 .DS_Store
 Thumbs.db
+
+# IDE
+.idea/
+
+# Playwright MCP browser artifacts
+.playwright-mcp/
+
+# Test payload
+test_payload.json
+
+
+# IDE
+.idea/
+
+# Playwright MCP browser artifacts
+.playwright-mcp/
+
+# Test payload
+test_payload.json
+
