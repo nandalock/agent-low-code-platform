@@ -1,7 +1,7 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { Brain, Users, ArrowRight } from 'lucide-react';
+import { Brain, Users, Bug, ArrowRight } from 'lucide-react';
 import { T, S } from '@/app/theme';
 
 export default function MemoryPage() {
@@ -30,6 +30,24 @@ export default function MemoryPage() {
           </div>
           <div style={{ display:'flex', alignItems:'center', gap:S.xs, marginTop:S.base, fontSize:12, color:T.accent }}>
             查看详情 <ArrowRight size={12} />
+          </div>
+        </div>
+
+        {/* 调试工具卡片 */}
+        <div onClick={() => router.push('/dashboard/memory/debug')} style={{
+          background:T.surface, borderRadius:10, padding:S.xl, cursor:'pointer',
+          border:`1px solid ${T.border}`, transition:'box-shadow .15s',
+        }} onMouseEnter={e => e.currentTarget.style.boxShadow='0 2px 12px rgba(0,0,0,0.06)'}
+           onMouseLeave={e => e.currentTarget.style.boxShadow='none'}>
+          <div style={{ width:40, height:40, borderRadius:10, background:'#FFF7E8', display:'flex', alignItems:'center', justifyContent:'center', marginBottom:S.base }}>
+            <Bug size={20} color={T.warning} />
+          </div>
+          <div style={{ fontSize:15, fontWeight:600, color:T.text }}>Pipeline 调试</div>
+          <div style={{ fontSize:12, color:T.secondary, marginTop:S.xs, lineHeight:1.5 }}>
+            输入对话消息，运行 MemoryContext 管道，查看压缩摘要、画像提取、上下文窗口等中间状态
+          </div>
+          <div style={{ display:'flex', alignItems:'center', gap:S.xs, marginTop:S.base, fontSize:12, color:T.accent }}>
+            打开调试 <ArrowRight size={12} />
           </div>
         </div>
 

@@ -264,6 +264,7 @@ MIGRATIONS = [
       END IF;
     END $$;""",
     "ALTER TABLE agent_definitions ADD COLUMN IF NOT EXISTS agent_type VARCHAR(20) NOT NULL DEFAULT 'agent'",
+    "ALTER TABLE agent_definitions ADD COLUMN IF NOT EXISTS cache_policy JSONB DEFAULT NULL",
     # 迁移 L1 关键字: JSONB config → router_l1_keywords 独立表（兼容新旧两种格式）
     """DO $$
     DECLARE
@@ -364,6 +365,14 @@ SEED_SERVERS = [
     "INSERT INTO mcp_servers (tenant_id, name, transport, url) SELECT 1, '本地 MCP', 'http', 'http://localhost:9001/mcp' WHERE NOT EXISTS (SELECT 1 FROM mcp_servers WHERE url = 'http://localhost:9001/mcp')",
 ]
 
+SEED_CACHE_POLICIES = [
+    """UPDATE agent_definitions SET cache_policy = '{
+      "base_score": 0.50,
+      "cacheable_intents": [],
+      "block_entities": []
+    }'::jsonb WHERE cache_policy IS NULL""",
+]
+
 SEED_AGENTS = [
     """INSERT INTO agent_definitions (agent_key, name, description, config)
        VALUES ('faqagent', 'FaqAgent', '基于 pg_trgm 直接匹配 + pgvector 语义检索 + reranker 精排 + LLM RAG 润色', '{
@@ -452,6 +461,9 @@ def init_db():
                 cur.execute(seed_sql)
 
             for seed_sql in SEED_AGENTS:
+                cur.execute(seed_sql)
+
+            for seed_sql in SEED_CACHE_POLICIES:
                 cur.execute(seed_sql)
 
         conn.commit()

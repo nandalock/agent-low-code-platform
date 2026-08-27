@@ -52,9 +52,23 @@ def _build_context(state: WorkflowState) -> dict:
     return result
 
 
-def make_agent_handler(node_id: str, agent_key: str) -> Callable:
+def make_agent_handler(node_id: str, agent_key: str, cache_config: dict | None = None) -> Callable:
+    from backend.engine.middlewares import CacheMiddleware
+    from backend.db.config_service import get_agent_definition
 
-    async def handler(state: WorkflowState) -> dict:
+    # 读 agent 定义的 cache_policy，用工作流节点配置覆写后传给 CacheMiddleware → SemanticCache → CachePolicyEngine
+    cache_policy = None
+    if cache_config and cache_config.get("enabled"):
+        definition = get_agent_definition(agent_key) or {}
+        base_policy = definition.get("cache_policy") or {"base_score": 0.50, "cacheable_intents": [], "block_entities": []}
+        overrides: dict[str, object] = {}
+        for field in ("base_score", "cacheable_intents", "block_entities", "content_hint", "scorer_weights"):
+            if field in (cache_config or {}):
+                overrides[field] = cache_config[field]
+        cache_policy = {**base_policy, **overrides}
+
+    async def core(state: WorkflowState) -> dict:
+        """核心逻辑：调用 agent.reply()"""
         from backend.agents import get_agent
 
         _visit_counts[node_id] = _visit_counts.get(node_id, 0) + 1
@@ -76,6 +90,21 @@ def make_agent_handler(node_id: str, agent_key: str) -> Callable:
             "node_results": {node_id: answer},
             "node_timeline": _timeline_entry(node_id, agent_key, "agent", answer, elapsed_ms),
         }
+
+    # 组装 middleware 链（洋葱模型）
+    handler = core
+    middlewares = []
+
+    if cache_config and cache_config.get("enabled"):
+        middlewares.append(CacheMiddleware(node_id, cache_config, cache_policy))
+
+    for mw in reversed(middlewares):
+        prev = handler
+
+        async def _wrapped(state, _mw=mw, _prev=prev):
+            return await _mw.process(state, node_id, _prev)
+
+        handler = _wrapped
 
     handler.__name__ = f"agent_{node_id}"
     return handler

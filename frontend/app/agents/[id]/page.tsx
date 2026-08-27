@@ -3,8 +3,9 @@
 import { useState, useRef, useEffect } from 'react';
 import { useParams } from 'next/navigation';
 import { T, S, inputField, labelField, btnPrimary } from '@/app/theme';
-import { PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Wrench, Brain, ChevronDown, ChevronRight } from 'lucide-react';
+import { PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Wrench, Brain, ChevronDown, ChevronRight, X } from 'lucide-react';
 import McpToolBinding from '../_components/McpToolBinding';
+import CachePolicyEditor, { type CachePolicyData } from '../_components/CachePolicyEditor';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 const TENANT_ID = 1;
@@ -71,6 +72,7 @@ export default function AgentDetailPage() {
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const [config, setConfig] = useState(DEFAULT_CONFIG);
+  const [cachePolicy, setCachePolicy] = useState<Record<string, any> | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
   const [leftOpen, setLeftOpen] = useState(true);
@@ -91,6 +93,7 @@ export default function AgentDetailPage() {
           max_steps: d.config.max_steps ?? 5,
         });
       }
+      setCachePolicy(d.cache_policy ?? null);
     }).catch(() => {});
   }, [agentKey]);
 
@@ -125,7 +128,9 @@ export default function AgentDetailPage() {
   async function handleSaveConfig() {
     setSaving(true); setSaveMsg('');
     try {
-      const r = await fetch(`${API}/api/agents/${agentKey}/config`, { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config) });
+      const body: any = { ...config };
+      if (cachePolicy !== null) body.cache_policy = cachePolicy;
+      const r = await fetch(`${API}/api/agents/${agentKey}/config`, { method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
       setSaveMsg(r.ok ? '保存成功' : '保存失败');
     } catch { setSaveMsg('保存失败'); }
     finally { setSaving(false); }
@@ -223,6 +228,32 @@ export default function AgentDetailPage() {
             <textarea rows={3} value={config.fallback_reply} onChange={e => setConfig(p=>({...p, fallback_reply:e.target.value}))}
               style={{ ...inputField, resize:'vertical', minHeight:50 }} />
           </label>
+
+          {/* 缓存策略 */}
+          <div style={{
+            marginTop: S.md, borderTop: `1px solid ${T.border}`, paddingTop: S.md,
+          }}>
+            <div style={{ marginBottom: S.sm }}>
+              <span style={{ fontSize: 11, fontWeight: 600, color: T.secondary, letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+                缓存策略
+              </span>
+              {cachePolicy && <span style={{
+                fontSize: 10, color: T.success, background: '#E8FFEA',
+                padding: '1px 6px', borderRadius: 8, fontWeight: 500, marginLeft: S.sm,
+              }}>已配置</span>}
+            </div>
+
+            <CachePolicyEditor
+              value={{
+                base_score: cachePolicy?.base_score ?? 0.50,
+                cacheable_intents: cachePolicy?.cacheable_intents ?? [],
+                block_entities: cachePolicy?.block_entities ?? [],
+                content_hint: cachePolicy?.content_hint ?? '',
+                scorer_weights: cachePolicy?.scorer_weights ?? undefined,
+              }}
+              onChange={(p: CachePolicyData) => setCachePolicy((prev: any) => ({ ...prev, ...p }))}
+            />
+          </div>
         </div>
 
         <div style={{ padding:`${S.base}px ${S.xl}px ${S.lg}px` }}>
@@ -355,6 +386,7 @@ export default function AgentDetailPage() {
           )}
         </div>
       </div>
+
     </div>
   );
 }

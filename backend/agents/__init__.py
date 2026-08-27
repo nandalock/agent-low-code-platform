@@ -13,9 +13,11 @@ def list_agents() -> list[dict]:
     result = []
     for a in _agents.values():
         agent_type = "router" if isinstance(a, RouterRuntime) else "agent"
+        cache_policy = getattr(a, '_definition', {}).get('cache_policy') if hasattr(a, '_definition') else None
         item = {
             "key": a.key, "name": a.name, "desc": a.desc,
             "status": a.status, "agent_type": agent_type,
+            "cache_policy": cache_policy,
         }
         if isinstance(a, RouterRuntime):
             item["routable"] = _router_targets(a)

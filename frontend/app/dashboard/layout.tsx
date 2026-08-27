@@ -45,7 +45,7 @@ export default function DashboardLayout({ children }:{ children:React.ReactNode 
         {/* Brand */}
         <div style={{ padding:collapsed?`${S.base}px ${S.sm}px`:`${S.lg}px ${S.xl}px ${S.base}px`, display:'flex', alignItems:'center', gap:S.sm }}>
           <div style={{ width:32, height:32, borderRadius:8, background:T.accent, flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center', fontSize:14, fontWeight:700, color:'#fff' }}>CS</div>
-          {!collapsed && <span style={{ fontSize:16, fontWeight:600, color:'#fff', whiteSpace:'nowrap' }}>智能客服</span>}
+          {!collapsed && <span style={{ fontSize:16, fontWeight:600, color:'#fff', whiteSpace:'nowrap' }}>低代码平台</span>}
         </div>
         {/* Nav */}
         <nav style={{ flex:1, padding:`${S.sm}px ${S.xs}px`, display:'flex', flexDirection:'column', gap:1 }}>

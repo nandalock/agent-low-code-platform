@@ -4,7 +4,7 @@ from mcp.server.fastmcp import FastMCP
 from backend.db.connection import get_conn
 
 logger = logging.getLogger(__name__)
-mcp = FastMCP("multi-agent-customer-service-mcp")
+mcp = FastMCP("agent-low-code-platform-mcp")
 
 
 # ═══ 订单域 ═══
