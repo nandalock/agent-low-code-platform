@@ -3,33 +3,57 @@
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { T, S, btnPrimary } from '@/app/theme';
-import { Wrench, Circle, ChevronRight, Server, Globe, Terminal, Plus, X, Trash2, Box, Code2 } from 'lucide-react';
+import { Wrench, Plus, X, Box, ShoppingCart, FileText, Truck, BookOpen, Tags, User, Search } from 'lucide-react';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
-interface McpServer {
-  id: number;
+interface McpTool {
   name: string;
+  description: string;
+  inputSchema?: Record<string, unknown>;
+  server_id: number;
+  server_name: string;
   transport: 'http' | 'stdio';
-  url?: string;
-  command?: string;
-  args?: string;
 }
 
-const TRANSPORT_ICON: Record<string, React.ReactNode> = {
-  http: <Globe size={13} />,
-  stdio: <Terminal size={13} />,
+// 工具名 → 图标映射（内置工具精确匹配，其余按类别兜底）
+const TOOL_ICONS: Record<string, { icon: React.ReactNode; color: string }> = {
+  query_orders: { icon: <ShoppingCart size={18} />, color: '#3370FF' },
+  get_order_detail: { icon: <FileText size={18} />, color: '#00B42A' },
+  track_logistics: { icon: <Truck size={18} />, color: '#FF7D00' },
+  search_faqs: { icon: <BookOpen size={18} />, color: '#8B5CF6' },
+  list_faq_tags: { icon: <Tags size={18} />, color: '#F59E0B' },
+  get_user_profile: { icon: <User size={18} />, color: '#13C2C2' },
 };
 
-function subtitle(s: McpServer): string {
-  if (s.transport === 'http') return s.url || '';
-  return `${s.command || 'python'} ${s.args || ''}`;
+function toolIcon(name: string): { icon: React.ReactNode; color: string } {
+  if (TOOL_ICONS[name]) return TOOL_ICONS[name];
+  if (/search|query|find/.test(name)) return { icon: <Search size={18} />, color: '#3370FF' };
+  return { icon: <Box size={18} />, color: '#86909C' };
+}
+
+// 取 schema 属性类型（处理 anyOf）
+function argType(v: any): string {
+  if (v.anyOf) return v.anyOf.find((o: any) => o.type !== 'null')?.type || 'string';
+  return v.type || 'string';
+}
+
+// 初始化参数默认值（tenant_id 默认 1，其余取 schema default）
+function initialArgs(schema: any): Record<string, any> {
+  const props = schema?.properties || {};
+  const init: Record<string, any> = {};
+  for (const [k, v] of Object.entries<any>(props)) {
+    if (k === 'tenant_id') { init[k] = 1; continue; }
+    if (v.default !== undefined && v.default !== null) init[k] = v.default;
+    else if (argType(v) === 'boolean') init[k] = false;
+    else init[k] = '';
+  }
+  return init;
 }
 
 export default function McpListPage() {
   const router = useRouter();
-  const [servers, setServers] = useState<McpServer[]>([]);
-  const [statuses, setStatuses] = useState<Record<number, boolean | null>>({});
+  const [tools, setTools] = useState<McpTool[]>([]);
   const [showModal, setShowModal] = useState(false);
 
   const [importJson, setImportJson] = useState('');
@@ -38,7 +62,7 @@ export default function McpListPage() {
   const MCP_EXAMPLES = [
     {
       type: 'npx', label: 'Node.js 包',
-      icon: <Code2 size={14} />,
+      icon: <Box size={14} />,
       color: '#00B42A',
       desc: '最常见的 MCP Server 形式，一行 npx 安装运行',
       json: JSON.stringify({
@@ -52,7 +76,7 @@ export default function McpListPage() {
     },
     {
       type: 'http', label: 'HTTP 远程',
-      icon: <Globe size={14} />,
+      icon: <Search size={14} />,
       color: '#3370FF',
       desc: '已部署好的 MCP 服务，通过 URL 连接',
       json: JSON.stringify({
@@ -82,7 +106,7 @@ export default function McpListPage() {
     },
     {
       type: 'uvx', label: 'Python 包',
-      icon: <Terminal size={14} />,
+      icon: <Wrench size={14} />,
       color: '#8B5CF6',
       desc: '通过 uvx 运行 Python MCP 包，无需手动安装',
       json: JSON.stringify({
@@ -96,20 +120,15 @@ export default function McpListPage() {
     },
   ];
 
-  async function fetchServers() {
+  async function fetchTools() {
     try {
-      const r = await fetch(`${API}/api/mcp/servers`);
-      const list: McpServer[] = await r.json();
-      setServers(list);
-      for (const s of list) {
-        fetch(`${API}/api/mcp/servers/${s.id}/tools`, { method: 'POST' })
-          .then(r => setStatuses(p => ({ ...p, [s.id]: r.ok })))
-          .catch(() => setStatuses(p => ({ ...p, [s.id]: false })));
-      }
+      const r = await fetch(`${API}/api/mcp/tools/all`);
+      const list: McpTool[] = await r.json();
+      setTools(list);
     } catch {}
   }
 
-  useEffect(() => { fetchServers(); }, []);
+  useEffect(() => { fetchTools(); }, []);
 
   async function importServers() {
     setImportError('');
@@ -128,20 +147,23 @@ export default function McpListPage() {
     }
     setShowModal(false);
     setImportJson('');
-    fetchServers();
+    fetchTools();
   }
 
-  async function removeServer(id: number) {
-    await fetch(`${API}/api/mcp/servers/${id}`, { method: 'DELETE' });
-    setServers(s => s.filter(x => x.id !== id));
+  // 按 server 分组
+  const groups = new Map<string, McpTool[]>();
+  for (const t of tools) {
+    const key = t.server_name;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(t);
   }
 
   return (
     <div style={{ height: '100vh', background: T.bg, color: T.text, fontFamily: "system-ui,-apple-system,'Segoe UI',sans-serif", overflow: 'auto' }}>
-      <div style={{ maxWidth: 800, margin: '0 auto', padding: `${S.huge}px ${S.xl}px` }}>
+      <div style={{ maxWidth: 1080, margin: '0 auto', padding: `${S.huge}px ${S.xl}px` }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: S.sm, marginBottom: S.xs }}>
           <Wrench size={22} color={T.accent} />
-          <h2 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>MCP 服务</h2>
+          <h2 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>工具</h2>
           <div style={{ flex: 1 }} />
           <button onClick={() => setShowModal(true)} style={{
             ...btnPrimary, display: 'flex', alignItems: 'center', gap: 5, padding: '8px 16px', fontSize: 13,
@@ -150,84 +172,79 @@ export default function McpListPage() {
           </button>
         </div>
         <p style={{ margin: 0, marginBottom: S.xl, fontSize: 13, color: T.secondary }}>
-          Model Context Protocol — 管理已注册的 MCP 服务与工具
+          平台所有可用的 MCP 工具，共 {tools.length} 个
         </p>
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: S.base }}>
-          {servers.map(s => {
-            const status = statuses[s.id];
-            return (
-              <div key={s.id} style={{ position: 'relative' }}>
-                <div
-                  onClick={() => router.push(`/dashboard/mcp/${s.id}`)}
-                  style={{
-                    padding: `${S.lg}px ${S.xl}px`,
-                    background: T.surface,
-                    borderRadius: 10,
-                    border: `1px solid ${T.border}`,
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: S.base,
-                    transition: 'border-color .15s, box-shadow .15s',
-                  }}
-                  onMouseEnter={e => { e.currentTarget.style.borderColor = T.accent; e.currentTarget.style.boxShadow = `0 0 0 1px ${T.accent}20`; }}
-                  onMouseLeave={e => { e.currentTarget.style.borderColor = T.border; e.currentTarget.style.boxShadow = 'none'; }}
-                >
-                  <div style={{
-                    width: 40, height: 40, borderRadius: 8, background: T.accentBg,
-                    display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-                  }}>
-                    <Server size={18} color={T.accent} />
-                  </div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: S.sm }}>
-                      <span style={{ fontSize: 14, fontWeight: 600 }}>{s.name}</span>
-                      <span style={{
-                        fontSize: 10, padding: '2px 8px', borderRadius: 10,
-                        background: s.transport === 'http' ? '#3370FF15' : '#00B42A15',
-                        color: s.transport === 'http' ? '#3370FF' : '#00B42A',
-                        display: 'flex', alignItems: 'center', gap: 3, fontWeight: 500,
+        {[...groups.entries()].map(([serverName, serverTools]) => (
+          <div key={serverName} style={{ marginBottom: S.xxl }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: S.sm, marginBottom: S.md }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: T.text }}>{serverName}</span>
+              <span style={{
+                fontSize: 10, padding: '1px 8px', borderRadius: 10,
+                background: T.accentBg, color: T.accent, fontWeight: 500,
+              }}>
+                {serverTools.length} 个工具
+              </span>
+            </div>
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(3, 1fr)',
+              gap: S.base,
+            }}>
+              {serverTools.map(t => {
+                const { icon, color } = toolIcon(t.name);
+                return (
+                  <div
+                    key={t.name}
+                    onClick={() => router.push(`/dashboard/mcp/tool/${encodeURIComponent(t.name)}`)}
+                    style={{
+                      background: T.surface,
+                      border: `1px solid ${T.border}`,
+                      borderRadius: 10,
+                      padding: `${S.lg}px ${S.base}px`,
+                      cursor: 'pointer',
+                      transition: 'border-color .15s, box-shadow .15s, transform .15s',
+                    }}
+                    onMouseEnter={e => {
+                      e.currentTarget.style.borderColor = color;
+                      e.currentTarget.style.boxShadow = `0 2px 12px ${color}15`;
+                      e.currentTarget.style.transform = 'translateY(-1px)';
+                    }}
+                    onMouseLeave={e => {
+                      e.currentTarget.style.borderColor = T.border;
+                      e.currentTarget.style.boxShadow = 'none';
+                      e.currentTarget.style.transform = 'none';
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: S.sm, marginBottom: S.sm }}>
+                      <div style={{
+                        width: 32, height: 32, borderRadius: 8, flexShrink: 0,
+                        background: `${color}14`, display: 'flex', alignItems: 'center', justifyContent: 'center',
                       }}>
-                        {TRANSPORT_ICON[s.transport]} {s.transport.toUpperCase()}
-                      </span>
+                        {icon}
+                      </div>
+                      <span style={{ fontSize: 14, fontWeight: 600, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.name}</span>
                     </div>
-                    <div style={{ fontSize: 12, color: T.secondary, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace' }}>
-                      {subtitle(s)}
-                    </div>
+                    <p style={{
+                      margin: 0, fontSize: 12, color: T.secondary, lineHeight: 1.5,
+                      display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+                    }}>
+                      {t.description || '暂无描述'}
+                    </p>
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: S.md, flexShrink: 0 }}>
-                    {status === null ? (
-                      <span style={{ fontSize: 11, color: T.tertiary }}>检测中...</span>
-                    ) : status ? (
-                      <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: T.success }}>
-                        <Circle size={6} fill={T.success} stroke={T.success} /> 在线
-                      </span>
-                    ) : (
-                      <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: T.danger }}>
-                        <Circle size={6} fill={T.danger} stroke={T.danger} /> 离线
-                      </span>
-                    )}
-                    <ChevronRight size={16} color={T.tertiary} />
-                  </div>
-                </div>
-                <button
-                  onClick={e => { e.stopPropagation(); removeServer(s.id); }}
-                  title="删除"
-                  style={{
-                    position: 'absolute', top: -6, right: -6,
-                    width: 24, height: 24, borderRadius: 12,
-                    background: T.danger, border: 'none', color: '#fff',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    cursor: 'pointer', opacity: 0,
-                    transition: 'opacity .12s',
-                  }}
-                  onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
-                ><Trash2 size={12} /></button>
-              </div>
-            );
-          })}
-        </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+
+        {tools.length === 0 && (
+          <div style={{ textAlign: 'center', padding: '80px 0', color: T.tertiary }}>
+            <Box size={36} style={{ marginBottom: S.md, opacity: 0.4 }} />
+            <div style={{ fontSize: 14, marginBottom: S.sm }}>暂无工具</div>
+            <div style={{ fontSize: 12 }}>点击右上角"导入 MCP"添加工具</div>
+          </div>
+        )}
       </div>
 
       {/* ── Import Modal ── */}

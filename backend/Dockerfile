@@ -2,6 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# HuggingFace 走国内镜像（构建时预下载 reranker 模型用）
+ENV HF_ENDPOINT=https://hf-mirror.com
+# pip 走清华镜像（加速依赖安装）
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
 # Node.js + npm (for npx MCP servers)
 RUN apt-get update && apt-get install -y curl gnupg && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
@@ -16,7 +21,7 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 RUN pip install --no-cache-dir \
     fastapi uvicorn pyjwt psycopg2-binary pydantic python-multipart \
     websockets aiohttp requests sentence-transformers \
-    langchain-core langchain-openai langgraph mcp redis numpy
+    langchain-core langchain-openai langgraph 'mcp<2' redis numpy
 
 RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3')"
 
