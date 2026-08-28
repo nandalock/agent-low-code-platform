@@ -100,8 +100,8 @@ class MemoryCompressor:
         """消息列表 → 纯文本。"""
         lines: list[str] = []
         for msg in messages:
-            role = Compressor._role(msg)
-            content = Compressor._content(msg)
+            role = MemoryCompressor._role(msg)
+            content = MemoryCompressor._content(msg)
 
             if role == 'customer':
                 lines.append(f"用户：{content}")

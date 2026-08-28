@@ -5,11 +5,11 @@ from backend.db.connection import get_conn
 
 
 def get_agent_definition(agent_key: str) -> dict | None:
-    """读取 agent 定义（name, desc, config）"""
+    """读取 agent 定义（name, desc, config, cache_policy）"""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT agent_key, name, description, config, status, agent_type FROM agent_definitions WHERE agent_key = %s",
+                "SELECT agent_key, name, description, config, status, agent_type, cache_policy FROM agent_definitions WHERE agent_key = %s",
                 (agent_key,),
             )
             row = cur.fetchone()
@@ -20,7 +20,7 @@ def list_agent_definitions() -> list[dict]:
     """列出所有 agent 定义"""
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT agent_key, name, description, config, status, agent_type FROM agent_definitions ORDER BY agent_key")
+            cur.execute("SELECT agent_key, name, description, config, status, agent_type, cache_policy FROM agent_definitions ORDER BY agent_key")
             return [dict(r) for r in cur.fetchall()]
 
 

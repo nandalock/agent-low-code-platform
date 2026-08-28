@@ -43,3 +43,5 @@ test_payload.json
 # Test payload
 test_payload.json
 
+# Build logs
+backend_build.log

@@ -7,7 +7,7 @@ export default function DashboardPage() {
         <div style={{ width:64, height:64, borderRadius:16, background:T.accentBg, margin:'0 auto', marginBottom:S.xl, display:'flex', alignItems:'center', justifyContent:'center', border:`1px solid rgba(51,112,255,0.15)` }}>
           <span style={{ fontSize:24 }}>👋</span>
         </div>
-        <p style={{ fontSize:18, fontWeight:600, color:T.text, margin:0 }}>欢迎使用智能客服</p>
+        <p style={{ fontSize:18, fontWeight:600, color:T.text, margin:0 }}>欢迎使用低代码平台</p>
         <p style={{ fontSize:14, color:T.secondary, margin:0, marginTop:S.sm }}>选择左侧功能开始使用</p>
         <div style={{ display:'flex', gap:S.base, marginTop:S.xxxl, justifyContent:'center' }}>
           {[{ label:'会话', icon:'💬' },{ label:'知识库', icon:'📚' },{ label:'Agent', icon:'🤖' }].map(s=>(

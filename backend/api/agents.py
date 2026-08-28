@@ -89,18 +89,20 @@ def agent_create(body: dict = Body(...)) -> dict:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO agent_definitions (agent_key, name, description, config, agent_type)
-                   VALUES (%s, %s, %s, %s::jsonb, %s)
+                """INSERT INTO agent_definitions (agent_key, name, description, config, agent_type, cache_policy)
+                   VALUES (%s, %s, %s, %s::jsonb, %s, %s::jsonb)
                    ON CONFLICT (agent_key) DO UPDATE
                    SET name = EXCLUDED.name, description = EXCLUDED.description,
-                       config = EXCLUDED.config, agent_type = EXCLUDED.agent_type
+                       config = EXCLUDED.config, agent_type = EXCLUDED.agent_type,
+                       cache_policy = COALESCE(agent_definitions.cache_policy, EXCLUDED.cache_policy)
                    RETURNING agent_key, name, description, config, status, agent_type""",
-                (key, name, desc, json.dumps(config), agent_type),
+                (key, name, desc, json.dumps(config), agent_type, json.dumps(_default_cache_policy(key))),
             )
             row = dict(cur.fetchone())
 
     definition = {"agent_key": row["agent_key"], "name": row["name"], "description": row["description"],
-                  "config": dict(row["config"]), "status": row["status"], "agent_type": row.get("agent_type", "agent")}
+                  "config": dict(row["config"]), "status": row["status"], "agent_type": row.get("agent_type", "agent"),
+                  "cache_policy": row.get("cache_policy") or _default_cache_policy(key)}
     if agent_type == "router":
         register(RouterRuntime(key=key, definition=definition))
     else:
@@ -108,8 +110,25 @@ def agent_create(body: dict = Body(...)) -> dict:
     return {"ok": True, "agent": {"key": key, "name": name, "desc": desc, "status": row["status"], "agent_type": agent_type}}
 
 
+def _default_cache_policy(agent_key: str) -> dict:
+    """所有 agent 统一的初始缓存策略，用户自行按需修改。"""
+    return {
+        "base_score": 0.50,
+        "cacheable_intents": [],
+        "block_entities": [
+            {"name": "手机号", "pattern": r"\b1[3-9]\d{9}\b", "penalty": 0.0},
+            {"name": "身份证", "pattern": r"\b\d{6}(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b", "penalty": 0.0},
+            {"name": "订单号", "pattern": r"\b\d{15,20}\b", "penalty": 0.0},
+            {"name": "运单号", "pattern": r"\b\d{15,20}\b", "penalty": 0.0},
+            {"name": "日期", "pattern": r"\b\d{4}-\d{2}-\d{2}\b", "penalty": 0.2},
+            {"name": "金额", "pattern": r"\d+\.?\d*\s*元", "penalty": 0.2},
+            {"name": "地址", "pattern": r"(北京|上海|广州|深圳|杭州|成都|武汉|南京|重庆|天津|苏州|西安).{0,10}(区|路|街|楼|号)", "penalty": 0.3},
+        ],
+    }
+
+
 @router.get("/{agent_key}/config")
-def agent_get_config(agent_key: str) -> AgentConfigResponse:
+def agent_get_config(agent_key: str) -> dict:
     try:
         get_agent(agent_key)
     except KeyError:
@@ -118,18 +137,36 @@ def agent_get_config(agent_key: str) -> AgentConfigResponse:
     base = definition.get("config", {})
     overrides = get_agent_config(agent_key) or {}
     config = {**base, **overrides}
-    return AgentConfigResponse(agent_key=agent_key, config=config)
+    cache_policy = definition.get("cache_policy") or _default_cache_policy(agent_key)
+    return {
+        "agent_key": agent_key,
+        "config": config,
+        "cache_policy": cache_policy,
+    }
 
 
 @router.put("/{agent_key}/config")
-def agent_save_config(agent_key: str, body: dict = Body(...)) -> AgentConfigResponse:
+def agent_save_config(agent_key: str, body: dict = Body(...)) -> dict:
     try:
         get_agent(agent_key)
     except KeyError:
         raise HTTPException(404, f"Agent 不存在: {agent_key}")
-    config = save_agent_config(agent_key, body)
+
+    # cache_policy 写入 agent_definitions，其余写入 agent_configs
+    cache_policy = body.pop("cache_policy", None)
+    config = save_agent_config(agent_key, body) if body else {}
+
+    if cache_policy is not None:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE agent_definitions SET cache_policy = %s::jsonb, updated_at = now() WHERE agent_key = %s",
+                    (json.dumps(cache_policy), agent_key),
+                )
+            conn.commit()
+
     invalidate_desc_cache(agent_key)
-    return AgentConfigResponse(agent_key=agent_key, config=config)
+    return {"agent_key": agent_key, "config": config, "cache_policy": cache_policy}
 
 
 @router.post("/{agent_key}/chat")

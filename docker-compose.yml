@@ -1,3 +1,5 @@
+name: agent-low-code-platform
+
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -26,6 +28,7 @@ services:
       - "9001:9001"
     depends_on:
       - db
+      - redis
 
   frontend:
     build: ./frontend
@@ -43,7 +46,28 @@ services:
     depends_on:
       - backend
 
+  redis:
+    image: redis/redis-stack:7.4.0-v2
+    container_name: redis
+    ports:
+      - "6379:6379"
+      - "8001:8001"
+    volumes:
+      - redis-data:/data
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: redisinsight
+    ports:
+      - "5540:5540"
+    volumes:
+      - redisinsight-data:/data
+    depends_on:
+      - redis
+
 volumes:
   pgdata:
   npm_cache:
   uv_cache:
+  redis-data:
+  redisinsight-data:

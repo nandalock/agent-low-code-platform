@@ -54,7 +54,8 @@ def build_workflow(nodes: list, edges: list):
             agent_key = config.get("agent_key", "")
             if not agent_key:
                 raise ValueError(f"Agent 节点 {nid} 缺少 agent_key")
-            graph.add_node(nid, handlers.make_agent_handler(nid, agent_key))
+            cache_config = config.get("cache", {})
+            graph.add_node(nid, handlers.make_agent_handler(nid, agent_key, cache_config))
         elif ntype == "condition":
             # handler 只做透传记录，路由交给 conditional_edges 的 router
             graph.add_node(nid, handlers.make_condition_handler(nid, config))

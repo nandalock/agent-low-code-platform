@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import Link from 'next/link';
 import dynamic from 'next/dynamic';
-import { MessageCircle, BookOpen, Bot, Plug, ChevronLeft, ChevronRight, Brain, Wrench, GitBranch } from 'lucide-react';
+import { MessageCircle, BookOpen, Bot, Plug, ChevronLeft, ChevronRight, Brain, Wrench, GitBranch, LayoutGrid } from 'lucide-react';
 import { T, S } from '@/app/theme';
 
 const ChatPageInner = dynamic(() => import('./_components/ChatPageInner'), { ssr:false });
@@ -14,10 +14,11 @@ const MENU: MenuItem[] = [
   { label:'聊天', path:'/dashboard/chat', icon:<MessageCircle size={18} /> },
   { label:'知识库', path:'/dashboard/knowledge', icon:<BookOpen size={18} /> },
   { label:'Agent', path:'/dashboard/agents', icon:<Bot size={18} /> },
-  { label:'MCP 工具', path:'/dashboard/mcp', icon:<Wrench size={18} /> },
+  { label:'工具', path:'/dashboard/mcp', icon:<Wrench size={18} /> },
   { label:'集成管理', path:'/dashboard/integrations', icon:<Plug size={18} /> },
   { label:'记忆系统', path:'/dashboard/memory', icon:<Brain size={18} /> },
   { label:'工作流', path:'/dashboard/workflow', icon:<GitBranch size={18} /> },
+  { label:'工作区', path:'/dashboard/workspace', icon:<LayoutGrid size={18} /> },
 ];
 const COLLAPSED_W=64, EXPANDED_W=220;
 
@@ -45,7 +46,7 @@ export default function DashboardLayout({ children }:{ children:React.ReactNode 
         {/* Brand */}
         <div style={{ padding:collapsed?`${S.base}px ${S.sm}px`:`${S.lg}px ${S.xl}px ${S.base}px`, display:'flex', alignItems:'center', gap:S.sm }}>
           <div style={{ width:32, height:32, borderRadius:8, background:T.accent, flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center', fontSize:14, fontWeight:700, color:'#fff' }}>CS</div>
-          {!collapsed && <span style={{ fontSize:16, fontWeight:600, color:'#fff', whiteSpace:'nowrap' }}>智能客服</span>}
+          {!collapsed && <span style={{ fontSize:16, fontWeight:600, color:'#fff', whiteSpace:'nowrap' }}>低代码平台</span>}
         </div>
         {/* Nav */}
         <nav style={{ flex:1, padding:`${S.sm}px ${S.xs}px`, display:'flex', flexDirection:'column', gap:1 }}>

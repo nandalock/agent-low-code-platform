@@ -14,6 +14,7 @@ interface PreviewMsg {
   content: string;
   time: string;
   sender?: string;
+  thinkSteps?: ThinkStep[];
 }
 
 interface ThinkStep {
@@ -22,6 +23,13 @@ interface ThinkStep {
   type: string;
   output: string;
   ms: number;
+  cache?: {
+    hit: boolean;
+    tier: string;
+    score: number | null;
+    factors?: { name: string; score: number; weight: number; reason: string; suggestion: string }[];
+    summary?: string;
+  };
 }
 
 export default function WorkflowDetailPage() {
@@ -39,8 +47,9 @@ export default function WorkflowDetailPage() {
   const [messages, setMessages] = useState<PreviewMsg[]>([]);
   const [previewInput, setPreviewInput] = useState('');
   const [previewSending, setPreviewSending] = useState(false);
-  const [thinkSteps, setThinkSteps] = useState<ThinkStep[]>([]);
-  const [thinkOpen, setThinkOpen] = useState(false);
+  const [currentThinkSteps, setCurrentThinkSteps] = useState<ThinkStep[]>([]);
+  const thinkStepsRef = useRef<ThinkStep[]>([]);
+  const [openThinks, setOpenThinks] = useState<Set<number>>(new Set());
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
@@ -52,12 +61,17 @@ export default function WorkflowDetailPage() {
     try {
       const url = isNew ? `${API}/api/workflows` : `${API}/api/workflows/${id}`;
       const method = isNew ? 'POST' : 'PUT';
-      const body = JSON.stringify({
-        name: saveName || '未命名工作流',
+      const bodyObj: Record<string, unknown> = {
         nodes: data.nodes,
         edges: data.edges,
-        ...(isNew ? {} : { status: 'draft' }),
-      });
+      };
+      if (isNew) {
+        bodyObj.name = saveName || '未命名工作流';
+      } else {
+        bodyObj.status = 'draft';
+        if (saveName) bodyObj.name = saveName;
+      }
+      const body = JSON.stringify(bodyObj);
 
       const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body });
       if (r.ok) {
@@ -66,8 +80,13 @@ export default function WorkflowDetailPage() {
           router.replace(`/dashboard/workflow/${d.id}`);
         }
         setShowNameDialog(false);
+      } else {
+        const err = await r.json().catch(() => ({}));
+        alert((err as any).detail || `保存失败 (${r.status})`);
       }
-    } catch {}
+    } catch {
+      alert('网络错误，保存失败');
+    }
     setSaving(false);
   };
 
@@ -86,8 +105,8 @@ export default function WorkflowDetailPage() {
     setMessages(prev => [...prev, userMsg]);
     setPreviewInput('');
     setPreviewSending(true);
-    setThinkSteps([]);
-    setThinkOpen(false);
+    thinkStepsRef.current = [];
+    setCurrentThinkSteps([]);
 
     try {
       // 先保存最新节点配置（含 agent_key 等），确保运行读到最新数据
@@ -120,21 +139,27 @@ export default function WorkflowDetailPage() {
             try {
               const d = JSON.parse(line.slice(6));
               if (d.type === 'node_done') {
-                setThinkSteps(prev => [...prev, {
+                const step: ThinkStep = {
                   node_id: d.node_id,
                   label: d.label,
                   type: d.node_type || d.type,
                   output: d.output || '',
                   ms: d.ms || 0,
-                }]);
+                  cache: d.cache,
+                };
+                thinkStepsRef.current = [...thinkStepsRef.current, step];
+                setCurrentThinkSteps(thinkStepsRef.current);
               } else if (d.type === 'workflow_done') {
-                setThinkOpen(false); // 完成后折叠
                 const finalOutput = d.output || '';
+                const steps = thinkStepsRef.current;
                 setMessages(prev => [...prev, {
                   role: 'agent',
                   content: finalOutput || '工作流执行完成',
                   time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+                  thinkSteps: steps,
                 }]);
+                thinkStepsRef.current = [];
+                setCurrentThinkSteps([]);
               } else if (d.type === 'error') {
                 setMessages(prev => [...prev, { role: 'agent', content: d.message, time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) }]);
               }
@@ -198,11 +223,13 @@ export default function WorkflowDetailPage() {
           <div style={{
             width: 380, flexShrink: 0, background: T.surface,
             borderLeft: `1px solid ${T.border}`, display: 'flex', flexDirection: 'column',
+            overflow: 'hidden',
           }}>
             {/* Panel header */}
             <div style={{
               display: 'flex', alignItems: 'center', justifyContent: 'space-between',
               padding: `${S.sm}px ${S.base}px`, borderBottom: `1px solid ${T.border}`,
+              flexShrink: 0,
             }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <span style={{ width: 7, height: 7, borderRadius: '50%', background: T.success }} />
@@ -217,7 +244,7 @@ export default function WorkflowDetailPage() {
             </div>
 
             {/* Messages */}
-            <div style={{ flex: 1, padding: S.base, overflow: 'auto' }}>
+            <div style={{ flex: 1, padding: S.base, overflow: 'auto', minHeight: 0 }}>
               {messages.length === 0 && (
                 <div style={{ textAlign: 'center', color: T.tertiary, marginTop: S.huge, fontSize: 13 }}>
                   输入消息预览工作流效果
@@ -225,6 +252,9 @@ export default function WorkflowDetailPage() {
               )}
               {messages.map((msg, i) => {
                 const isUser = msg.role === 'user';
+                const hasThink = !isUser && msg.thinkSteps && msg.thinkSteps.length > 0;
+                const thinkOpen = openThinks.has(i);
+
                 return (
                   <div key={i} style={{ marginBottom: S.lg, display: 'flex', flexDirection: 'column', alignItems: isUser ? 'flex-end' : 'flex-start' }}>
                     <div style={{ fontSize: 11, color: T.secondary, marginBottom: 4 }}>
@@ -240,60 +270,165 @@ export default function WorkflowDetailPage() {
                     }}>
                       {msg.content}
                     </div>
+
+                    {/* 每条 agent 消息的思考过程 */}
+                    {hasThink && (
+                      <div style={{ marginTop: S.xs, width: '100%', maxWidth: '85%' }}>
+                        <button
+                          onClick={() => {
+                            setOpenThinks(prev => {
+                              const next = new Set(prev);
+                              if (next.has(i)) next.delete(i); else next.add(i);
+                              return next;
+                            });
+                          }}
+                          style={{
+                            display: 'flex', alignItems: 'center', gap: 4, padding: 0,
+                            border: 'none', background: 'transparent', cursor: 'pointer',
+                            fontSize: 12, color: T.secondary, fontFamily: 'inherit',
+                          }}
+                        >
+                          {thinkOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                          思考过程 ({msg.thinkSteps!.length} 步)
+                        </button>
+                        {thinkOpen && (
+                          <div style={{
+                            marginTop: S.xs, padding: `${S.sm}px ${S.md}px`, borderRadius: 8,
+                            background: '#F0F1F5', border: `1px solid ${T.border}`,
+                          }}>
+                            {msg.thinkSteps!.map((s, j) => {
+                              const isFinal = j === msg.thinkSteps!.length - 1;
+                              const isCacheHit = s.cache?.hit;
+                              const isCacheMiss = s.cache && !s.cache.hit;
+
+                              return (
+                                <div key={j} style={{
+                                  padding: `${S.xs}px 0`,
+                                  borderBottom: isFinal ? 'none' : `1px solid #E5E6EB`,
+                                  fontSize: 12,
+                                }}>
+                                  <div style={{ display: 'flex', gap: S.sm, alignItems: 'flex-start' }}>
+                                    <span style={{ color: T.secondary, flexShrink: 0, minWidth: 60, fontWeight: 500 }}>
+                                      {s.label}
+                                    </span>
+                                    <span style={{ color: T.tertiary, flex: 1, whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5 }}>
+                                      {s.output || (isCacheMiss ? '' : '(无输出)')}
+                                    </span>
+                                    {s.ms > 0 && (
+                                      <span style={{ color: T.tertiary, flexShrink: 0 }}>{s.ms}ms</span>
+                                    )}
+                                  </div>
+
+                                  {/* 缓存详情 */}
+                                  {s.cache && (
+                                    <div style={{
+                                      marginTop: 4, marginLeft: 68, display: 'flex', flexDirection: 'column', gap: 4,
+                                    }}>
+                                      {isCacheHit ? (
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                          <span style={{
+                                            fontSize: 10, fontWeight: 600, color: T.success,
+                                            background: '#E8FFEA', padding: '1px 6px', borderRadius: 8,
+                                          }}>
+                                            命中 {s.cache.tier === 'exact' ? 'L1 精确' : 'L2 语义'}
+                                          </span>
+                                          {s.cache.score != null && (
+                                            <span style={{ fontSize: 10, color: T.tertiary }}>
+                                              相似度 {s.cache.tier === 'exact' ? '1.00' : (s.cache.score as number).toFixed(4)}
+                                            </span>
+                                          )}
+                                        </div>
+                                      ) : (
+                                        <>
+                                          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                            <span style={{
+                                              fontSize: 10, fontWeight: 500, color: '#92400E',
+                                              background: '#FEF3C7', padding: '1px 6px', borderRadius: 8,
+                                            }}>
+                                              未命中
+                                            </span>
+                                            {s.cache.score != null && (
+                                              <span style={{ fontSize: 10, color: T.secondary, fontWeight: 500 }}>
+                                                综合分 {(s.cache.score as number).toFixed(3)}
+                                              </span>
+                                            )}
+                                            {s.cache.summary && (
+                                              <span style={{ fontSize: 10, color: T.tertiary }}>
+                                                {s.cache.summary}
+                                              </span>
+                                            )}
+                                          </div>
+                                          {s.cache.factors && s.cache.factors.length > 0 && (
+                                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                                              {s.cache.factors.map((f, fi) => {
+                                                const barColor = f.score >= 0.7 ? T.success : f.score >= 0.3 ? '#D97706' : T.danger;
+                                                const bgColor = f.score >= 0.7 ? '#E8FFEA' : f.score >= 0.3 ? '#FEF3C7' : '#FFF2F0';
+                                                return (
+                                                  <div key={fi} style={{
+                                                    fontSize: 10, padding: '2px 6px', borderRadius: 4,
+                                                    background: bgColor, border: `1px solid ${barColor}30`,
+                                                    display: 'flex', alignItems: 'center', gap: 3,
+                                                  }}>
+                                                    <span style={{ color: T.secondary }}>{f.name}</span>
+                                                    <span style={{ fontWeight: 600, color: barColor }}>{f.score.toFixed(2)}</span>
+                                                    <span style={{ color: T.tertiary, fontSize: 9 }}>×{f.weight.toFixed(2)}</span>
+                                                  </div>
+                                                );
+                                              })}
+                                            </div>
+                                          )}
+                                        </>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 );
               })}
 
-              {/* Thinking process — collapsible */}
-              {thinkSteps.length > 0 && (
+              {/* 实时思考过程（流式进行中） */}
+              {previewSending && currentThinkSteps.length > 0 && (
                 <div style={{ marginBottom: S.lg }}>
-                  <button
-                    onClick={() => setThinkOpen(v => !v)}
-                    style={{
-                      display: 'flex', alignItems: 'center', gap: 4, padding: 0,
-                      border: 'none', background: 'transparent', cursor: 'pointer',
-                      fontSize: 12, color: T.secondary, fontFamily: 'inherit',
-                    }}
-                  >
-                    {thinkOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                    思考过程 ({thinkSteps.length} 步)
-                  </button>
-                  {thinkOpen && (
-                    <div style={{
-                      marginTop: S.xs, padding: `${S.sm}px ${S.md}px`, borderRadius: 8,
-                      background: '#F0F1F5', border: `1px solid ${T.border}`,
-                    }}>
-                      {thinkSteps.map((s, j) => {
-                        const isFinal = j === thinkSteps.length - 1;
-                        return (
-                          <div key={j} style={{
-                            display: 'flex', gap: S.sm, padding: `${S.xs}px 0`,
-                            borderBottom: isFinal ? 'none' : `1px solid #E5E6EB`,
-                            fontSize: 12,
-                          }}>
-                            <span style={{ color: T.secondary, flexShrink: 0, minWidth: 60, fontWeight: 500 }}>
-                              {s.label}
-                            </span>
-                            <span style={{ color: T.tertiary, flex: 1, whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5 }}>
-                              {s.output || '(无输出)'}
-                            </span>
-                            {s.ms > 0 && (
-                              <span style={{ color: T.tertiary, flexShrink: 0 }}>{s.ms}ms</span>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: 4, marginBottom: S.xs,
+                    fontSize: 12, color: T.secondary,
+                  }}>
+                    <ChevronDown size={14} />
+                    思考过程 ({currentThinkSteps.length} 步)
+                  </div>
+                  <div style={{
+                    padding: `${S.sm}px ${S.md}px`, borderRadius: 8,
+                    background: '#F0F1F5', border: `1px solid ${T.border}`,
+                  }}>
+                    {currentThinkSteps.map((s, j) => (
+                      <div key={j} style={{
+                        padding: `${S.xs}px 0`, fontSize: 12,
+                        borderBottom: j === currentThinkSteps.length - 1 ? 'none' : `1px solid #E5E6EB`,
+                      }}>
+                        <div style={{ display: 'flex', gap: S.sm, alignItems: 'flex-start' }}>
+                          <span style={{ color: T.secondary, flexShrink: 0, minWidth: 60, fontWeight: 500 }}>{s.label}</span>
+                          <span style={{ color: T.tertiary, flex: 1, whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5 }}>
+                            {s.output || ''}
+                          </span>
+                          {s.ms > 0 && <span style={{ color: T.tertiary, flexShrink: 0 }}>{s.ms}ms</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
-
               {previewSending && <div style={{ color: T.secondary, fontSize: 12, paddingLeft: 4 }}>工作流运行中...</div>}
               <div ref={chatEndRef} />
             </div>
 
             {/* Input */}
-            <div style={{ padding: `${S.sm}px ${S.base}px ${S.base}px`, borderTop: `1px solid ${T.border}` }}>
+            <div style={{ padding: `${S.sm}px ${S.base}px ${S.base}px`, borderTop: `1px solid ${T.border}`, flexShrink: 0 }}>
               <div style={{ display: 'flex', gap: S.xs }}>
                 <input
                   value={previewInput}

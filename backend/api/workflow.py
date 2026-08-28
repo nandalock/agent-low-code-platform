@@ -1,4 +1,5 @@
 import json
+import re
 
 import psycopg2.errors
 from fastapi import APIRouter, HTTPException
@@ -7,6 +8,15 @@ from pydantic import BaseModel
 from backend.db.connection import get_conn
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
+
+# Lone surrogates (U+D800–U+DFFF) are invalid in JSON; strip them before saving.
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def _safe_dumps(obj) -> str:
+    """json.dumps that strips lone surrogates before encoding."""
+    raw = json.dumps(obj, ensure_ascii=False)
+    return _SURROGATE_RE.sub("", raw)
 
 
 class RunWorkflowPayload(BaseModel):
@@ -50,8 +60,8 @@ def create_workflow(payload: CreateWorkflowPayload, tenant_id: int = 1):
                     """INSERT INTO workflows (tenant_id, name, nodes, edges)
                        VALUES (%s, %s, %s::jsonb, %s::jsonb) RETURNING id""",
                     (tenant_id, payload.name,
-                     json.dumps(payload.nodes) if payload.nodes else '[]',
-                     json.dumps(payload.edges) if payload.edges else '[]'),
+                     _safe_dumps(payload.nodes) if payload.nodes else '[]',
+                     _safe_dumps(payload.edges) if payload.edges else '[]'),
                 )
                 new_id = cur.fetchone()["id"]
             conn.commit()
@@ -86,10 +96,10 @@ def save_workflow(workflow_id: int, payload: SaveWorkflowPayload):
         params.append(payload.status)
     if payload.nodes is not None:
         sets.append("nodes = %s::jsonb")
-        params.append(json.dumps(payload.nodes))
+        params.append(_safe_dumps(payload.nodes))
     if payload.edges is not None:
         sets.append("edges = %s::jsonb")
-        params.append(json.dumps(payload.edges))
+        params.append(_safe_dumps(payload.edges))
     if not sets:
         raise HTTPException(400, "没有要更新的字段")
     sets.append("updated_at = now()")

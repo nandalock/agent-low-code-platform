@@ -22,7 +22,7 @@ async def embed(text: str, model: str = "bge-m3") -> list[float] | None:
                 if embeddings:
                     return embeddings[0]
     except Exception as e:
-        logger.warning(f"Embedding 失败: {e}")
+        logger.warning(f"Embedding 失败: url={OLLAMA_URL}/api/embed model={model} error={e}")
     return None
 
 

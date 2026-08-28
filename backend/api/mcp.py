@@ -246,6 +246,57 @@ async def api_list_tools():
     return client.tools
 
 
+@router.get("/tools/all")
+async def api_list_all_tools():
+    """列出所有已注册 MCP 工具（含来源 server 信息），尝试连接未索引的 server"""
+    registry = get_registry()
+    servers = registry._list_servers()
+    name_map = {s["id"]: s["name"] for s in servers}
+
+    # 尝试索引尚未连接的 server（本地立即成功，远程/stdio 失败则跳过）
+    for srv in servers:
+        try:
+            await registry.connect_server(srv)
+        except Exception:
+            continue
+
+    tools = []
+    for name, entry in registry._index.items():
+        schema = entry.get("schema") or {}
+        tools.append({
+            "name": name,
+            "description": schema.get("description", ""),
+            "inputSchema": schema.get("inputSchema", {}),
+            "server_id": entry.get("server_id"),
+            "server_name": name_map.get(entry.get("server_id"), f"server-{entry.get('server_id')}"),
+            "transport": entry.get("transport", "http"),
+        })
+    tools.sort(key=lambda t: (t["server_name"], t["name"]))
+    return tools
+
+
+@router.get("/tools/{name}")
+async def api_get_tool(name: str):
+    """查询单个工具信息（未索引则懒加载）"""
+    registry = get_registry()
+    entry = registry._index.get(name)
+    if not entry:
+        entry = await registry._lazy_load_tool(name)
+    if not entry:
+        raise HTTPException(404, f"工具不存在: {name}")
+    schema = entry.get("schema") or {}
+    servers = registry._list_servers()
+    name_map = {s["id"]: s["name"] for s in servers}
+    return {
+        "name": name,
+        "description": schema.get("description", ""),
+        "inputSchema": schema.get("inputSchema", {}),
+        "server_id": entry.get("server_id"),
+        "server_name": name_map.get(entry.get("server_id"), f"server-{entry.get('server_id')}"),
+        "transport": entry.get("transport", "http"),
+    }
+
+
 @router.post("/tools/{name}/call")
 async def api_call_tool(name: str, args: dict = Body(...)):
     """调用工具 — 从 registry 查所属 server，路由到正确的 server 执行"""
