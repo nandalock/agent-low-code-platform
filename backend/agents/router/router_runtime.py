@@ -20,8 +20,8 @@ import time
 import aiohttp
 
 from backend.agents.base import BaseAgent, AgentReply
-from backend.db.config_service import get_agent_config
-from backend.rag.ollama_embed import embed
+from backend.agents.config_service import get_agent_config
+from backend.core.rag import embed
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class RouterRuntime(BaseAgent):
     """可配置的三层意图路由器"""
 
     def __init__(self, key: str, definition: dict | None = None):
-        from backend.db.config_service import get_agent_definition
+        from backend.agents.config_service import get_agent_definition
 
         if definition is None:
             definition = get_agent_definition(key) or {}
@@ -176,7 +176,7 @@ class RouterRuntime(BaseAgent):
 
     async def _l1_match(self, question: str, config: dict) -> tuple[str | None, float]:
         try:
-            from backend.db.connection import get_conn
+            from backend.core.connection import get_conn
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -209,7 +209,7 @@ class RouterRuntime(BaseAgent):
             return None
 
         try:
-            from backend.db.connection import get_conn
+            from backend.core.connection import get_conn
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -380,7 +380,7 @@ class RouterRuntime(BaseAgent):
             return ""
 
         try:
-            from backend.db.connection import get_conn
+            from backend.core.connection import get_conn
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -484,7 +484,7 @@ class RouterRuntime(BaseAgent):
             except Exception:
                 pass
 
-            from backend.db.connection import get_conn
+            from backend.core.connection import get_conn
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     # 已存在相同问题+相同目标的记录则跳过

@@ -91,24 +91,19 @@ flowchart LR
 ```
 agent-low-code-platform/
 ├── backend/
-│   ├── agents/          # Agent implementations (faq, supervisor, router, human_handoff)
+│   ├── agents/          # Agent implementations (faq, supervisor, router, human_handoff) + config service
 │   ├── api/             # REST & WebSocket endpoints
-│   ├── auth/            # JWT authentication
-│   ├── cache/           # Redis client + semantic cache + caching policy engine
-│   ├── chat/            # Conversation models & service
-│   ├── db/              # Database connection, init & config service
+│   ├── core/            # Infrastructure: db connection & schema, JWT auth, RAG embeddings & reranker
 │   ├── engine/          # Workflow engine (builder, handlers, state, middlewares)
-│   ├── faq/             # Knowledge-base / FAQ service
-│   ├── memory/          # Session context, summarizer, compressor, experience
 │   ├── mcp_service/     # MCP client, registry & built-in server
-│   ├── rag/             # Ollama embeddings & reranker
-│   └── xianyu/          # (optional) 3rd-party channel integration
+│   ├── services/        # Business domains: faq · chat · memory · cache
+│   └── integrations/    # 3rd-party channel integrations (xianyu)
+├── docs/                # design docs
 ├── frontend/
 │   └── app/
 │       ├── dashboard/   # agents · chat · knowledge · mcp · memory · workflow
 │       └── agents/      # per-agent configuration pages
-├── docker-compose.yml   # db · redis · backend · frontend
-└── main.py
+└── docker-compose.yml   # db · redis · backend · frontend
 ```
 
 ## 📡 API Overview

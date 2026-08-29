@@ -1,7 +1,7 @@
 """MCP Server — FastMCP 暴露数据库查询工具"""
 import logging
 from mcp.server.fastmcp import FastMCP
-from backend.db.connection import get_conn
+from backend.core.connection import get_conn
 
 logger = logging.getLogger(__name__)
 mcp = FastMCP("agent-low-code-platform-mcp")

@@ -2,8 +2,8 @@
 import json, logging, time
 from backend.agents.base import AgentReply
 from backend.agents.runtime import AgentRuntime
-from backend.faq.service import match_faq, vector_search
-from backend.rag import embed, rerank
+from backend.services.faq.service import match_faq, vector_search
+from backend.core.rag import embed, rerank
 
 logger = logging.getLogger(__name__)
 

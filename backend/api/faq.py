@@ -1,6 +1,6 @@
 from fastapi import APIRouter, File, Header, HTTPException, Query, UploadFile
 
-from backend.faq.models import (
+from backend.services.faq.models import (
     FAQBackfillResult,
     FAQCreate,
     FAQImportResult,
@@ -10,7 +10,7 @@ from backend.faq.models import (
     FAQUpdate,
     FAQVectorizeResult,
 )
-from backend.faq import service
+from backend.services.faq import service
 
 router = APIRouter(prefix="/api/faqs", tags=["FAQ"])
 

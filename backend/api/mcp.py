@@ -1,7 +1,7 @@
 """MCP API — 服务管理 + 代理 + 热拔插绑定"""
 import json, traceback, logging, asyncio
 from fastapi import APIRouter, Body, HTTPException
-from backend.db.connection import get_conn
+from backend.core.connection import get_conn
 from backend.mcp_service.client import get_mcp_client, McpClient, MCP_URL
 from backend.mcp_service.registry import get_registry
 

@@ -13,7 +13,7 @@ from backend.api.memory import router as memory_router
 from backend.api.mcp import router as mcp_router
 from backend.api.workflow import router as workflow_router
 
-app = FastAPI(title="SaaS Customer Service")
+app = FastAPI(title="agent-low-code-platform")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3003"],
@@ -33,17 +33,17 @@ app.include_router(workflow_router)
 
 @app.on_event("startup")
 async def startup():
-    from backend.db.init_db import init_db
+    from backend.core.schema import init_db
     from backend.agents import register, _agents
     from backend.agents.runtime import AgentRuntime
     from backend.agents.faqagent.agent import FaqAgent
     from backend.agents.supervisor.agent import SupervisorAgent
     from backend.agents.router import RouterAgent, RouterRuntime
     from backend.agents.human_handoff.agent import HumanHandoffAgent
-    from backend.db.config_service import list_agent_definitions
+    from backend.agents.config_service import list_agent_definitions
     from backend.mcp_service.registry import init_registry
 
-    from backend.db.seed_orders import seed_orders
+    from backend.core.seeds import seed_orders
 
     init_db()
     seed_orders(tenant_id=1)

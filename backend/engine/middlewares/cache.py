@@ -1,8 +1,8 @@
 import time
 import logging
 
-from backend.cache.config import CacheConfig
-from backend.cache.semantic_cache import SemanticCache
+from backend.services.cache.config import CacheConfig
+from backend.services.cache.semantic_cache import SemanticCache
 from backend.engine.middlewares.base import Middleware
 
 logger = logging.getLogger(__name__)

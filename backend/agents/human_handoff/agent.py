@@ -2,7 +2,7 @@
 import time
 
 from backend.agents.base import BaseAgent, AgentReply
-from backend.db.config_service import get_agent_definition, get_agent_config
+from backend.agents.config_service import get_agent_definition, get_agent_config
 
 
 class HumanHandoffAgent(BaseAgent):

@@ -5,7 +5,7 @@ import psycopg2.errors
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from backend.db.connection import get_conn
+from backend.core.connection import get_conn
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
 

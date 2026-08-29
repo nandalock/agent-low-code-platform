@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Header, HTTPException, Query
 
-from backend.chat.models import ConversationCreate, ConversationUpdate, ConversationResponse, MessageCreate, MessageResponse
-from backend.chat import service as chat_service
+from backend.services.chat.models import ConversationCreate, ConversationUpdate, ConversationResponse, MessageCreate, MessageResponse
+from backend.services.chat import service as chat_service
 
 router = APIRouter(prefix="/api/chat", tags=["Chat"])
 

@@ -2,7 +2,7 @@ import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from backend.xianyu import manager
+from backend.integrations.xianyu import manager
 
 logger = logging.getLogger(__name__)
 

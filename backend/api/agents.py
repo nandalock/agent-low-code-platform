@@ -8,10 +8,10 @@ from backend.agents import list_agents, get_agent, register
 from backend.agents.base import AgentReply
 from backend.agents.runtime import AgentRuntime
 from backend.agents.router.router_runtime import RouterRuntime, invalidate_desc_cache
-from backend.db.config_service import get_agent_config, save_agent_config, get_agent_definition
-from backend.db.config_service import list_l1_keywords, create_l1_keyword, update_l1_keyword, delete_l1_keyword
-from backend.db.connection import get_conn
-from backend.chat import service as chat_service
+from backend.agents.config_service import get_agent_config, save_agent_config, get_agent_definition
+from backend.agents.config_service import list_l1_keywords, create_l1_keyword, update_l1_keyword, delete_l1_keyword
+from backend.core.connection import get_conn
+from backend.services.chat import service as chat_service
 
 router = APIRouter(prefix="/api/agents", tags=["Agents"])
 

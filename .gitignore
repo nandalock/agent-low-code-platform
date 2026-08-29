@@ -14,7 +14,6 @@ node_modules/
 .env
 
 # Sensitive credentials
-xianyu_cookie.json
 *.cookie.json
 
 # Temp files
@@ -23,16 +22,6 @@ _temp_*
 # OS
 .DS_Store
 Thumbs.db
-
-# IDE
-.idea/
-
-# Playwright MCP browser artifacts
-.playwright-mcp/
-
-# Test payload
-test_payload.json
-
 
 # IDE
 .idea/

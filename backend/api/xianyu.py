@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from backend.xianyu import manager
+from backend.integrations.xianyu import manager
 
 router = APIRouter(prefix="/api/xianyu", tags=["Xianyu"])
 

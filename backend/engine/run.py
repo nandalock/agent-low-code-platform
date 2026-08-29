@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 def _load_workflow(workflow_id: int) -> dict:
-    from backend.db.connection import get_conn
+    from backend.core.connection import get_conn
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM workflows WHERE id = %s", (workflow_id,))

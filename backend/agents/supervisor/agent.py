@@ -21,8 +21,8 @@ from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 
 from backend.agents.base import BaseAgent, AgentReply
-from backend.db.config_service import get_agent_definition, get_agent_config
-from backend.memory.hooks import MemoryHook
+from backend.agents.config_service import get_agent_definition, get_agent_config
+from backend.services.memory.hooks import MemoryHook
 
 logger = logging.getLogger(__name__)
 
@@ -378,7 +378,7 @@ class SupervisorAgent(BaseAgent):
         self.template = definition.get("config", {})
 
     async def reply(self, tenant_id: int, question: str, context: dict | None = None) -> AgentReply:
-        from backend.memory import MemoryContext
+        from backend.services.memory import MemoryContext
 
         graph = build_graph()
         # 每次请求注入独立的记忆实例

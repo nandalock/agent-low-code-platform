@@ -4,6 +4,6 @@ from backend.agents.router.router_runtime import RouterRuntime
 
 class RouterAgent(RouterRuntime):
     def __init__(self):
-        from backend.db.config_service import get_agent_definition
+        from backend.agents.config_service import get_agent_definition
         definition = get_agent_definition("router") or get_agent_definition("supervisor") or {}
         super().__init__(key="router", definition=definition)

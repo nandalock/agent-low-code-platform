@@ -27,7 +27,7 @@ def list_agents() -> list[dict]:
 
 def _router_targets(router) -> list[str]:
     """路由器可能路由到的所有目标：routable_agents + L1 关键词目标 + fallback，去重保序"""
-    from backend.db.config_service import list_l1_keywords
+    from backend.agents.config_service import list_l1_keywords
 
     targets: list[str] = []
 

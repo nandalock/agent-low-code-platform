@@ -9,11 +9,11 @@ from pydantic import BaseModel
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
-from backend.db.connection import get_conn
-from backend.memory import MemoryContext, SessionMemory, MemoryCompressor, ExperienceMemory
-from backend.memory.config import get_config as get_memory_config
-from backend.memory.summarizer import EXTRACT_PROMPT
-from backend.db.config_service import get_agent_definition, get_agent_config
+from backend.core.connection import get_conn
+from backend.services.memory import MemoryContext, SessionMemory, MemoryCompressor, ExperienceMemory
+from backend.services.memory.config import get_config as get_memory_config
+from backend.services.memory.summarizer import EXTRACT_PROMPT
+from backend.agents.config_service import get_agent_definition, get_agent_config
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ async def debug_run_memory(
         # 1. Resolve messages
         raw_messages: list[dict] = []
         if body.conversation_id is not None:
-            from backend.chat import service as chat_service
+            from backend.services.chat import service as chat_service
             conv = chat_service.get_conversation(x_tenant_id, body.conversation_id)
             if not conv:
                 raise HTTPException(404, "会话不存在")

@@ -54,7 +54,7 @@ def _build_context(state: WorkflowState) -> dict:
 
 def make_agent_handler(node_id: str, agent_key: str, cache_config: dict | None = None) -> Callable:
     from backend.engine.middlewares import CacheMiddleware
-    from backend.db.config_service import get_agent_definition
+    from backend.agents.config_service import get_agent_definition
 
     # 读 agent 定义的 cache_policy，用工作流节点配置覆写后传给 CacheMiddleware → SemanticCache → CachePolicyEngine
     cache_policy = None
