@@ -47,6 +47,15 @@ class AgentRuntime(BaseAgent):
         tier = "llm" if any(s.get("type") == "llm" for s in trace.get("steps", [])) else "fallback"
         return AgentReply(answer=answer, tier=tier, trace=trace)
 
+    def _llm_params(self, config: dict) -> dict:
+        """LLM 调用参数，全部从 agent 配置读取，默认值=现行为（零破坏）"""
+        return {
+            "max_steps": int(config.get("max_steps", 5)),
+            "max_tokens": int(config.get("max_tokens", 1024)),
+            "max_tokens_plain": int(config.get("max_tokens_plain", 512)),
+            "temperature": float(config.get("temperature", 0.3)),
+        }
+
     async def _call_llm_plain(self, messages: list[dict], config: dict) -> tuple[str, bool]:
         """简单 LLM 调用（无 tools），FaqAgent RAG 用"""
         api_key = (config.get("api_key", "") or "").strip()
@@ -54,12 +63,13 @@ class AgentRuntime(BaseAgent):
         model = (config.get("model", "") or "").strip()
         if not api_key or not base_url or not model:
             return "", False
+        params = self._llm_params(config)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{base_url}/v1/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    json={"model": model, "messages": messages, "temperature": 0.3, "max_tokens": 512},
+                    json={"model": model, "messages": messages, "temperature": params["temperature"], "max_tokens": params["max_tokens_plain"]},
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     result = await resp.json()
@@ -80,7 +90,8 @@ class AgentRuntime(BaseAgent):
         if not api_key or not base_url or not model:
             return config.get("fallback_reply", "服务未配置"), trace
 
-        max_steps = int(config.get("max_steps", 5))
+        params = self._llm_params(config)
+        max_steps = params["max_steps"]
 
         name_map = {}
         tools = []
@@ -121,8 +132,8 @@ class AgentRuntime(BaseAgent):
                     payload = {
                         "model": model,
                         "messages": messages,
-                        "temperature": 0.3,
-                        "max_tokens": 1024,
+                        "temperature": params["temperature"],
+                        "max_tokens": params["max_tokens"],
                     }
                     if tools:
                         payload["tools"] = tools

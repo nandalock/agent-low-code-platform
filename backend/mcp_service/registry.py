@@ -43,8 +43,12 @@ class ToolRegistry:
         logger.info(f"ToolRegistry 初始化完成，共 {len(self._index)} 个工具")
 
     async def connect_server(self, srv: dict) -> int:
-        """外部 API 调用：连接一个 server 并索引其工具。返回工具数。"""
+        """外部 API 调用：连接一个 server 并索引其工具。返回工具数。已连接过则跳过（幂等）。"""
         transport = srv.get("transport", "http")
+        sid = srv["id"]
+        # 幂等：该 server 已连接并索引过则直接返回，避免 tools/all 每次全量重连
+        if (transport == "http" and sid in self._http_clients) or (transport == "stdio" and sid in self._stdio_configs):
+            return sum(1 for v in self._index.values() if v["server_id"] == sid)
         try:
             await self._connect_and_index(srv, cache_client=(transport == "http"))
         except Exception as e:
