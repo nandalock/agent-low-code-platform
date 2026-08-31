@@ -75,8 +75,33 @@ async def startup():
     server_task = asyncio.create_task(uvicorn.Server(config).serve())
     await asyncio.sleep(0.5)  # 等 MCP server 就绪
 
+    # 论文域 MCP server (9002) — 领域扩展点，新域继续往下加
+    from backend.mcp_servers.paper.server import mcp as paper_mcp
+    paper_app = paper_mcp.streamable_http_app()
+    paper_app.add_middleware(StarletteCORS, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["Mcp-Session-Id"])
+    paper_config = uvicorn.Config(paper_app, host="0.0.0.0", port=9002, log_level="info")
+    paper_task = asyncio.create_task(uvicorn.Server(paper_config).serve())
+    await asyncio.sleep(0.3)  # 等论文 MCP server 就绪
+
     try:
         await init_registry()
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"ToolRegistry 初始化失败（不影响服务启动）: {e}")
+
+    # 装配：论文域工具内部进度 → registry 进度查询（平台扩展点示例）
+    try:
+        from backend.mcp_servers.paper.server import get_stage
+        from backend.mcp_service.registry import get_registry
+        _registry = get_registry()
+        for _tool in ("summarize_paper", "fetch_paper_text"):
+            _registry.register_progress_query(_tool, lambda args, _t=_tool: get_stage(args.get("url", "")))
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"论文域进度查询注册失败: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    from backend.core.http import close_http_session
+    await close_http_session()

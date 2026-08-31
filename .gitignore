@@ -15,6 +15,7 @@ node_modules/
 
 # Sensitive credentials
 *.cookie.json
+backend/mcp_servers/paper/llm.config.json
 
 # Temp files
 _temp_*

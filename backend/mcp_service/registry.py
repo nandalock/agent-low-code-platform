@@ -21,7 +21,19 @@ class ToolRegistry:
         self._http_clients: dict[int, McpClient] = {}
         # server_id → server config (仅 STDIO，用于按需重连)
         self._stdio_configs: dict[int, dict] = {}
+        # 工具进度查询（可选扩展点）：tool_name → fn(args) -> stage_str
+        # 领域 MCP 可在装配层注册，AgentRuntime 执行工具期间轮询 → tool_progress 事件
+        self._progress_queries: dict[str, object] = {}
         self._ready = False
+
+    # ── 工具进度查询（领域扩展点） ──
+
+    def register_progress_query(self, tool_name: str, fn) -> None:
+        """注册工具进度查询函数：fn(args: dict) -> 当前阶段描述字符串"""
+        self._progress_queries[tool_name] = fn
+
+    def get_progress_query(self, tool_name: str):
+        return self._progress_queries.get(tool_name)
 
     async def init(self):
         """启动时：遍历所有 server，连上并索引工具。HTTP 远程延迟加载。"""
@@ -43,8 +55,12 @@ class ToolRegistry:
         logger.info(f"ToolRegistry 初始化完成，共 {len(self._index)} 个工具")
 
     async def connect_server(self, srv: dict) -> int:
-        """外部 API 调用：连接一个 server 并索引其工具。返回工具数。"""
+        """外部 API 调用：连接一个 server 并索引其工具。返回工具数。已连接过则跳过（幂等）。"""
         transport = srv.get("transport", "http")
+        sid = srv["id"]
+        # 幂等：该 server 已连接并索引过则直接返回，避免 tools/all 每次全量重连
+        if (transport == "http" and sid in self._http_clients) or (transport == "stdio" and sid in self._stdio_configs):
+            return sum(1 for v in self._index.values() if v["server_id"] == sid)
         try:
             await self._connect_and_index(srv, cache_client=(transport == "http"))
         except Exception as e:

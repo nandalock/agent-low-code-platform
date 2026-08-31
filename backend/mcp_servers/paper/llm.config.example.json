@@ -1,0 +1,6 @@
+{
+  "_comment": "论文域 MCP 总结用 LLM 配置（OpenAI 兼容协议）。使用方法：复制本文件为 llm.config.json 并填写三项。llm.config.json 已被 .gitignore 忽略，不会提交。配置后无需重启容器（bind-mount 下即时生效）。",
+  "base_url": "https://api.openai.com/v1",
+  "api_key": "",
+  "model": "gpt-4o"
+}

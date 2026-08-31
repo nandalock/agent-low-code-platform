@@ -363,6 +363,7 @@ MIGRATIONS = [
 
 SEED_SERVERS = [
     "INSERT INTO mcp_servers (tenant_id, name, transport, url) SELECT 1, '本地 MCP', 'http', 'http://localhost:9001/mcp' WHERE NOT EXISTS (SELECT 1 FROM mcp_servers WHERE url = 'http://localhost:9001/mcp')",
+    "INSERT INTO mcp_servers (tenant_id, name, transport, url) SELECT 1, '论文 MCP', 'http', 'http://localhost:9002/mcp' WHERE NOT EXISTS (SELECT 1 FROM mcp_servers WHERE url = 'http://localhost:9002/mcp')",
 ]
 
 SEED_CACHE_POLICIES = [
@@ -432,6 +433,18 @@ SEED_AGENTS = [
        VALUES ('human_handoff', '人工转接', '无法自动处理时转接人工客服，支持排队通知和安抚话术', '{
          "handoff_message": "已为您转接人工客服，请稍候...",
          "queue_message": "当前排队人数较多，预计等待 {wait_minutes} 分钟，人工客服将尽快为您服务。",
+         "api_key": "",
+         "base_url": "",
+         "model": ""
+       }'::jsonb)
+       ON CONFLICT (agent_key) DO NOTHING""",
+    """INSERT INTO agent_definitions (agent_key, name, description, config)
+       VALUES ('paper_agent', 'PaperAgent', '学术论文研究助手 — arxiv 搜索 + PDF 全文总结成 markdown', '{
+         "system_prompt": "你是学术论文研究助手。帮助用户查找 arXiv 论文并总结成 markdown。流程：先用 search_papers 搜索相关论文 → 对用户感兴趣的论文调 summarize_paper 生成结构化总结（标题/摘要/核心贡献/方法/关键结论/局限）→ 最后把总结完整输出给用户。一次可总结 1-3 篇，如果用户要多篇先问清楚优先级。",
+         "fallback_reply": "抱歉，论文服务暂不可用，请稍后再试。",
+         "max_steps": 8,
+         "max_tokens": 3000,
+         "temperature": 0.3,
          "api_key": "",
          "base_url": "",
          "model": ""

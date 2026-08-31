@@ -21,6 +21,7 @@ import aiohttp
 
 from backend.agents.base import BaseAgent, AgentReply
 from backend.agents.config_service import get_agent_config
+from backend.core.http import get_http_session
 from backend.core.rag import embed
 
 logger = logging.getLogger(__name__)
@@ -319,26 +320,26 @@ class RouterRuntime(BaseAgent):
         system_prompt = self._build_system_prompt(config, system_extra, context, fewshot)
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{base_url}/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": question},
-                        ],
-                        "tools": tools,
-                        "tool_choice": "required",
-                        "temperature": 0,
-                    },
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    result = await resp.json()
+            session = await get_http_session()
+            async with session.post(
+                f"{base_url}/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": question},
+                    ],
+                    "tools": tools,
+                    "tool_choice": "required",
+                    "temperature": 0,
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                result = await resp.json()
 
             msg = result.get("choices", [{}])[0].get("message", {})
             tool_calls = msg.get("tool_calls") or []

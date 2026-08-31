@@ -9,7 +9,9 @@ logger = logging.getLogger(__name__)
 
 MCP_URL = "http://localhost:9001/mcp"
 MCP_CONNECT_TIMEOUT = 10
-MCP_CALL_TIMEOUT = 20  # 连接超时秒数
+# 读超时：MCP 工具响应走 SSE 流，结果在工具跑完才发；重活工具（PDF 下载/LLM 总结）可跑几分钟。
+# 之前误用了 10s（连接超时值），响应流被 httpx 读超时掐断 → SDK 静默丢弃 pending future → 调用永久挂起。
+MCP_TOOL_TIMEOUT = 300  # 工具调用总超时（秒）
 
 TransportType = Literal["http", "stdio"]
 
@@ -40,8 +42,8 @@ class McpClient:
         if self._transport_type == "http":
             self._transport_ctx = streamablehttp_client(
                 self._url,
-                timeout=MCP_CONNECT_TIMEOUT,
-                sse_read_timeout=MCP_CONNECT_TIMEOUT,
+                timeout=MCP_CONNECT_TIMEOUT,       # 连接/写 10s 快速失败
+                sse_read_timeout=MCP_TOOL_TIMEOUT, # 响应流读超时 300s，覆盖重活工具
             )
         else:
             params = StdioServerParameters(command=self._command, args=self._args, env=self._env if self._env else None)
@@ -74,10 +76,13 @@ class McpClient:
         return self._tools
 
     async def call(self, name: str, args: dict) -> list[dict]:
-        """调用 MCP 工具，返回结果行"""
+        """调用 MCP 工具，返回结果行（带总超时，防止传输层挂死导致 await 永不返回）"""
         if not self._session:
             raise RuntimeError("MCP 未连接")
-        result = await self._session.call_tool(name, args)
+        result = await asyncio.wait_for(
+            self._session.call_tool(name, args),
+            timeout=MCP_TOOL_TIMEOUT,
+        )
         rows: list[dict] = []
         for c in result.content:
             if c.type == "text":
