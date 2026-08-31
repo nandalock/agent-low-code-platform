@@ -137,6 +137,45 @@ Environment variables (see `docker-compose.yml`):
 | `OLLAMA_HOST`        | `http://host.docker.internal:11434` | Local LLM endpoint       |
 | `NEXT_PUBLIC_API_URL`| `http://localhost:8000`          | Frontend → backend base URL  |
 
+### 📄 Paper MCP — LLM 配置
+
+论文域 MCP（`backend/mcp_servers/paper/`，端口 `:9002`，提供 `search_papers` /
+`fetch_paper_text` / `summarize_paper` / `list_papers` 四个工具）总结论文时在
+**工具内部**调用 LLM，需要 OpenAI 兼容网关（`/v1/chat/completions`）。
+
+配置方式（二选一，JSON 文件优先）：
+
+**方式一：JSON 配置文件（推荐）**
+
+```bash
+# 复制模板为真实配置（模板会提交，真实配置已被 .gitignore 忽略）
+cp backend/mcp_servers/paper/llm.config.example.json backend/mcp_servers/paper/llm.config.json
+
+# 编辑三项（代码 bind-mount 到容器，改完即时生效，无需重启）
+# llm.config.json
+{
+  "base_url": "https://api.openai.com/v1",
+  "api_key": "sk-...",
+  "model": "gpt-4o"
+}
+```
+
+**方式二：环境变量**（docker-compose 注入）
+
+```bash
+# 项目根目录 .env
+PAPER_LLM_BASE_URL=https://api.openai.com/v1
+PAPER_LLM_API_KEY=sk-...
+PAPER_LLM_MODEL=gpt-4o
+# 然后
+docker compose up -d backend
+```
+
+**Agent 决策层（paper_agent）**还需单独配置编排 LLM（AgentRuntime 使用，
+与总结层相互独立、可指向不同模型）：`PUT /api/agents/paper_agent/config`，
+或在 Dashboard 的 agent 配置页填写 `base_url` / `api_key` / `model`。
+建议 `max_steps: 8`、`max_tokens: 3000`（默认已内置）。
+
 ## 🗺️ Roadmap
 
 - [x] Visual workflow builder & runner

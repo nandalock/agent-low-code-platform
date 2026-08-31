@@ -1,7 +1,9 @@
 """Agent API"""
+import asyncio
 import json
 
 from fastapi import APIRouter, Body, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from backend.agents import list_agents, get_agent, register
@@ -169,6 +171,24 @@ def agent_save_config(agent_key: str, body: dict = Body(...)) -> dict:
     return {"agent_key": agent_key, "config": config, "cache_policy": cache_policy}
 
 
+def _resolve_conversation(agent_key: str, body: ChatRequest, tenant_id: int):
+    """获取或创建会话：有 conversation_id → 继续（页面刷新）；只有 visitor_id → 新建"""
+    if body.conversation_id:
+        conv = chat_service.get_conversation(tenant_id, body.conversation_id)
+        if conv is None:
+            raise HTTPException(404, "会话不存在")
+    else:
+        conv = chat_service.create_conversation(
+            tenant_id,
+            chat_service.ConversationCreate(
+                channel=f"agent:{agent_key}",
+                channel_conversation_id=body.visitor_id or None,
+                customer_name="测试用户" if body.visitor_id else "匿名用户",
+            ),
+        )
+    return conv
+
+
 @router.post("/{agent_key}/chat")
 async def agent_chat(
     agent_key: str,
@@ -181,21 +201,7 @@ async def agent_chat(
         raise HTTPException(404, f"Agent 不存在: {agent_key}")
 
     # 1. 获取或创建会话
-    #    - 有 conversation_id → 继续当前会话（页面刷新）
-    #    - 只有 visitor_id → 新建会话（新访问），visitor_id 仅做身份标识
-    if body.conversation_id:
-        conv = chat_service.get_conversation(x_tenant_id, body.conversation_id)
-        if conv is None:
-            raise HTTPException(404, "会话不存在")
-    else:
-        conv = chat_service.create_conversation(
-            x_tenant_id,
-            chat_service.ConversationCreate(
-                channel=f"agent:{agent_key}",
-                channel_conversation_id=body.visitor_id or None,
-                customer_name="测试用户" if body.visitor_id else "匿名用户",
-            ),
-        )
+    conv = _resolve_conversation(agent_key, body, x_tenant_id)
 
     # 2. 写入用户消息
     chat_service.create_message(
@@ -220,6 +226,83 @@ async def agent_chat(
     return ChatResponse(
         answer=reply.answer, sources=reply.sources, tier=reply.tier, trace=reply.trace,
         conversation_id=conv.id,
+    )
+
+
+@router.post("/{agent_key}/chat/stream")
+async def agent_chat_stream(
+    agent_key: str,
+    body: ChatRequest,
+    x_tenant_id: int = Header(alias="X-Tenant-ID"),
+):
+    """SSE 流式聊天（deepseek harness 风格事件流）。
+
+    事件（data: JSON）:
+      {"type":"step","step":1,"total":8}        循环步进
+      {"type":"thinking","delta":"..."}         推理过程增量（reasoning_content）
+      {"type":"text","delta":"..."}             思考间隙文本增量
+      {"type":"tool_call","tool":"...","args":{}}   工具调用
+      {"type":"tool_result","tool":"...","summary":"..."} 工具结果
+      {"type":"answer","delta":"..."}           最终回答增量
+      {"type":"done","answer":"...","tier":"llm"} 结束
+    """
+    try:
+        agent = get_agent(agent_key)
+    except KeyError:
+        raise HTTPException(404, f"Agent 不存在: {agent_key}")
+
+    conv = _resolve_conversation(agent_key, body, x_tenant_id)
+    chat_service.create_message(
+        x_tenant_id, conv.id,
+        chat_service.MessageCreate(role="customer", content=body.question),
+    )
+
+    async def event_gen():
+        queue: asyncio.Queue = asyncio.Queue()
+        thinking_parts: list[str] = []  # 累积思考过程，随消息落库持久化
+
+        async def on_event(ev: dict):
+            await queue.put(ev)
+
+        task = asyncio.create_task(agent.reply(x_tenant_id, body.question, on_event=on_event))
+        try:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if task.done():
+                        break
+                    continue
+                if ev.get("type") == "thinking":
+                    thinking_parts.append(ev.get("delta", ""))
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                if ev.get("type") == "done":
+                    break
+        finally:
+            # 落库 agent 回复（done 事件后 reply 已完成），思考过程持久化到 metadata
+            try:
+                reply = task.result()
+            except Exception:
+                reply = None
+            if reply is not None:
+                thinking = "".join(thinking_parts)[:6000]  # 截断保护
+                chat_service.create_message(
+                    x_tenant_id, conv.id,
+                    chat_service.MessageCreate(
+                        role="agent",
+                        sender_name=agent.name,
+                        content=reply.answer,
+                        metadata={
+                            "tier": reply.tier, "sources": reply.sources, "trace": reply.trace,
+                            "thinking": thinking or None,
+                        },
+                    ),
+                )
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -313,14 +396,15 @@ async def list_ollama_models() -> list[dict]:
     """读取 Ollama 本地已安装的 embedding 模型"""
     import os
     import aiohttp
+    from backend.core.http import get_http_session
 
     ollama_url = os.getenv("OLLAMA_HOST", "http://localhost:11434")
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{ollama_url}/api/tags", timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                data = await resp.json()
+        session = await get_http_session()
+        async with session.get(
+            f"{ollama_url}/api/tags", timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            data = await resp.json()
     except Exception:
         return []
 

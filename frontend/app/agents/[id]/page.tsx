@@ -27,6 +27,64 @@ const AGENT_DEFAULTS: Record<string, { model: string; base_url: string }> = {
   supervisor:   { model: 'deepseek-chat', base_url: 'https://api.deepseek.com' },
 };
 
+/** DSH ReasoningRow 移植：折叠=最新行跟读（流式）/ 首行摘要（完成），点击展开全文 */
+function ThinkingPanel({ thinking, running }: {
+  thinking: string; running: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  // 折叠态摘要：流式中取最新一行（字幕跟读），完成取第一行
+  const trimmed = thinking.trimEnd();
+  const summary = running
+    ? trimmed.slice(trimmed.lastIndexOf('\n') + 1)
+    : trimmed.slice(0, trimmed.indexOf('\n') === -1 ? trimmed.length : trimmed.indexOf('\n'));
+  // DSH 折叠态：流式中水平滚动到最新文本末尾（字幕跟读），完成回到开头
+  useEffect(() => {
+    if (bodyRef.current) {
+      bodyRef.current.scrollLeft = running
+        ? bodyRef.current.scrollWidth - bodyRef.current.clientWidth
+        : 0;
+    }
+  }, [summary, running]);
+
+  return (
+    <>
+    <style>{`@keyframes spin{to{transform:rotate(360deg)}} .stream-cursor{display:inline-block;width:2px;height:1em;background:${T.accent};margin-left:2px;vertical-align:-2px;animation:blink 1s steps(1) infinite} @keyframes blink{50%{opacity:0}}`}</style>
+    <div style={{ padding:`${S.md}px ${S.base}px`, borderRadius:8, background:T.surface, border:`1px solid ${T.border}`, marginBottom:S.sm, cursor: thinking ? 'pointer' : 'default' }}
+      onClick={() => thinking && setExpanded(v => !v)}>
+      <div style={{ display:'flex', alignItems:'center', gap:S.sm, fontSize:12, fontWeight:600, color:T.secondary }}>
+        {running ? (
+          <span style={{ width:14, height:14, borderRadius:'50%', border:'2px solid '+T.accent, borderTopColor:'transparent', animation:'spin 0.8s linear infinite', display:'inline-block' }} />
+        ) : (
+          <Brain size={14} />
+        )}
+        <span>深度思考</span>
+        {running && <span style={{ fontSize:11, color:T.tertiary }}>思考中...</span>}
+        {thinking && (
+          <span style={{ marginLeft:'auto', color:T.tertiary }}>
+            {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+          </span>
+        )}
+      </div>
+      {thinking && !expanded && (
+        <div style={{ position:'relative', marginTop:S.sm, overflow:'hidden', minWidth:0 }}>
+          <div ref={bodyRef} style={{ fontSize:12, color:T.secondary, lineHeight:1.6, whiteSpace:'nowrap', overflow:'hidden' }}>
+            {summary}
+            {running && <span style={{ display:'inline-block', width:2, height:12, background:T.accent, verticalAlign:-1, marginLeft:2, animation:'blink 1s steps(1) infinite' }} />}
+          </div>
+          {running && <div style={{ position:'absolute', right:0, top:0, bottom:0, width:40, background:`linear-gradient(to left, ${T.surface}, transparent)` }} />}
+        </div>
+      )}
+      {thinking && expanded && (
+        <div style={{ fontSize:12, color:T.secondary, lineHeight:1.6, marginTop:S.sm, maxHeight:220, overflow:'auto', whiteSpace:'pre-wrap', wordBreak:'break-word' }}>
+          {thinking}
+        </div>
+      )}
+    </div>
+    </>
+  );
+}
+
 function getVisitorId(agentKey: string): string {
   if (typeof window === 'undefined') return '';
   const key = `visitor_${agentKey}`;
@@ -48,6 +106,7 @@ interface TraceStep {
 }
 interface ChatMsg {
   role: 'user' | 'agent'; content: string; time: string;
+  thinking?: string;
   trace?: { tier: string; total_ms: number; steps?: TraceStep[] };
 }
 
@@ -65,6 +124,11 @@ export default function AgentDetailPage() {
   const [trace, setTrace] = useState<ChatMsg['trace'] | null>(null);
   const [conversationId, setConversationId] = useState<number | null>(getSavedConversationId(agentKey));
   const [loadingHistory, setLoadingHistory] = useState(false);
+  // 流式状态（deepseek harness 风格：思考面板 + 工具卡片 + 打字机）
+  const [liveThinking, setLiveThinking] = useState('');
+  const [liveAnswer, setLiveAnswer] = useState('');
+  const [liveTools, setLiveTools] = useState<{tool:string; args:any; status:'running'|'done'; summary?:string; stage?:string; seconds?:number}[]>([]);
+  const [liveSteps, setLiveSteps] = useState<{step:number; total:number}>({ step:0, total:0 });
 
   useEffect(() => {
     if (sessionStorage.getItem(`conv_${agentKey}`)) setLoadingHistory(true);
@@ -115,7 +179,7 @@ export default function AgentDetailPage() {
           for (const m of items) {
             const time = m.created_at ? new Date(m.created_at).toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' }) : '';
             const meta = m.metadata || {};
-            if (m.role === 'agent') msgs.push({ role:'agent', content:m.content, time, trace: meta.trace || undefined });
+            if (m.role === 'agent') msgs.push({ role:'agent', content:m.content, time, thinking: meta.thinking || undefined, trace: meta.trace || undefined });
             else if (m.role === 'customer') msgs.push({ role:'user', content:m.content, time });
           }
           setMessages(msgs);
@@ -143,18 +207,81 @@ export default function AgentDetailPage() {
     const now = new Date().toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' });
     setMessages(prev => [...prev, { role:'user', content:input, time:now }]);
     setInput(''); setSending(true);
+    setLiveThinking(''); setLiveAnswer(''); setLiveTools([]); setLiveSteps({ step:0, total:0 });
+    let finalAnswer = '';
+    let liveAns = '';  // 局部累积（避免 state 闭包读到旧值）
+    let liveThink = '';  // 局部累积思考（done 后用于生成首行摘要）
+    let finalTrace: ChatMsg['trace'] | undefined;
     try {
       const body: any = { question: input, visitor_id: VISITOR_ID };
       if (conversationId) body.conversation_id = conversationId;
-      const r = await fetch(`${API}/api/agents/${agentKey}/chat`, { method:'POST', headers:{'Content-Type':'application/json','X-Tenant-ID':String(TENANT_ID)}, body:JSON.stringify(body) });
-      const data = await r.json();
-      if (data.conversation_id && !conversationId) { setConversationId(data.conversation_id); sessionStorage.setItem(`conv_${agentKey}`, String(data.conversation_id)); }
-      const tr = data.trace ? { tier: data.tier, total_ms: data.trace.total_ms, steps: data.trace.steps } : undefined;
-      setMessages(prev => [...prev, { role:'agent', content:data.answer||'抱歉，暂时无法处理。', time:new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}), trace: tr }]);
-      setTrace(tr || null);
+      const r = await fetch(`${API}/api/agents/${agentKey}/chat/stream`, { method:'POST', headers:{'Content-Type':'application/json','X-Tenant-ID':String(TENANT_ID)}, body:JSON.stringify(body) });
+      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+      // 解析 SSE 事件流（data: JSON 空行分隔）
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream:true });
+        const parts = buf.split('\n\n');
+        buf = parts.pop() ?? '';
+        for (const part of parts) {
+          const line = part.split('\n').find(l => l.startsWith('data:'));
+          if (!line) continue;
+          let ev: any;
+          try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+          switch (ev.type) {
+            case 'step':
+              setLiveSteps({ step: ev.step, total: ev.total });
+              break;
+            case 'thinking':
+              liveThink += ev.delta;
+              setLiveThinking(p => p + ev.delta);
+              break;
+            case 'text':
+              setLiveAnswer(p => p + ev.delta);
+              break;
+            case 'tool_call':
+              setLiveTools(p => [...p, { tool: ev.tool, args: ev.args, status: 'running' }]);
+              break;
+            case 'tool_progress':
+              setLiveTools(p => {
+                const a = [...p];
+                const idx = a.findIndex(x => x.tool === ev.tool && x.status === 'running');
+                if (idx >= 0) a[idx] = { ...a[idx], stage: ev.stage, seconds: ev.seconds };
+                return a;
+              });
+              break;
+            case 'tool_result':
+              setLiveTools(p => {
+                const a = [...p];
+                const idx = a.findIndex(x => x.tool === ev.tool && x.status === 'running');
+                if (idx >= 0) a[idx] = { ...a[idx], status:'done', summary: ev.summary || '' };
+                return a;
+              });
+              break;
+            case 'answer':
+              liveAns += ev.delta;
+              setLiveAnswer(p => p + ev.delta);
+              break;
+            case 'done':
+              if (ev.answer) finalAnswer = ev.answer;
+              if (ev.trace) finalTrace = { tier: ev.tier, total_ms: ev.trace.total_ms, steps: ev.trace.steps };
+              setLiveThinking(liveThink);  // 保留思考（折叠为首行摘要）
+              break;
+          }
+        }
+      }
     } catch {
-      setMessages(prev => [...prev, { role:'agent', content:'请求失败，请稍后重试。', time:new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}) }]);
-    } finally { setSending(false); }
+      finalAnswer = '请求失败，请稍后重试。';
+    } finally {
+      setSending(false);
+      setMessages(prev => [...prev, { role:'agent', content: finalAnswer || liveAns || '抱歉，暂时无法处理。', time:new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}), thinking: liveThink || undefined, trace: finalTrace }]);
+      if (finalTrace) setTrace(finalTrace);
+      setLiveThinking(''); setLiveAnswer(''); setLiveTools([]);
+    }
   }
 
   const preSmall: React.CSSProperties = { margin:0, padding:'6px 8px', background:T.bg, borderRadius:4, fontSize:11, fontFamily:'monospace', color:T.text, lineHeight:1.5, overflow:'auto', maxHeight:200, whiteSpace:'pre-wrap', wordBreak:'break-all' };
@@ -164,7 +291,7 @@ export default function AgentDetailPage() {
   const tierBg = (tier: string) => tier==='llm'?T.accentBg:'#FFF7E6';
 
   return (
-    <div style={{ display:'flex', height:'100vh', background:T.bg, color:T.text, fontFamily:"system-ui,-apple-system,'Segoe UI',sans-serif" }}>
+    <div style={{ display:'flex', height:'100vh', background:T.bg, color:T.text, fontFamily:"system-ui,-apple-system,'Segoe UI',sans-serif", overflow:'auto' }}>
       {/* Left config panel */}
       <div style={{
         width: leftOpen ? 300 : 0, minWidth: leftOpen ? 300 : 0,
@@ -263,7 +390,8 @@ export default function AgentDetailPage() {
       </div>
 
       {/* Center: chat */}
-      <div style={{ flex:1, display:'flex', flexDirection:'column', background:T.bg }}>
+      {/* minWidth:420 保底聊天列可用宽度（窄视口下宁可横向滚动也不把聊天区压扁）；minWidth 同时避免内部长内容撑爆 */}
+      <div style={{ flex:1, minWidth:420, minHeight:0, display:'flex', flexDirection:'column', background:T.bg }}>
         <div style={{ padding:`${S.md}px ${S.xl}px`, display:'flex', alignItems:'center', gap:S.sm, borderBottom:`1px solid ${T.border}` }}>
           <button onClick={() => setLeftOpen(!leftOpen)} title={leftOpen?'收起配置':'展开配置'} style={{
             width:28, height:28, borderRadius:6, border:`1px solid ${T.border}`, background:T.surface,
@@ -286,7 +414,7 @@ export default function AgentDetailPage() {
           <button onClick={handleNewChat} style={{ padding:'5px 14px', borderRadius:6, border:`1px solid ${T.border}`, background:T.surface, color:T.text, fontSize:12, cursor:'pointer' }}>新建会话</button>
         </div>
 
-        <div style={{ flex:1, padding:S.xl, overflow:'auto' }}>
+        <div style={{ flex:1, minHeight:0, padding:S.xl, overflow:'auto' }}>
           {loadingHistory && <div style={{ textAlign:'center', color:T.secondary, marginTop:S.huge, fontSize:14 }}>加载历史消息...</div>}
           {!loadingHistory && messages.length===0 && <div style={{ textAlign:'center', color:T.secondary, marginTop:S.huge, fontSize:14 }}>输入消息，测试智能体</div>}
           {messages.map((msg, i) => {
@@ -294,7 +422,10 @@ export default function AgentDetailPage() {
             return (
               <div key={i} style={{ marginBottom:S.lg, display:'flex', flexDirection:'column', alignItems:isUser?'flex-end':'flex-start' }}>
                 <div style={{ fontSize:12, color:T.secondary, marginBottom:6 }}>{isUser?'测试用户':(agentName||agentKey)} · {msg.time}</div>
-                <div style={{ maxWidth:'72%' }}>
+                <div style={{ maxWidth:'min(72%, 820px)', minWidth:0 }}>
+                  {!isUser && msg.thinking && (
+                    <ThinkingPanel thinking={msg.thinking} running={false} />
+                  )}
                   <div style={{
                     padding:`${S.md}px ${S.base}px`, borderRadius:8, fontSize:14, lineHeight:1.55,
                     whiteSpace:'pre-wrap', wordBreak:'break-word',
@@ -305,7 +436,56 @@ export default function AgentDetailPage() {
               </div>
             );
           })}
-          {sending && <div style={{ color:T.secondary, fontSize:13 }}>Agent 回复中...</div>}
+          {sending && (
+            <div style={{ marginBottom:S.lg, display:'flex', flexDirection:'column', alignItems:'flex-start' }}>
+              <div style={{ fontSize:12, color:T.secondary, marginBottom:6 }}>{agentName||agentKey} · 回复中</div>
+              <div style={{ maxWidth:'min(72%, 820px)', minWidth:0, width:'100%' }}>
+                {/* DSH 式思考面板：折叠=最新一行跟读（流式）/ 首行摘要（完成），展开=全文 */}
+                {(liveThinking || liveSteps.step>0) && (
+                  <ThinkingPanel thinking={liveThinking} running={sending} />
+                )}
+                {/* 工具区（DSH tool rows：名称 + 状态动画 + 参数摘要） */}
+                {liveTools.length>0 && (
+                  <div style={{ display:'flex', flexDirection:'column', gap:6, marginBottom:S.sm }}>
+                    {liveTools.map((t,i) => (
+                      <div key={i} style={{ padding:`${S.sm}px ${S.base}px`, borderRadius:8, background:T.surface, border:`1px solid ${T.border}`, minWidth:0 }}>
+                        <div style={{ display:'flex', alignItems:'center', gap:S.sm, fontSize:12 }}>
+                          {t.status==='running' ? (
+                            <span style={{ width:12, height:12, borderRadius:'50%', border:'2px solid '+T.accent, borderTopColor:'transparent', animation:'spin 0.8s linear infinite', display:'inline-block', flexShrink:0 }} />
+                          ) : (
+                            <span style={{ color:T.success, flexShrink:0 }}>✓</span>
+                          )}
+                          <span style={{ fontWeight:600, color:T.text, fontFamily:'monospace' }}>{t.tool}</span>
+                          <span style={{ fontSize:11, color:T.secondary }}>{t.status==='running' ? '运行中' : '完成'}</span>
+                          {t.status==='running' && t.seconds ? <span style={{ fontSize:11, color:T.tertiary }}>{t.seconds}s</span> : null}
+                        </div>
+                        {t.args && Object.keys(t.args).length>0 && (
+                          <div style={{ marginTop:4, fontSize:11, color:T.secondary, fontFamily:'monospace', whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>
+                            {JSON.stringify(t.args, null, 0).slice(0, 160)}
+                          </div>
+                        )}
+                        {t.stage && (
+                          <div style={{ marginTop:4, fontSize:11, color:T.warning }}>{t.stage}{t.seconds ? `（${t.seconds}s）` : ''}</div>
+                        )}
+                        {t.status==='done' && t.summary && (
+                          <div style={{ marginTop:4, fontSize:11, color:T.success }}>→ {t.summary}</div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {/* 流式回答气泡（打字机） */}
+                {liveAnswer && (
+                  <div data-streaming="true" style={{ padding:`${S.md}px ${S.base}px`, borderRadius:8, fontSize:14, lineHeight:1.55,
+                    whiteSpace:'pre-wrap', wordBreak:'break-word',
+                    background:T.surface, color:T.text, border:`1px solid ${T.border}`, borderBottomLeftRadius:2 }}>
+                    {liveAnswer}
+                    <span className="stream-cursor" />
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
           <div ref={bottomRef} />
         </div>
 
@@ -313,7 +493,7 @@ export default function AgentDetailPage() {
           <div style={{ display:'flex', gap:S.sm }}>
             <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key==='Enter'&&handleSend()}
               placeholder="输入消息测试 Agent..."
-              style={{ flex:1, padding:'10px 14px', background:T.surface, border:`1px solid ${T.border}`, borderRadius:6, fontSize:14, color:T.text, outline:'none', boxSizing:'border-box', fontFamily:'inherit' }} />
+              style={{ flex:1, minWidth:0, padding:'10px 14px', background:T.surface, border:`1px solid ${T.border}`, borderRadius:6, fontSize:14, color:T.text, outline:'none', boxSizing:'border-box', fontFamily:'inherit' }} />
             <button onClick={handleSend} disabled={!input.trim()||sending} style={{...btnPrimary, padding:'10px 22px', fontSize:14, opacity:!input.trim()||sending?0.4:1 }}>发送</button>
           </div>
         </div>
@@ -326,11 +506,11 @@ export default function AgentDetailPage() {
         display:'flex', flexDirection:'column', flexShrink:0,
         transition:'width .18s ease, min-width .18s ease', overflow:'hidden',
       }}>
-        <div style={{ padding:`${S.md}px ${S.xl}px`, borderBottom:`1px solid ${T.border}`, minWidth:340 }}>
+        <div style={{ padding:`${S.md}px ${S.xl}px`, borderBottom:`1px solid ${T.border}`, minWidth:0 }}>
           <span style={{ fontSize:13, fontWeight:600, color:T.text }}>调用链</span>
           <span style={{ fontSize:11, color:T.tertiary, marginLeft:S.sm }}>Tool Calling Trace</span>
         </div>
-        <div style={{ flex:1, overflow:'auto', padding:S.xl, minWidth:340 }}>
+        <div style={{ flex:1, minHeight:0, overflow:'auto', padding:S.xl, minWidth:0 }}>
           {!trace || !trace.steps || trace.steps.length===0 ? (
             <div style={{ textAlign:'center', color:T.tertiary, marginTop:S.huge, fontSize:13 }}>暂无调用记录</div>
           ) : (

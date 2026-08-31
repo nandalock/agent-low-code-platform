@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 RUN pip install --no-cache-dir \
     fastapi uvicorn pyjwt psycopg2-binary pydantic python-multipart \
     websockets aiohttp requests sentence-transformers \
-    langchain-core langchain-openai langgraph 'mcp<2' redis numpy
+    langchain-core langchain-openai langgraph 'mcp<2' redis numpy pypdf
 
 RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3')"
 

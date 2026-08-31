@@ -21,7 +21,19 @@ class ToolRegistry:
         self._http_clients: dict[int, McpClient] = {}
         # server_id → server config (仅 STDIO，用于按需重连)
         self._stdio_configs: dict[int, dict] = {}
+        # 工具进度查询（可选扩展点）：tool_name → fn(args) -> stage_str
+        # 领域 MCP 可在装配层注册，AgentRuntime 执行工具期间轮询 → tool_progress 事件
+        self._progress_queries: dict[str, object] = {}
         self._ready = False
+
+    # ── 工具进度查询（领域扩展点） ──
+
+    def register_progress_query(self, tool_name: str, fn) -> None:
+        """注册工具进度查询函数：fn(args: dict) -> 当前阶段描述字符串"""
+        self._progress_queries[tool_name] = fn
+
+    def get_progress_query(self, tool_name: str):
+        return self._progress_queries.get(tool_name)
 
     async def init(self):
         """启动时：遍历所有 server，连上并索引工具。HTTP 远程延迟加载。"""

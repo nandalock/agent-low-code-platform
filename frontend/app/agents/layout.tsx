@@ -102,7 +102,8 @@ export default function AgentsLayout({ children }:{ children:React.ReactNode }) 
       </div>
 
       {/* ── Content ── */}
-      <div style={{ flex:1, overflow:'hidden' }}>
+      {/* overflow:auto：页面聊天列有 420px 保底宽度，窄视口下宁可整体横向滚动也不裁剪 */}
+      <div style={{ flex:1, minWidth:0, overflow:'auto' }}>
         {children}
       </div>
     </div>
