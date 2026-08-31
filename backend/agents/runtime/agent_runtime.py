@@ -70,9 +70,11 @@ class AgentRuntime(BaseAgent):
         return AgentReply(answer=answer, tier=tier, trace=trace)
 
     def _llm_params(self, config: dict) -> dict:
-        """LLM 调用参数，全部从 agent 配置读取，默认值=现行为（零破坏）"""
+        """运行参数（LLM 调用 + 防失控限制），全部从 agent 配置读取，默认值=现行为（零破坏）"""
         return {
             "max_steps": int(config.get("max_steps", 5)),
+            "max_tool_calls": int(config.get("max_tool_calls", 30)),
+            "max_wall_time": float(config.get("max_wall_time", 300)),
             "max_tokens": int(config.get("max_tokens", 1024)),
             "max_tokens_plain": int(config.get("max_tokens_plain", 512)),
             "temperature": float(config.get("temperature", 0.3)),

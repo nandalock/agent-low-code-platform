@@ -96,6 +96,8 @@ async def startup():
         _registry = get_registry()
         for _tool in ("summarize_paper", "fetch_paper_text"):
             _registry.register_progress_query(_tool, lambda args, _t=_tool: get_stage(args.get("url", "")))
+            # 重活工具（PDF 下载/LLM 总结）：显式声明更长超时，避免默认 30s 误杀
+            _registry.register_tool_timeout(_tool, 120)
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"论文域进度查询注册失败: {e}")

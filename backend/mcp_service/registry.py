@@ -24,6 +24,8 @@ class ToolRegistry:
         # 工具进度查询（可选扩展点）：tool_name → fn(args) -> stage_str
         # 领域 MCP 可在装配层注册，AgentRuntime 执行工具期间轮询 → tool_progress 事件
         self._progress_queries: dict[str, object] = {}
+        # 工具执行超时（可选扩展点）：tool_name → 秒；未注册的 Tool 由 AgentLoop 使用默认值
+        self._tool_timeouts: dict[str, float] = {}
         self._ready = False
 
     # ── 工具进度查询（领域扩展点） ──
@@ -34,6 +36,15 @@ class ToolRegistry:
 
     def get_progress_query(self, tool_name: str):
         return self._progress_queries.get(tool_name)
+
+    # ── 工具执行超时（领域扩展点） ──
+
+    def register_tool_timeout(self, tool_name: str, seconds: float) -> None:
+        """注册工具执行超时（秒）。未注册的 Tool 由 AgentLoop 使用 DEFAULT_TOOL_TIMEOUT"""
+        self._tool_timeouts[tool_name] = seconds
+
+    def get_tool_timeout(self, tool_name: str) -> float | None:
+        return self._tool_timeouts.get(tool_name)
 
     async def init(self):
         """启动时：遍历所有 server，连上并索引工具。HTTP 远程延迟加载。"""
