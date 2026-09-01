@@ -1,9 +1,13 @@
 """Session 事件定义（DSH 思想：Session Event Log 是执行事实来源）
 
 事件类型与 LLM messages 的映射由 Surface + derive_event_message 负责：
-  - surface 事件（进入 LLM Context）: user/message, assistant/message, tool/result
+  - surface 事件（进入 LLM Context）: session/seed, user/message, assistant/message, tool/result
   - 过程事件（仅 Event Log，不进入 LLM）: turn/start, step/start, assistant/chunk,
     tool/call, step/end, turn/end
+
+session/seed 是会话创建时注入的初始 LLM 消息（system prompt / 上游 context），
+作为事件写入 Event Log 开头（Event Log 是唯一真源），header.seed_length 记录数量；
+持久化与恢复时无需单独保存 OpenAI messages，seed 事件随 Event Log 一起落库。
 
 按规格暂不实现：steering/message、todo/write、request/header、compaction、delegation。
 """
@@ -11,6 +15,7 @@ import uuid
 from dataclasses import dataclass
 
 # ── 事件类型常量 ──
+SEED = "session/seed"                    # 初始 LLM 消息（data: role + content），LLM 可见、入 Event Log
 TURN_START = "turn/start"
 TURN_END = "turn/end"
 STEP_START = "step/start"
@@ -22,7 +27,7 @@ TOOL_CALL = "tool/call"
 TOOL_RESULT = "tool/result"
 
 # 进入 LLM Context 的 surface 事件（其余事件只存在于 Event Log）
-SURFACE_EVENT_TYPES = frozenset({USER_MESSAGE, ASSISTANT_MESSAGE, TOOL_RESULT})
+SURFACE_EVENT_TYPES = frozenset({SEED, USER_MESSAGE, ASSISTANT_MESSAGE, TOOL_RESULT})
 
 
 @dataclass

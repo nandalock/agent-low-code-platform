@@ -22,6 +22,7 @@ class ChatRequest(BaseModel):
     question: str
     conversation_id: int | None = None
     visitor_id: str | None = None
+    session_id: str | None = None  # AgentRuntime 多轮 Session id：首轮不传（新建），后续传回（恢复）
 
 
 class ChatResponse(BaseModel):
@@ -30,6 +31,7 @@ class ChatResponse(BaseModel):
     tier: str
     trace: dict = {}
     conversation_id: int
+    session_id: str | None = None
 
 
 class AgentConfigResponse(BaseModel):
@@ -209,8 +211,8 @@ async def agent_chat(
         chat_service.MessageCreate(role="customer", content=body.question),
     )
 
-    # 3. 调用 Agent
-    reply: AgentReply = await agent.reply(x_tenant_id, body.question)
+    # 3. 调用 Agent（session_id 透传：多轮 Session 由 AgentRuntime + SessionStore 管理）
+    reply: AgentReply = await agent.reply(x_tenant_id, body.question, session_id=body.session_id)
 
     # 4. 写入 Agent 回复
     chat_service.create_message(
@@ -225,7 +227,7 @@ async def agent_chat(
 
     return ChatResponse(
         answer=reply.answer, sources=reply.sources, tier=reply.tier, trace=reply.trace,
-        conversation_id=conv.id,
+        conversation_id=conv.id, session_id=reply.session_id,
     )
 
 
@@ -264,7 +266,7 @@ async def agent_chat_stream(
         async def on_event(ev: dict):
             await queue.put(ev)
 
-        task = asyncio.create_task(agent.reply(x_tenant_id, body.question, on_event=on_event))
+        task = asyncio.create_task(agent.reply(x_tenant_id, body.question, on_event=on_event, session_id=body.session_id))
         try:
             while True:
                 try:

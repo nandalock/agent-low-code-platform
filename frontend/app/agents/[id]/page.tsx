@@ -99,6 +99,12 @@ function getSavedConversationId(agentKey: string): number | null {
   return saved ? parseInt(saved) : null;
 }
 
+// AgentRuntime 多轮 Session id：done 事件带回 → sessionStorage 持久化 → 下一轮回传（与 conv 同生命周期）
+function getSavedSessionId(agentKey: string): string | null {
+  if (typeof window === 'undefined') return null;
+  return sessionStorage.getItem(`sid_${agentKey}`);
+}
+
 interface TraceStep {
   step: number; type: 'llm' | 'tool'; content?: string;
   tool?: string; args?: Record<string,any>; output?: any;
@@ -123,6 +129,7 @@ export default function AgentDetailPage() {
   const [sending, setSending] = useState(false);
   const [trace, setTrace] = useState<ChatMsg['trace'] | null>(null);
   const [conversationId, setConversationId] = useState<number | null>(getSavedConversationId(agentKey));
+  const [sessionId, setSessionId] = useState<string | null>(getSavedSessionId(agentKey));
   const [loadingHistory, setLoadingHistory] = useState(false);
   // 流式状态（deepseek harness 风格：思考面板 + 工具卡片 + 打字机）
   const [liveThinking, setLiveThinking] = useState('');
@@ -200,7 +207,7 @@ export default function AgentDetailPage() {
     finally { setSaving(false); }
   }
 
-  function handleNewChat() { setMessages([]); setConversationId(null); setTrace(null); sessionStorage.removeItem(`conv_${agentKey}`); }
+  function handleNewChat() { setMessages([]); setConversationId(null); setSessionId(null); setTrace(null); sessionStorage.removeItem(`conv_${agentKey}`); sessionStorage.removeItem(`sid_${agentKey}`); }
 
   async function handleSend() {
     if (!input.trim() || sending) return;
@@ -215,6 +222,7 @@ export default function AgentDetailPage() {
     try {
       const body: any = { question: input, visitor_id: VISITOR_ID };
       if (conversationId) body.conversation_id = conversationId;
+      if (sessionId) body.session_id = sessionId;  // 多轮：回传 AgentRuntime Session id 续上历史
       const r = await fetch(`${API}/api/agents/${agentKey}/chat/stream`, { method:'POST', headers:{'Content-Type':'application/json','X-Tenant-ID':String(TENANT_ID)}, body:JSON.stringify(body) });
       if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
       // 解析 SSE 事件流（data: JSON 空行分隔）
@@ -269,6 +277,7 @@ export default function AgentDetailPage() {
             case 'done':
               if (ev.answer) finalAnswer = ev.answer;
               if (ev.trace) finalTrace = { tier: ev.tier, total_ms: ev.trace.total_ms, steps: ev.trace.steps };
+              if (ev.session_id) { setSessionId(ev.session_id); sessionStorage.setItem(`sid_${agentKey}`, ev.session_id); }  // 首轮新建 → 保存，后续轮次带回
               setLiveThinking(liveThink);  // 保留思考（折叠为首行摘要）
               break;
           }
