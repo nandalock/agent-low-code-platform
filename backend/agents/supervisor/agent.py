@@ -377,7 +377,7 @@ class SupervisorAgent(BaseAgent):
         self.status = "active"
         self.template = definition.get("config", {})
 
-    async def reply(self, tenant_id: int, question: str, context: dict | None = None) -> AgentReply:
+    async def reply(self, tenant_id: int, question: str, context: dict | None = None, session_id: str | None = None) -> AgentReply:
         from backend.services.memory import MemoryContext
 
         graph = build_graph()

@@ -12,7 +12,7 @@ class FaqAgent(AgentRuntime):
     def __init__(self):
         super().__init__(key="faqagent")
 
-    async def reply(self, tenant_id: int, question: str, context: dict | None = None) -> AgentReply:
+    async def reply(self, tenant_id: int, question: str, context: dict | None = None, session_id: str | None = None) -> AgentReply:
         t0 = time.perf_counter()
         config = self._cfg()
         direct_threshold = config["direct_threshold"]

@@ -13,7 +13,7 @@ from backend.agents.base import BaseAgent, AgentReply
 from backend.agents.config_service import get_agent_definition, get_agent_config
 from backend.agents.runtime.agent_loop import AgentLoop
 from backend.agents.runtime.events import EventSink
-from backend.agents.runtime.session import Session
+from backend.agents.runtime.session import get_session_store
 from backend.core.http import get_http_session
 from backend.mcp_service.registry import get_registry
 
@@ -42,6 +42,7 @@ class AgentRuntime(BaseAgent):
         self, tenant_id: int, question: str,
         context: dict | None = None,
         on_event: EventSink | None = None,
+        session_id: str | None = None,
     ) -> AgentReply:
         t0 = time.perf_counter()
         config = self._cfg()
@@ -54,18 +55,24 @@ class AgentRuntime(BaseAgent):
             tool_schemas = []
 
         # Session 开关（默认开）：开 → 记录 Event Log 并派生 LLM 消息；关 → 保持原 messages 行为。
-        # Session 属于一次独立 Agent Run：system prompt / 上游 context 作为 init_messages 注入
-        # （LLM 可见但不入 Event Log），不能记成 user/message。Runtime 只创建注入，不消费 Session。
+        # 多轮 Session：session_id 给定 → SessionStore.get() 恢复同一 Session（跨请求保持上下文）；
+        # 否则（首次 / id 失效）→ SessionStore.create() 新建。init_messages（system prompt /
+        # 上游 context）只首轮注入，作为 seed 事件写入 Event Log；后续轮次不重复注入。
+        # AgentRuntime 是无状态执行器：Session 生命周期归 SessionStore，Runtime 只取用不持有。
         session = None
         if bool(config.get("session_enabled", True)):
-            init_messages = [{"role": "system", "content": config.get("system_prompt", "")}]
-            if context:
-                context_str = json.dumps(context, ensure_ascii=False, indent=2)
-                init_messages.append({
-                    "role": "system",
-                    "content": f"【上游节点输出，供你参考】\n{context_str}",
-                })
-            session = Session(init_messages=init_messages)
+            store = get_session_store()
+            if session_id:
+                session = store.get(session_id)
+            if session is None:
+                init_messages = [{"role": "system", "content": config.get("system_prompt", "")}]
+                if context:
+                    context_str = json.dumps(context, ensure_ascii=False, indent=2)
+                    init_messages.append({
+                        "role": "system",
+                        "content": f"【上游节点输出，供你参考】\n{context_str}",
+                    })
+                session = store.create(init_messages=init_messages)
 
         # 准备运行环境，创建并驱动 AgentLoop（执行循环在 Loop 内部；Session 由 Runtime 注入）
         loop = AgentLoop(
@@ -82,9 +89,11 @@ class AgentRuntime(BaseAgent):
 
         trace["total_ms"] = round((time.perf_counter() - t0) * 1000)
         tier = "llm" if any(s.get("type") == "llm" for s in trace.get("steps", [])) else "fallback"
+        # session_id 返回给客户端：首轮为新建 Session 的 id，后续轮次客户端原样带回
+        sid = session.header.id if session is not None else None
         if on_event:
-            await on_event({"type": "done", "answer": answer, "tier": tier, "trace": trace})
-        return AgentReply(answer=answer, tier=tier, trace=trace)
+            await on_event({"type": "done", "answer": answer, "tier": tier, "trace": trace, "session_id": sid})
+        return AgentReply(answer=answer, tier=tier, trace=trace, session_id=sid)
 
     def _llm_params(self, config: dict) -> dict:
         """运行参数（LLM 调用 + 防失控限制），全部从 agent 配置读取，默认值=现行为（零破坏）"""

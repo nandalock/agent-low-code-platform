@@ -18,7 +18,7 @@ class HumanHandoffAgent(BaseAgent):
         db_config = get_agent_config(self.key) or {}
         return {**self.template, **db_config}
 
-    async def reply(self, tenant_id: int, question: str, context: dict | None = None) -> AgentReply:
+    async def reply(self, tenant_id: int, question: str, context: dict | None = None, session_id: str | None = None) -> AgentReply:
         t0 = time.perf_counter()
         config = self._get_config()
         trace = {"total_ms": round((time.perf_counter() - t0) * 1000)}

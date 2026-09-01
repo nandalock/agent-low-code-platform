@@ -80,7 +80,7 @@ class RouterRuntime(BaseAgent):
 
     # ── 入口 ──
 
-    async def reply(self, tenant_id: int, question: str, context: dict | None = None) -> AgentReply:
+    async def reply(self, tenant_id: int, question: str, context: dict | None = None, session_id: str | None = None) -> AgentReply:
         t0 = time.perf_counter()
         config = self._cfg()
         steps: list[dict] = []
