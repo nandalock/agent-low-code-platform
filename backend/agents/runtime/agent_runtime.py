@@ -3,6 +3,7 @@
 职责：加载 agent definition / config，获取 ToolRegistry 与 tool schemas，准备 LLM 参数，
 创建并驱动 AgentLoop，返回最终结果。Agent 执行循环（LLM → Tool → LLM）在 AgentLoop 中。
 """
+import json
 import logging
 import time
 
@@ -12,6 +13,7 @@ from backend.agents.base import BaseAgent, AgentReply
 from backend.agents.config_service import get_agent_definition, get_agent_config
 from backend.agents.runtime.agent_loop import AgentLoop
 from backend.agents.runtime.events import EventSink
+from backend.agents.runtime.session import Session
 from backend.core.http import get_http_session
 from backend.mcp_service.registry import get_registry
 
@@ -51,7 +53,21 @@ class AgentRuntime(BaseAgent):
         except RuntimeError:
             tool_schemas = []
 
-        # 准备运行环境，创建并驱动 AgentLoop（执行循环在 Loop 内部）
+        # Session 开关（默认开）：开 → 记录 Event Log 并派生 LLM 消息；关 → 保持原 messages 行为。
+        # Session 属于一次独立 Agent Run：system prompt / 上游 context 作为 init_messages 注入
+        # （LLM 可见但不入 Event Log），不能记成 user/message。Runtime 只创建注入，不消费 Session。
+        session = None
+        if bool(config.get("session_enabled", True)):
+            init_messages = [{"role": "system", "content": config.get("system_prompt", "")}]
+            if context:
+                context_str = json.dumps(context, ensure_ascii=False, indent=2)
+                init_messages.append({
+                    "role": "system",
+                    "content": f"【上游节点输出，供你参考】\n{context_str}",
+                })
+            session = Session(init_messages=init_messages)
+
+        # 准备运行环境，创建并驱动 AgentLoop（执行循环在 Loop 内部；Session 由 Runtime 注入）
         loop = AgentLoop(
             key=self.key,
             config=config,
@@ -60,6 +76,7 @@ class AgentRuntime(BaseAgent):
             tenant_id=tenant_id,
             trace=trace,
             on_event=on_event,
+            session=session,
         )
         answer = await loop.run(question, context)
 

@@ -11,6 +11,8 @@
   max_wall_time  — 整个 run 的总时长上限（AgentRuntime._llm_params 配置）
   tool timeout   — 单个 Tool 的最大执行时间（ToolRegistry 提供，未声明用 DEFAULT_TOOL_TIMEOUT）
   repeat tool    — 连续重复调用相同 Tool + 标准化参数达到 REPEAT_TOOL_THRESHOLD 后停止
+  Session        — 可选执行事实源（AgentRuntime 创建注入）：开启时 append 事件、LLM 消息由
+                   session.derive_messages() 派生；None 时保持现有 messages 列表行为
 """
 import asyncio
 import json
@@ -20,6 +22,18 @@ import time
 import aiohttp
 
 from backend.agents.runtime.events import EventSink
+from backend.agents.runtime.session import (
+    ASSISTANT_CHUNK,
+    ASSISTANT_MESSAGE,
+    STEP_END,
+    STEP_START,
+    TOOL_CALL,
+    TOOL_RESULT,
+    TURN_END,
+    TURN_START,
+    USER_MESSAGE,
+    Session,
+)
 from backend.core.http import get_http_session
 from backend.mcp_service.registry import get_registry
 
@@ -48,6 +62,7 @@ class AgentLoop:
         tenant_id: int,
         trace: dict,
         on_event: EventSink | None = None,
+        session: Session | None = None,
     ):
         self.key = key
         self.config = config
@@ -56,6 +71,9 @@ class AgentLoop:
         self.tenant_id = tenant_id
         self.trace = trace
         self.on_event = on_event
+        # 可选 Session（由 AgentRuntime 创建注入）：开启时 Event Log 是执行事实来源，
+        # LLM 消息由 session.derive_messages() 派生；None 时保持现有 messages 列表行为
+        self.session = session
 
     async def run(self, question: str, context: dict | None = None) -> str:
         """驱动完整 Agent 循环，返回最终 answer（含 guard 安全停止 / fallback 兜底）"""
@@ -107,15 +125,23 @@ class AgentLoop:
             if "tenant_id" not in required:
                 required.append("tenant_id")
 
-        messages = [
+        system_messages = [
             {"role": "system", "content": config.get("system_prompt", "")},
         ]
         if context:
             context_str = json.dumps(context, ensure_ascii=False, indent=2)
-            messages.append({
+            system_messages.append({
                 "role": "system",
                 "content": f"【上游节点输出，供你参考】\n{context_str}",
             })
+
+        # Session 开启：Session 是执行事实来源（init_messages 已由 AgentRuntime 注入），
+        # LLM 消息由 derive_messages() 派生；关闭：保持现有 messages 列表行为。
+        if self.session:
+            self.session.append(TURN_START, {"agent": self.key})
+            self.session.append(USER_MESSAGE, {"content": question})
+
+        messages = list(system_messages)
         messages.append({"role": "user", "content": question})
 
         final_answer = ""
@@ -130,13 +156,16 @@ class AgentLoop:
                     wall_time_exhausted = True
                     break
 
+                if self.session:
+                    self.session.append(STEP_START, {"step": step + 1})
+
                 t_step = time.perf_counter()
                 # LLM 请求超时不能突破 max_wall_time：按剩余时间裁剪
                 remaining = max(max_wall_time - (time.perf_counter() - run_start), 1.0)
 
                 payload = {
                     "model": model,
-                    "messages": messages,
+                    "messages": self._get_messages(messages),
                     "temperature": self.llm_params["temperature"],
                     "max_tokens": self.llm_params["max_tokens"],
                 }
@@ -148,7 +177,8 @@ class AgentLoop:
 
                 logger.info(
                     f"AgentLoop [{self.key}] step {step + 1}/{max_steps}, "
-                    f"messages={len(messages)}, tools={[t['function']['name'] for t in tools]}"
+                    f"messages={len(self._get_messages(messages))}, "
+                    f"tools={[t['function']['name'] for t in tools]}"
                 )
 
                 if self.on_event:
@@ -168,7 +198,13 @@ class AgentLoop:
                         result = await resp.json()
                     msg = result.get("choices", [{}])[0].get("message", {})
 
-                messages.append(msg)
+                if self.session:
+                    self.session.append(ASSISTANT_MESSAGE, {
+                        "content": msg.get("content") or "",
+                        "tool_calls": msg.get("tool_calls") or [],
+                    })
+                if self.session is None:
+                    messages.append(msg)
 
                 if not payload.get("stream"):
                     step_latency = round((time.perf_counter() - t_step) * 1000)
@@ -183,6 +219,8 @@ class AgentLoop:
 
                 if not tool_calls:
                     final_answer = msg.get("content", "")
+                    if self.session:
+                        self.session.append(STEP_END, {"step": step + 1})
                     break
 
                 for tc in tool_calls:
@@ -209,6 +247,13 @@ class AgentLoop:
 
                     tool_call_count += 1
 
+                    if self.session:
+                        self.session.append(TOOL_CALL, {
+                            "tool": mcp_name,
+                            "args": args,
+                            "tool_call_id": tc["id"],
+                        })
+
                     if self.on_event:
                         await self.on_event({"type": "tool_call", "tool": mcp_name, "args": args})
 
@@ -226,6 +271,13 @@ class AgentLoop:
                     if isinstance(tool_result, dict) and "执行超时" in (tool_result.get("error") or ""):
                         last_tool_timeout_msg = tool_result["error"]
 
+                    if self.session:
+                        self.session.append(TOOL_RESULT, {
+                            "tool": mcp_name,
+                            "tool_call_id": tc["id"],
+                            "content": json.dumps(tool_result, ensure_ascii=False),
+                        })
+
                     if self.on_event:
                         await self.on_event({
                             "type": "tool_result", "tool": mcp_name,
@@ -233,11 +285,12 @@ class AgentLoop:
                             "error": tool_result.get("error"),
                         })
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": json.dumps(tool_result, ensure_ascii=False),
-                    })
+                    if self.session is None:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": json.dumps(tool_result, ensure_ascii=False),
+                        })
 
                     self.trace["steps"].append({
                         "step": step,
@@ -249,13 +302,37 @@ class AgentLoop:
                     })
 
                 if tool_calls_exhausted or repeat_tool_stopped:
+                    if self.session:
+                        self.session.append(STEP_END, {"step": step + 1})
                     break
+
+                if self.session:
+                    self.session.append(STEP_END, {"step": step + 1})
 
             else:
                 steps_exhausted = True
 
         except Exception as e:
             logger.warning(f"AgentLoop [{self.key}] LLM 调用失败: {e}")
+
+        # turn/end 记录 stop_reason（Session 视角：正常完成/guard/异常都有值）；
+        # trace 的 stop_reason 仍按原有逻辑只记录 guard，行为不变。
+        if self.session:
+            if tool_calls_exhausted:
+                stop_reason = "max_tool_calls"
+            elif repeat_tool_stopped:
+                stop_reason = "repeat_tool"
+            elif steps_exhausted:
+                stop_reason = "max_steps"
+            elif wall_time_exhausted:
+                stop_reason = "max_wall_time"
+            elif last_tool_timeout_msg:
+                stop_reason = "tool_timeout"
+            elif final_answer:
+                stop_reason = "completed"
+            else:
+                stop_reason = "error"
+            self.session.append(TURN_END, {"stop_reason": stop_reason})
 
         # 终止兜底：guard 安全停止都给出明确原因（不是「服务不可用」）
         if final_answer:
@@ -277,6 +354,12 @@ class AgentLoop:
             self.trace["stop_reason"] = "tool_timeout"
             return f"{last_tool_timeout_msg}，请重试或拆分成更小的步骤。"
         return config.get("fallback_reply", "服务暂时不可用")
+
+    def _get_messages(self, fallback: list[dict]) -> list[dict]:
+        """LLM 消息来源：Session 开启时由 surface 派生，否则用现有 messages 列表"""
+        if self.session is None:
+            return fallback
+        return self.session.derive_messages()
 
     async def _call_tool_with_progress(self, registry, tool_name: str, args: dict, timeout: float) -> dict:
         """执行工具：所有 Tool 统一带 timeout；有进度查询 + 事件订阅者时额外轮询 → tool_progress 事件
@@ -361,12 +444,16 @@ class AgentLoop:
                 # 推理过程（deepseek reasoning_content）— 只广播，不混入 content
                 r = delta.get("reasoning_content")
                 if r:
+                    if self.session:
+                        self.session.append(ASSISTANT_CHUNK, {"kind": "thinking", "delta": r})
                     await self.on_event({"type": "thinking", "delta": r})
 
                 # 正文增量
                 c = delta.get("content")
                 if c:
                     msg["content"] = msg.get("content", "") + c
+                    if self.session:
+                        self.session.append(ASSISTANT_CHUNK, {"kind": "text", "delta": c})
                     await self.on_event({"type": "text", "delta": c})
 
                 # 工具调用按 index 累积（流式下是分段片段）

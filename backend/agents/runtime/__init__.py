@@ -5,5 +5,6 @@
 from backend.agents.runtime.agent_loop import AgentLoop
 from backend.agents.runtime.agent_runtime import AgentRuntime
 from backend.agents.runtime.events import EventSink, TOOL_POLL_TIMEOUT
+from backend.agents.runtime.session import Session
 
-__all__ = ["AgentRuntime", "AgentLoop", "EventSink", "TOOL_POLL_TIMEOUT"]
+__all__ = ["AgentRuntime", "AgentLoop", "EventSink", "TOOL_POLL_TIMEOUT", "Session"]
