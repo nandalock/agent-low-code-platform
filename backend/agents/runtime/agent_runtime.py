@@ -55,10 +55,11 @@ class AgentRuntime(BaseAgent):
             tool_schemas = []
 
         # Session 开关（默认开）：开 → 记录 Event Log 并派生 LLM 消息；关 → 保持原 messages 行为。
-        # 多轮 Session：session_id 给定 → SessionStore.get() 恢复同一 Session（跨请求保持上下文）；
-        # 否则（首次 / id 失效）→ SessionStore.create() 新建。init_messages（system prompt /
+        # 多轮 Session：session_id 给定 → SessionStore.get() 取回进程内同一 Session（跨请求保持上下文）；
+        # 否则（首次 / 内存中不存在）→ SessionStore.create() 新建。init_messages（system prompt /
         # 上游 context）只首轮注入，作为 seed 事件写入 Event Log；后续轮次不重复注入。
-        # AgentRuntime 是无状态执行器：Session 生命周期归 SessionStore，Runtime 只取用不持有。
+        # AgentRuntime 是无状态执行器：Session 生命周期归 SessionStore（进程内 dict 登记表），
+        # Runtime 只取用不持有；Persistence 当前不参与执行链（进程退出后 Session 消失）。
         session = None
         if bool(config.get("session_enabled", True)):
             store = get_session_store()

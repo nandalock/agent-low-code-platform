@@ -2,8 +2,8 @@
 
 职责划分（与 DeepSeek Harness 一致）：
   Session              单个会话的事件管理（SessionStore 创建，AgentLoop 消费）
-  SessionStore         当前运行中 Session 的生命周期管理（get_session_store() 单例）
-  SessionPersistence   Event Log 持久化接口（Session 内部持有，随 append 写入）
+  SessionStore         进程内运行态 Session 的生命周期管理（get_session_store() 单例）
+  SessionPersistence   Event Log 持久化接口（独立 capability seam，当前阶段不参与执行链）
 """
 from backend.agents.runtime.session.events import (
     ASSISTANT_CHUNK,
@@ -21,7 +21,7 @@ from backend.agents.runtime.session.events import (
     SessionHeader,
 )
 from backend.agents.runtime.session.persistence import (
-    InMemoryPersistence,
+    NoopPersistence,
     SessionPersistence,
 )
 from backend.agents.runtime.session.session import Session
@@ -36,7 +36,7 @@ __all__ = [
     "SessionStore",
     "get_session_store",
     "SessionPersistence",
-    "InMemoryPersistence",
+    "NoopPersistence",
     "SEED",
     "TURN_START",
     "TURN_END",

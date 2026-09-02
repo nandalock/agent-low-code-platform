@@ -4,14 +4,15 @@
   - 记录完整执行事件（log / seq / time 自动生成，log 外部只读）
   - 维护 ordered surface（LLM 可见子集）
   - 由 surface 派生 OpenAI 兼容 Message[]（derive_messages）
-  - 持有 SessionPersistence：每次 append 同步持久化 Event Log
 
 Event Log 是唯一真源：会话创建时的初始消息（system prompt / 上游 context）
 以 session/seed 事件写入 Log 开头（header.seed_length 记录数量），不做第二份存储；
-持久化 / 恢复只依赖 SessionHeader + SessionEvent[]，OpenAI messages 始终派生。
+LLM messages 始终由 derive_messages() 派生，不单独保存。
 
 不负责：实时广播（EventSink）、运行统计（trace）、Context Compaction、
-SubAgent Session、Session 生命周期（SessionStore）。
+SubAgent Session、Session 生命周期（SessionStore）、持久化（SessionPersistence）。
+Session 不感知任何外部存储（JSONL / SQLite / Postgres）——Persistence 是独立
+capability seam，当前阶段不参与执行链。
 """
 import time
 
@@ -21,7 +22,6 @@ from backend.agents.runtime.session.events import (
     SessionHeader,
     new_session_id,
 )
-from backend.agents.runtime.session.persistence import SessionPersistence
 from backend.agents.runtime.session.surface import SurfaceManager
 
 
@@ -33,7 +33,6 @@ class Session:
         *,
         header: SessionHeader | None = None,
         init_messages: list[dict] | None = None,
-        persistence: SessionPersistence | None = None,
     ):
         self._header = header or SessionHeader(
             version=1,
@@ -44,12 +43,8 @@ class Session:
         self._log: list[SessionEvent] = []
         self._surface = SurfaceManager()
         self._seq = 0
-        self._persistence = persistence
-        # 新建会话（无 header）时向持久化注册；恢复（有 header）时不重复注册
-        if persistence is not None and header is None:
-            persistence.create(self._header.id, self._header)
         # 初始 LLM 消息（system / 上游 context）→ seed 事件写入 Event Log：
-        # LLM 可见（surface 事件）、随 Log 持久化，Event Log 保持唯一真源
+        # LLM 可见（surface 事件）、随 Log 保存，Event Log 保持唯一真源
         if init_messages:
             self._header.seed_length = len(init_messages)
             for m in init_messages:
@@ -99,32 +94,33 @@ class Session:
     # ── 写入 ──
 
     def append(self, type: str, data: dict) -> SessionEvent:
-        """追加一条执行事实：自增 seq → 记 time → 写 log → 通知 surface → 持久化"""
+        """追加一条执行事实：自增 seq → 记 time → 写 log → 通知 surface。
+
+        只有符合 Surface 规则的事件进入 SurfaceManager；不在这里处理
+        Persistence（独立 capability seam，外部事件监听者自行消费）。
+        """
         self._seq += 1
         event = SessionEvent(type=type, seq=self._seq, time=time.time(), data=data)
         self._log.append(event)
         self._surface.append(event)
-        if self._persistence is not None:
-            self._persistence.append(self._header.id, event)
         return event
 
-    # ── 恢复 ──
+    # ── 重建 ──
 
     @classmethod
     def from_events(
         cls,
         header: SessionHeader,
         events: list[SessionEvent],
-        *,
-        persistence: SessionPersistence | None = None,
     ) -> "Session":
-        """从持久化的 SessionHeader + SessionEvent[] 恢复 Session。
+        """从 SessionHeader + SessionEvent[] 重建 Session（纯内存，不涉及存储）。
 
-        重建 _log / _surface / _seq（不回放 append()，避免重写 seq/time 与重复持久化）。
-        恢复后 derive_messages() 结果与原 Session 完全一致（surface 由事件类型重建，
-        seed 事件随 Log 一起恢复）。
+        重建 _log / _surface / _seq（不回放 append()，避免重写 seq/time）。
+        重建后 derive_messages() 结果与原 Session 完全一致（surface 由事件类型
+        重建，seed 事件随 Log 一起恢复）。当前阶段无调用方——后续接入真正
+        Persistence 时由 Persistence.load() → from_events() → SessionStore 使用。
         """
-        session = cls(header=header, persistence=persistence)  # header 存在 → 不重复注册
+        session = cls(header=header)
         ordered = sorted(events, key=lambda e: e.seq)
         for ev in ordered:
             session._log.append(ev)
