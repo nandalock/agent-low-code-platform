@@ -277,6 +277,10 @@ async def agent_chat_stream(
                     continue
                 if ev.get("type") == "thinking":
                     thinking_parts.append(ev.get("delta", ""))
+                # 会话 id 随 done 事件回传：前端据此恢复历史消息（conv_id 属于 API 层概念，
+                # AgentRuntime 不感知 conversation — 分层保持 Runtime 无状态）
+                if ev.get("type") == "done":
+                    ev = {**ev, "conversation_id": conv.id}
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 if ev.get("type") == "done":
                     break
