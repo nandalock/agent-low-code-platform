@@ -278,6 +278,7 @@ export default function AgentDetailPage() {
               if (ev.answer) finalAnswer = ev.answer;
               if (ev.trace) finalTrace = { tier: ev.tier, total_ms: ev.trace.total_ms, steps: ev.trace.steps };
               if (ev.session_id) { setSessionId(ev.session_id); sessionStorage.setItem(`sid_${agentKey}`, ev.session_id); }  // 首轮新建 → 保存，后续轮次带回
+              if (ev.conversation_id) { setConversationId(ev.conversation_id); sessionStorage.setItem(`conv_${agentKey}`, String(ev.conversation_id)); }  // 会话 id 保存：切页回来据此恢复历史消息
               setLiveThinking(liveThink);  // 保留思考（折叠为首行摘要）
               break;
           }
