@@ -14,6 +14,7 @@ from backend.agents.config_service import get_agent_config, save_agent_config, g
 from backend.agents.config_service import list_l1_keywords, create_l1_keyword, update_l1_keyword, delete_l1_keyword
 from backend.core.connection import get_conn
 from backend.services.chat import service as chat_service
+from backend.gateway import AgentNotFound, RequestContext, get_gateway
 
 router = APIRouter(prefix="/api/agents", tags=["Agents"])
 
@@ -197,12 +198,14 @@ async def agent_chat(
     body: ChatRequest,
     x_tenant_id: int = Header(alias="X-Tenant-ID"),
 ) -> ChatResponse:
+    gateway = get_gateway()
+    # 0. 入口存在性检查（与旧行为一致：Agent 不存在 → 404，且不创建会话/不落库）
     try:
-        agent = get_agent(agent_key)
-    except KeyError:
-        raise HTTPException(404, f"Agent 不存在: {agent_key}")
+        agent = gateway.resolve(agent_key)
+    except AgentNotFound as e:
+        raise HTTPException(404, str(e))
 
-    # 1. 获取或创建会话
+    # 1. 获取或创建会话（conversation 为 HTTP 通道的会话历史资源，属 chat 域，API 层持有）
     conv = _resolve_conversation(agent_key, body, x_tenant_id)
 
     # 2. 写入用户消息
@@ -211,8 +214,16 @@ async def agent_chat(
         chat_service.MessageCreate(role="customer", content=body.question),
     )
 
-    # 3. 调用 Agent（session_id 透传：多轮 Session 由 AgentRuntime + SessionStore 管理）
-    reply: AgentReply = await agent.reply(x_tenant_id, body.question, session_id=body.session_id)
+    # 3. 统一经 Gateway 驱动 AgentRuntime（身份解析/会话映射/上下文装配在 Gateway 内；
+    #    session_id 透传：多轮 Session 由 AgentRuntime + SessionStore 管理）
+    reply: AgentReply = await gateway.chat(
+        RequestContext(
+            tenant_id=x_tenant_id, agent_key=agent_key, channel="http",
+            session_id=body.session_id, conversation_id=conv.id,
+            visitor_id=body.visitor_id,
+        ),
+        body.question,
+    )
 
     # 4. 写入 Agent 回复
     chat_service.create_message(
@@ -248,15 +259,24 @@ async def agent_chat_stream(
       {"type":"answer","delta":"..."}           最终回答增量
       {"type":"done","answer":"...","tier":"llm"} 结束
     """
+    gateway = get_gateway()
+    # 0. 入口存在性检查（与旧行为一致：Agent 不存在 → 404，且不创建会话/不落库）
     try:
-        agent = get_agent(agent_key)
-    except KeyError:
-        raise HTTPException(404, f"Agent 不存在: {agent_key}")
+        agent = gateway.resolve(agent_key)
+    except AgentNotFound as e:
+        raise HTTPException(404, str(e))
 
     conv = _resolve_conversation(agent_key, body, x_tenant_id)
     chat_service.create_message(
         x_tenant_id, conv.id,
         chat_service.MessageCreate(role="customer", content=body.question),
+    )
+
+    # 统一经 Gateway 驱动 AgentRuntime；SSE 帧格式/事件翻译仍在本层（Gateway 不感知 HTTP）
+    rctx = RequestContext(
+        tenant_id=x_tenant_id, agent_key=agent_key, channel="http",
+        session_id=body.session_id, conversation_id=conv.id,
+        visitor_id=body.visitor_id,
     )
 
     async def event_gen():
@@ -266,7 +286,7 @@ async def agent_chat_stream(
         async def on_event(ev: dict):
             await queue.put(ev)
 
-        task = asyncio.create_task(agent.reply(x_tenant_id, body.question, on_event=on_event, session_id=body.session_id))
+        task = asyncio.create_task(gateway.chat(rctx, body.question, on_event=on_event))
         try:
             while True:
                 try:
@@ -318,14 +338,21 @@ async def agent_route_test(
     body: ChatRequest,
     x_tenant_id: int = Header(default=1, alias="X-Tenant-ID"),
 ) -> dict:
+    gateway = get_gateway()
     try:
-        agent = get_agent(agent_key)
-    except KeyError:
-        raise HTTPException(404, f"Agent 不存在: {agent_key}")
+        agent = gateway.resolve(agent_key)
+    except AgentNotFound as e:
+        raise HTTPException(404, str(e))
     if not isinstance(agent, RouterRuntime):
         raise HTTPException(400, "仅 Router Agent 支持路由测试")
 
-    reply = await agent.reply(x_tenant_id, body.question)
+    reply = await gateway.chat(
+        RequestContext(
+            tenant_id=x_tenant_id, agent_key=agent_key, channel="http",
+            visitor_id=body.visitor_id,
+        ),
+        body.question,
+    )
     try:
         routing_result = json.loads(reply.answer) if isinstance(reply.answer, str) else reply.answer
     except (json.JSONDecodeError, TypeError):

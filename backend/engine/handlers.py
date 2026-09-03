@@ -68,8 +68,8 @@ def make_agent_handler(node_id: str, agent_key: str, cache_config: dict | None =
         cache_policy = {**base_policy, **overrides}
 
     async def core(state: WorkflowState) -> dict:
-        """核心逻辑：调用 agent.reply()"""
-        from backend.agents import get_agent
+        """核心逻辑：统一经 Gateway 入口调用 agent（身份解析/会话映射在 Gateway）"""
+        from backend.gateway import RequestContext, get_gateway
 
         _visit_counts[node_id] = _visit_counts.get(node_id, 0) + 1
 
@@ -77,8 +77,16 @@ def make_agent_handler(node_id: str, agent_key: str, cache_config: dict | None =
 
         t0 = time.time()
         try:
-            agent = get_agent(agent_key)
-            reply = await agent.reply(tenant_id=1, question=state["input"], context=context)
+            # tenant 来自 workflow 行注入的 state（不再硬编码 tenant_id=1）；
+            # 上游节点输出装配为 context，经 RequestContext 交给 Gateway
+            reply = await get_gateway().chat(
+                RequestContext(
+                    tenant_id=state.get("tenant_id"), agent_key=agent_key,
+                    channel="workflow", visitor_id=state.get("user_id") or None,
+                    context=context,
+                ),
+                state["input"],
+            )
             answer = reply.answer
         except Exception as e:
             logger.error(f"[engine] agent {agent_key} error: {e}")
@@ -169,15 +177,21 @@ def make_condition_router(node_id: str, config: dict, path_map: dict[str, str]) 
 def make_router_handler(node_id: str, agent_key: str) -> Callable:
 
     async def handler(state: WorkflowState) -> dict:
-        from backend.agents import get_agent
+        from backend.gateway import RequestContext, get_gateway
 
         _visit_counts[node_id] = _visit_counts.get(node_id, 0) + 1
         context = _build_context(state)
 
         t0 = time.time()
         try:
-            agent = get_agent(agent_key)
-            reply = await agent.reply(tenant_id=1, question=state["input"], context=context)
+            reply = await get_gateway().chat(
+                RequestContext(
+                    tenant_id=state.get("tenant_id"), agent_key=agent_key,
+                    channel="workflow", visitor_id=state.get("user_id") or None,
+                    context=context,
+                ),
+                state["input"],
+            )
             raw = reply.answer
             trace = reply.trace or {}
             level = trace.get("route_level", "?")

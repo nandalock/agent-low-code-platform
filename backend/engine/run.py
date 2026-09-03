@@ -45,6 +45,7 @@ async def run_workflow(workflow_id: int, payload: dict) -> AsyncGenerator[str, N
     initial_state: WorkflowState = {
         "input": payload.get("input", ""),
         "user_id": payload.get("user_id", ""),
+        "tenant_id": wf["tenant_id"],  # 租户来自 workflow 归属行（agent 节点经 Gateway 使用，不再硬编码）
         "node_results": {},
         "node_timeline": [],
         "output": "",
