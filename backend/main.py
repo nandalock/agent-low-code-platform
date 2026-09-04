@@ -44,9 +44,14 @@ async def startup():
     from backend.mcp_service.registry import init_registry
 
     from backend.core.seeds import seed_orders
+    from backend.agents.runtime.session import PostgresSessionPersistence, set_session_persistence
 
     init_db()
     seed_orders(tenant_id=1)
+
+    # 装配 Session Event Log 持久化（PostgreSQL）。默认 NoopPersistence：进程内 Session，
+    # 退出即消失；装配后 SessionStore 只做内存热区，Event Log 持久化 + 冷恢复走 Postgres。
+    set_session_persistence(PostgresSessionPersistence())
 
     # 1. 有自定义 logic 的 Agent
     register(FaqAgent())

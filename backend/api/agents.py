@@ -174,6 +174,21 @@ def agent_save_config(agent_key: str, body: dict = Body(...)) -> dict:
     return {"agent_key": agent_key, "config": config, "cache_policy": cache_policy}
 
 
+def _session_for_conversation(tenant_id: int, conversation_id: int | None, requested: str | None) -> str | None:
+    """会话级 Session 恢复：显式 session_id（前端多轮回传）优先；
+    否则查 conversations.session_id 映射（该 conversation 最近一次 chat 的 Session）——
+    历史会话从任意入口继续（重启 / 换浏览器 / 切换会话）都能恢复 Agent 上下文。
+
+    每次 chat 完成后本层把 reply.session_id 写回映射（save_conversation_session_id），
+    保证 conversation ↔ session 关联持续存在。映射属 chat 域，Runtime 不感知 conversation。
+    """
+    if requested:
+        return requested
+    if conversation_id is None:
+        return None
+    return chat_service.get_conversation_session_id(tenant_id, conversation_id)
+
+
 def _resolve_conversation(agent_key: str, body: ChatRequest, tenant_id: int):
     """获取或创建会话：有 conversation_id → 继续（页面刷新）；只有 visitor_id → 新建"""
     if body.conversation_id:
@@ -215,17 +230,23 @@ async def agent_chat(
     )
 
     # 3. 统一经 Gateway 驱动 AgentRuntime（身份解析/会话映射/上下文装配在 Gateway 内；
-    #    session_id 透传：多轮 Session 由 AgentRuntime + SessionStore 管理）
+    #    session_id 透传：多轮 Session 由 AgentRuntime + SessionStore 管理。
+    #    无显式 session_id 时按 conversation 映射恢复（历史会话续聊带记忆）
     reply: AgentReply = await gateway.chat(
         RequestContext(
             tenant_id=x_tenant_id, agent_key=agent_key, channel="http",
-            session_id=body.session_id, conversation_id=conv.id,
+            session_id=_session_for_conversation(x_tenant_id, conv.id, body.session_id),
+            conversation_id=conv.id,
             visitor_id=body.visitor_id,
         ),
         body.question,
     )
 
-    # 4. 写入 Agent 回复
+    # 4. 写回 conversation → session 映射（本次 chat 使用的 Session，供历史会话冷恢复）
+    if reply.session_id:
+        chat_service.save_conversation_session_id(x_tenant_id, conv.id, reply.session_id)
+
+    # 5. 写入 Agent 回复
     chat_service.create_message(
         x_tenant_id, conv.id,
         chat_service.MessageCreate(
@@ -275,7 +296,8 @@ async def agent_chat_stream(
     # 统一经 Gateway 驱动 AgentRuntime；SSE 帧格式/事件翻译仍在本层（Gateway 不感知 HTTP）
     rctx = RequestContext(
         tenant_id=x_tenant_id, agent_key=agent_key, channel="http",
-        session_id=body.session_id, conversation_id=conv.id,
+        session_id=_session_for_conversation(x_tenant_id, conv.id, body.session_id),
+        conversation_id=conv.id,
         visitor_id=body.visitor_id,
     )
 
@@ -311,6 +333,9 @@ async def agent_chat_stream(
             except Exception:
                 reply = None
             if reply is not None:
+                # 写回 conversation → session 映射：SSE 轮次同样维护，历史会话冷恢复靠它
+                if reply.session_id:
+                    chat_service.save_conversation_session_id(x_tenant_id, conv.id, reply.session_id)
                 thinking = "".join(thinking_parts)[:6000]  # 截断保护
                 chat_service.create_message(
                     x_tenant_id, conv.id,

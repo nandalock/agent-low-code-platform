@@ -219,6 +219,34 @@ def list_messages(
             return [MessageResponse(**r) for r in rows]
 
 
+def get_conversation_session_id(tenant_id: int, conversation_id: int) -> Optional[str]:
+    """conversation → Agent Runtime session 映射读取（会话级记忆恢复用）。
+
+    该映射属 chat 域（conversation 是 chat 资源），由 API 层维护：每次 chat 完成
+    后把 reply.session_id 写回；请求无显式 session_id 时读它做冷恢复。与
+    RequestContext.conversation_id 同层，AgentRuntime 不感知 conversation。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT session_id FROM conversations WHERE tenant_id = %s AND id = %s",
+                (tenant_id, conversation_id),
+            )
+            row = cur.fetchone()
+            return row["session_id"] if row else None
+
+
+def save_conversation_session_id(tenant_id: int, conversation_id: int, session_id: str) -> None:
+    """conversation → session 映射写回（幂等覆盖：该 conversation 最近一次 chat 的 session）"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE conversations SET session_id = %s, updated_at = now() "
+                "WHERE tenant_id = %s AND id = %s",
+                (session_id, tenant_id, conversation_id),
+            )
+
+
 def create_message(
     tenant_id: int,
     conversation_id: int,
