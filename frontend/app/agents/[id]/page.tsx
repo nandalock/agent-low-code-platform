@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { useParams } from 'next/navigation';
 import { T, S, inputField, labelField, btnPrimary } from '@/app/theme';
-import { PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Wrench, Brain, ChevronDown, ChevronRight, X } from 'lucide-react';
+import { PanelLeftClose, PanelLeftOpen, Brain, ChevronDown, ChevronRight } from 'lucide-react';
 import McpToolBinding from '../_components/McpToolBinding';
 import CachePolicyEditor, { type CachePolicyData } from '../_components/CachePolicyEditor';
 
@@ -95,25 +95,28 @@ function getVisitorId(agentKey: string): string {
 
 function getSavedConversationId(agentKey: string): number | null {
   if (typeof window === 'undefined') return null;
-  const saved = sessionStorage.getItem(`conv_${agentKey}`);
+  const saved = localStorage.getItem(`conv_${agentKey}`);
   return saved ? parseInt(saved) : null;
 }
 
-// AgentRuntime 多轮 Session id：done 事件带回 → sessionStorage 持久化 → 下一轮回传（与 conv 同生命周期）
+// AgentRuntime 多轮 Session id：done 事件带回 → localStorage 持久化 → 下一轮回传。
+// 与 conv 同生命周期（localStorage：重启浏览器仍续最近一场对话，后端冷恢复续 Agent 上下文）
 function getSavedSessionId(agentKey: string): string | null {
   if (typeof window === 'undefined') return null;
-  return sessionStorage.getItem(`sid_${agentKey}`);
+  return localStorage.getItem(`sid_${agentKey}`);
 }
 
-interface TraceStep {
-  step: number; type: 'llm' | 'tool'; content?: string;
-  tool?: string; args?: Record<string,any>; output?: any;
-  latency_ms?: number;
-}
 interface ChatMsg {
   role: 'user' | 'agent'; content: string; time: string;
   thinking?: string;
-  trace?: { tier: string; total_ms: number; steps?: TraceStep[] };
+}
+
+// 历史会话项（服务端 conversations 列表，channel=agent:{key}，与 DeepSeek 会话列表同源）
+interface HistConv {
+  id: number;
+  last_msg: string;
+  last_time: string;
+  count: number;
 }
 
 const DEFAULT_CONFIG = { system_prompt: '', fallback_reply: '', api_key: '', base_url: '', model: '', max_steps: 5 };
@@ -127,10 +130,12 @@ export default function AgentDetailPage() {
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
-  const [trace, setTrace] = useState<ChatMsg['trace'] | null>(null);
-  const [conversationId, setConversationId] = useState<number | null>(getSavedConversationId(agentKey));
-  const [sessionId, setSessionId] = useState<string | null>(getSavedSessionId(agentKey));
+  // 初值恒为 null：localStorage 读取放在 mount effect 里（SSR 首帧无本地存储，
+  // 直接读会 hydation mismatch —— select 的 value 与 option 集合必须服务端/客户端一致）
+  const [conversationId, setConversationId] = useState<number | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [hist, setHist] = useState<HistConv[]>([]);
   // 流式状态（deepseek harness 风格：思考面板 + 工具卡片 + 打字机）
   const [liveThinking, setLiveThinking] = useState('');
   const [liveAnswer, setLiveAnswer] = useState('');
@@ -138,7 +143,24 @@ export default function AgentDetailPage() {
   const [liveSteps, setLiveSteps] = useState<{step:number; total:number}>({ step:0, total:0 });
 
   useEffect(() => {
-    if (sessionStorage.getItem(`conv_${agentKey}`)) setLoadingHistory(true);
+    // mount：从 localStorage 恢复最近一场对话（重启浏览器 → 自动续聊最近会话）。
+    // 放 effect 而非 state 初值，保证 SSR/客户端首帧渲染一致。
+    const cid = getSavedConversationId(agentKey);
+    const sid = getSavedSessionId(agentKey);
+    if (cid) setConversationId(cid);
+    if (sid) setSessionId(sid);
+  }, [agentKey]);
+
+  // 历史会话列表（服务端拉取，channel=agent:{key}）：与 DeepSeek 会话列表同源 ——
+  // 数据在服务端 conversations/messages 表，重启浏览器/换设备都能看到
+  useEffect(() => {
+    fetch(`${API}/api/chat/conversations?channel=agent:${agentKey}`, { headers: { 'X-Tenant-ID': String(TENANT_ID) } })
+      .then(r => r.json()).then(d => {
+        const items = (d.items || []).map((c: any) => ({
+          id: c.id, last_msg: c.last_msg || '', last_time: c.last_time || '', count: c.msg_count || 0,
+        }));
+        setHist(items);
+      }).catch(() => {});
   }, [agentKey]);
 
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -147,8 +169,6 @@ export default function AgentDetailPage() {
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
   const [leftOpen, setLeftOpen] = useState(true);
-  const [rightOpen, setRightOpen] = useState(true);
-  const [expandedSteps, setExpandedSteps] = useState<Record<number, boolean>>({});
   const VISITOR_ID = getVisitorId(agentKey);
 
   useEffect(() => {
@@ -178,6 +198,7 @@ export default function AgentDetailPage() {
 
   useEffect(() => {
     if (!conversationId) { setLoadingHistory(false); return; }
+    setLoadingHistory(true);  // 会话切换 / 自动恢复时显示加载态
     fetch(`${API}/api/chat/conversations/${conversationId}/messages`, { headers: { 'X-Tenant-ID': String(TENANT_ID) } })
       .then(r => r.json()).then(data => {
         const items = data.items || [];
@@ -186,7 +207,7 @@ export default function AgentDetailPage() {
           for (const m of items) {
             const time = m.created_at ? new Date(m.created_at).toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' }) : '';
             const meta = m.metadata || {};
-            if (m.role === 'agent') msgs.push({ role:'agent', content:m.content, time, thinking: meta.thinking || undefined, trace: meta.trace || undefined });
+            if (m.role === 'agent') msgs.push({ role:'agent', content:m.content, time, thinking: meta.thinking || undefined });
             else if (m.role === 'customer') msgs.push({ role:'user', content:m.content, time });
           }
           setMessages(msgs);
@@ -207,7 +228,29 @@ export default function AgentDetailPage() {
     finally { setSaving(false); }
   }
 
-  function handleNewChat() { setMessages([]); setConversationId(null); setSessionId(null); setTrace(null); sessionStorage.removeItem(`conv_${agentKey}`); sessionStorage.removeItem(`sid_${agentKey}`); }
+  function handleNewChat() {
+    setMessages([]); setConversationId(null); setSessionId(null);
+    localStorage.removeItem(`conv_${agentKey}`); localStorage.removeItem(`sid_${agentKey}`);
+  }
+
+  // 切换到历史会话：加载该场对话消息（conversationId state 变化 → 下方 effect 拉消息）并继续在该场聊。
+  // 只有「最近一场」的 Agent Session id 存在本地；切到更早会话不带 session_id →
+  // 后端新建 Runtime Session（消息仍追加进同一场对话，记录连续；Agent 上下文从头 ——
+  // 完整会话级 Agent 记忆恢复属于 conversation↔session 服务端映射（后续阶段）。
+  function switchConversation(id: number) {
+    if (conversationId === id) return;
+    setMessages([]);
+    setConversationId(id);
+    const savedSid = getSavedSessionId(agentKey);
+    setSessionId(savedSid && getSavedConversationId(agentKey) === id ? savedSid : null);
+  }
+
+  function fmtConvTime(t: string): string {
+    if (!t) return '';
+    const d = new Date(t);
+    const p = (n: number) => String(n).padStart(2, '0');
+    return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
 
   async function handleSend() {
     if (!input.trim() || sending) return;
@@ -218,7 +261,6 @@ export default function AgentDetailPage() {
     let finalAnswer = '';
     let liveAns = '';  // 局部累积（避免 state 闭包读到旧值）
     let liveThink = '';  // 局部累积思考（done 后用于生成首行摘要）
-    let finalTrace: ChatMsg['trace'] | undefined;
     try {
       const body: any = { question: input, visitor_id: VISITOR_ID };
       if (conversationId) body.conversation_id = conversationId;
@@ -276,9 +318,9 @@ export default function AgentDetailPage() {
               break;
             case 'done':
               if (ev.answer) finalAnswer = ev.answer;
-              if (ev.trace) finalTrace = { tier: ev.tier, total_ms: ev.trace.total_ms, steps: ev.trace.steps };
-              if (ev.session_id) { setSessionId(ev.session_id); sessionStorage.setItem(`sid_${agentKey}`, ev.session_id); }  // 首轮新建 → 保存，后续轮次带回
-              if (ev.conversation_id) { setConversationId(ev.conversation_id); sessionStorage.setItem(`conv_${agentKey}`, String(ev.conversation_id)); }  // 会话 id 保存：切页回来据此恢复历史消息
+              // session/conversation id 持久到 localStorage：重启浏览器自动续最近一场
+              if (ev.session_id) { setSessionId(ev.session_id); localStorage.setItem(`sid_${agentKey}`, ev.session_id); }
+              if (ev.conversation_id) { setConversationId(ev.conversation_id); localStorage.setItem(`conv_${agentKey}`, String(ev.conversation_id)); }
               setLiveThinking(liveThink);  // 保留思考（折叠为首行摘要）
               break;
           }
@@ -288,17 +330,10 @@ export default function AgentDetailPage() {
       finalAnswer = '请求失败，请稍后重试。';
     } finally {
       setSending(false);
-      setMessages(prev => [...prev, { role:'agent', content: finalAnswer || liveAns || '抱歉，暂时无法处理。', time:new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}), thinking: liveThink || undefined, trace: finalTrace }]);
-      if (finalTrace) setTrace(finalTrace);
+      setMessages(prev => [...prev, { role:'agent', content: finalAnswer || liveAns || '抱歉，暂时无法处理。', time:new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}), thinking: liveThink || undefined }]);
       setLiveThinking(''); setLiveAnswer(''); setLiveTools([]);
     }
   }
-
-  const preSmall: React.CSSProperties = { margin:0, padding:'6px 8px', background:T.bg, borderRadius:4, fontSize:11, fontFamily:'monospace', color:T.text, lineHeight:1.5, overflow:'auto', maxHeight:200, whiteSpace:'pre-wrap', wordBreak:'break-all' };
-
-  const tierLabel = (tier: string) => tier==='llm'?'AI 回答':tier==='fallback'?'兜底回复':tier;
-  const tierColor = (tier: string) => tier==='llm'?T.accent:tier==='fallback'?T.warning:T.success;
-  const tierBg = (tier: string) => tier==='llm'?T.accentBg:'#FFF7E6';
 
   return (
     <div style={{ display:'flex', height:'100vh', background:T.bg, color:T.text, fontFamily:"system-ui,-apple-system,'Segoe UI',sans-serif", overflow:'auto' }}>
@@ -412,15 +447,20 @@ export default function AgentDetailPage() {
           <span style={{ width:7, height:7, borderRadius:'50%', background:T.accent }} />
           <span style={{ fontSize:14, fontWeight:500, color:T.text }}>测试对话</span>
           <div style={{ flex:1 }} />
-          {trace && (
-            <span style={{ fontSize:11, padding:'3px 10px', borderRadius:12, fontWeight:500, background:tierBg(trace.tier), color:tierColor(trace.tier) }}>
-              {tierLabel(trace.tier)} {trace.total_ms>0 ? `· ${trace.total_ms}ms` : ''}
-            </span>
-          )}
-          <button onClick={() => setRightOpen(!rightOpen)} title={rightOpen?'收起调用链':'展开调用链'} style={{
-            width:28, height:28, borderRadius:6, border:`1px solid ${T.border}`, background:T.surface,
-            display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', color:T.secondary,
-          }}>{rightOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}</button>
+          {/* 历史会话（服务端列表）：重启浏览器/换设备都在 —— DeepSeek 式历史会话恢复 */}
+          <select title="历史会话" value={conversationId ?? '__new'}
+            onChange={e => { const v = e.target.value; if (v === '__new') handleNewChat(); else switchConversation(Number(v)); }}
+            style={{ maxWidth:260, padding:'4px 10px', borderRadius:6, border:`1px solid ${T.border}`, background:T.surface, color:T.text, fontSize:12, cursor:'pointer', outline:'none' }}>
+            <option value="__new">＋ 新对话</option>
+            {conversationId !== null && !hist.some(h => h.id === conversationId) && (
+              <option value={conversationId}>当前会话（恢复中…）</option>
+            )}
+            {hist.map(h => (
+              <option key={h.id} value={h.id}>
+                {fmtConvTime(h.last_time)}{h.count > 1 ? `（${h.count} 条）` : ''}{h.last_msg ? ` · ${h.last_msg.replace(/\s+/g, ' ').slice(0, 18)}` : ''}
+              </option>
+            ))}
+          </select>
           <button onClick={handleNewChat} style={{ padding:'5px 14px', borderRadius:6, border:`1px solid ${T.border}`, background:T.surface, color:T.text, fontSize:12, cursor:'pointer' }}>新建会话</button>
         </div>
 
@@ -506,74 +546,6 @@ export default function AgentDetailPage() {
               style={{ flex:1, minWidth:0, padding:'10px 14px', background:T.surface, border:`1px solid ${T.border}`, borderRadius:6, fontSize:14, color:T.text, outline:'none', boxSizing:'border-box', fontFamily:'inherit' }} />
             <button onClick={handleSend} disabled={!input.trim()||sending} style={{...btnPrimary, padding:'10px 22px', fontSize:14, opacity:!input.trim()||sending?0.4:1 }}>发送</button>
           </div>
-        </div>
-      </div>
-
-      {/* Right: Trace Panel */}
-      <div style={{
-        width: rightOpen ? 360 : 0, minWidth: rightOpen ? 360 : 0,
-        background:T.surface, borderLeft: rightOpen ? `1px solid ${T.border}` : 'none',
-        display:'flex', flexDirection:'column', flexShrink:0,
-        transition:'width .18s ease, min-width .18s ease', overflow:'hidden',
-      }}>
-        <div style={{ padding:`${S.md}px ${S.xl}px`, borderBottom:`1px solid ${T.border}`, minWidth:0 }}>
-          <span style={{ fontSize:13, fontWeight:600, color:T.text }}>调用链</span>
-          <span style={{ fontSize:11, color:T.tertiary, marginLeft:S.sm }}>Tool Calling Trace</span>
-        </div>
-        <div style={{ flex:1, minHeight:0, overflow:'auto', padding:S.xl, minWidth:0 }}>
-          {!trace || !trace.steps || trace.steps.length===0 ? (
-            <div style={{ textAlign:'center', color:T.tertiary, marginTop:S.huge, fontSize:13 }}>暂无调用记录</div>
-          ) : (
-            <div style={{ display:'flex', flexDirection:'column', gap:S.sm }}>
-              {trace.steps.map((step, i) => {
-                const expanded = expandedSteps[i] ?? (i === trace.steps!.length - 1);
-                return (
-                  <div key={i} style={{
-                    padding:S.md, borderRadius:8, border:`1px solid ${T.border}`,
-                    background: step.type==='tool' ? '#FFF7E6' : T.accentBg,
-                  }}>
-                    <div style={{ display:'flex', alignItems:'center', gap:S.sm, cursor:'pointer' }}
-                      onClick={() => setExpandedSteps(p => ({...p, [i]: !expanded}))}>
-                      <span style={{
-                        display:'inline-flex', alignItems:'center', gap:3,
-                        padding:'1px 7px', borderRadius:4, fontSize:10, fontWeight:600,
-                        background: step.type==='tool' ? '#F59E0B18' : `${T.accent}18`,
-                        color: step.type==='tool' ? '#F59E0B' : T.accent,
-                      }}>
-                        {step.type==='tool' ? <Wrench size={10} /> : <Brain size={10} />}
-                        {step.type==='tool' ? `调用: ${step.tool}` : 'LLM 决策'}
-                      </span>
-                      <span style={{ fontSize:10, color:T.tertiary, marginLeft:'auto' }}>Step {step.step+1} · {step.latency_ms}ms</span>
-                      {expanded ? <ChevronDown size={12} color={T.tertiary} /> : <ChevronRight size={12} color={T.tertiary} />}
-                    </div>
-                    {expanded && (
-                      <div style={{ marginTop:S.sm, fontSize:12 }}>
-                        {step.type==='tool' ? (
-                          <>
-                            <div style={{ marginBottom:S.xs }}>
-                              <span style={{ fontWeight:600, color:T.secondary }}>参数</span>
-                              <pre style={preSmall}>{JSON.stringify(step.args || {}, null, 2)}</pre>
-                            </div>
-                            <div>
-                              <span style={{ fontWeight:600, color:T.secondary }}>返回</span>
-                              <pre style={preSmall}>{JSON.stringify(step.output, null, 2)}</pre>
-                            </div>
-                          </>
-                        ) : (
-                          <div style={{ color:T.text, whiteSpace:'pre-wrap', lineHeight:1.5 }}>
-                            {step.content || '(无文本输出 — LLM 决定调用工具)'}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-              <div style={{ fontSize:11, color:T.tertiary, textAlign:'center', padding:S.sm }}>
-                总耗时 {trace.total_ms}ms · {trace.steps.length} 步
-              </div>
-            </div>
-          )}
         </div>
       </div>
 
