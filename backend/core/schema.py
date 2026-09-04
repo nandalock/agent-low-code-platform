@@ -210,6 +210,35 @@ TABLES_DDL = {
             UNIQUE(tenant_id, name)
         )
     """,
+    # Agent Runtime Session(Event Log 持久化事实来源):
+    #   session_headers — Session 元信息(与 events 分离,避免每行重复 header 字段)
+    #   session_events  — 唯一真源 Event Log。session_id + seq 唯一确定顺序(UNIQUE 兜底并发);
+    #                     data JSONB 保存事件 payload,不按事件类型拆业务表
+    "session_headers": """
+        CREATE TABLE IF NOT EXISTS session_headers (
+            session_id       TEXT PRIMARY KEY,
+            version          INT NOT NULL DEFAULT 1,
+            created_at       DOUBLE PRECISION NOT NULL,
+            cwd              TEXT,
+            parent_session   TEXT,
+            seed_length      INT,
+            delegation_depth INT,
+            updated_at       TIMESTAMPTZ DEFAULT now()
+        )
+    """,
+    "session_events": """
+        CREATE TABLE IF NOT EXISTS session_events (
+            id               BIGSERIAL PRIMARY KEY,
+            session_id       TEXT NOT NULL REFERENCES session_headers(session_id) ON DELETE CASCADE,
+            seq              INT NOT NULL,
+            event_type       TEXT NOT NULL,
+            event_time       DOUBLE PRECISION NOT NULL,
+            data             JSONB NOT NULL DEFAULT '{}',
+            source_event_seqs JSONB,
+            created_at       TIMESTAMPTZ DEFAULT now(),
+            UNIQUE(session_id, seq)
+        )
+    """,
 }
 
 INDEXES_DDL = [
@@ -252,6 +281,9 @@ EXTENSIONS = [
 
 MIGRATIONS = [
     "ALTER TABLE faqs ADD COLUMN IF NOT EXISTS embedding vector(1024)",
+    # chat 域 conversation ↔ Agent Runtime Session 的持久映射（会话级记忆恢复用）：
+    # 请求带 conversation_id 而无 session_id 时，API 层按此列冷恢复该场对话的 Session
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS session_id TEXT",
     "ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS env JSONB DEFAULT '{}'",
     "ALTER TABLE mcp_servers ALTER COLUMN args TYPE JSONB USING COALESCE(args::jsonb, '[]'::jsonb)",
     "ALTER TABLE mcp_servers ALTER COLUMN args SET DEFAULT '[]'::jsonb",
