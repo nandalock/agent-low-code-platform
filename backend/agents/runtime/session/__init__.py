@@ -11,6 +11,7 @@
 from backend.agents.runtime.session.events import (
     ASSISTANT_CHUNK,
     ASSISTANT_MESSAGE,
+    LLM_USAGE,
     SEED,
     STEP_END,
     STEP_START,
@@ -54,6 +55,7 @@ __all__ = [
     "USER_MESSAGE",
     "ASSISTANT_CHUNK",
     "ASSISTANT_MESSAGE",
+    "LLM_USAGE",
     "TOOL_CALL",
     "TOOL_RESULT",
     "SURFACE_EVENT_TYPES",
