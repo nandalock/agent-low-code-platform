@@ -25,6 +25,7 @@ from backend.agents.runtime.events import EventSink
 from backend.agents.runtime.session import (
     ASSISTANT_CHUNK,
     ASSISTANT_MESSAGE,
+    LLM_USAGE,
     STEP_END,
     STEP_START,
     TOOL_CALL,
@@ -174,6 +175,9 @@ class AgentLoop:
                     payload["tool_choice"] = "auto"
                 if self.on_event:
                     payload["stream"] = True  # 有订阅者才流式，其余保持原行为
+                    # usage 观测（Step 1）：SSE 默认不回 usage，显式请求；
+                    # DeepSeek 在 [DONE] 前发一个纯 usage chunk（choices 为空）
+                    payload["stream_options"] = {"include_usage": True}
 
                 logger.info(
                     f"AgentLoop [{self.key}] step {step + 1}/{max_steps}, "
@@ -188,6 +192,7 @@ class AgentLoop:
                     msg = await self._call_llm_stream(
                         session, base_url, api_key, payload, step, t_step, remaining,
                     )
+                    llm_usage = msg.pop("usage", None)  # 流式：_call_llm_stream 从 SSE usage chunk 带回
                 else:
                     async with session.post(
                         f"{base_url}/v1/chat/completions",
@@ -197,6 +202,7 @@ class AgentLoop:
                     ) as resp:
                         result = await resp.json()
                     msg = result.get("choices", [{}])[0].get("message", {})
+                    llm_usage = result.get("usage")  # 非流式：顶层 usage（provider 自动返回）
 
                 if self.session:
                     self.session.append(ASSISTANT_MESSAGE, {
@@ -206,14 +212,21 @@ class AgentLoop:
                 if self.session is None:
                     messages.append(msg)
 
+                # usage 观测（Step 1）：llm/usage 事件紧跟本步 assistant/message 之后（log-only）
+                if llm_usage:
+                    self._record_usage(llm_usage, step)
+
                 if not payload.get("stream"):
                     step_latency = round((time.perf_counter() - t_step) * 1000)
-                    self.trace.setdefault("steps", []).append({
+                    entry = {
                         "step": step,
                         "type": "llm",
                         "content": msg.get("content"),
                         "latency_ms": step_latency,
-                    })
+                    }
+                    if llm_usage:
+                        entry["usage"] = llm_usage  # 原始 usage 挂进 step trace，随 done 事件/接口回传
+                    self.trace.setdefault("steps", []).append(entry)
 
                 tool_calls = msg.get("tool_calls") or []
 
@@ -334,6 +347,33 @@ class AgentLoop:
                 stop_reason = "error"
             self.session.append(TURN_END, {"stop_reason": stop_reason})
 
+        # usage 汇总（Step 1，纯观测）：扫 llm step trace 聚合成轮级指标 + 命中率日志。
+        # DeepSeek 字段 prompt_cache_hit_tokens / prompt_cache_miss_tokens；
+        # 两个 cache 字段都缺（非 DeepSeek 网关）→ ratio 记 None，仅 info 不告警。
+        llm_usages = [
+            s.get("usage") for s in self.trace.get("steps", [])
+            if s.get("type") == "llm" and s.get("usage")
+        ]
+        if llm_usages:
+            hits = sum(int(u.get("prompt_cache_hit_tokens") or 0) for u in llm_usages)
+            misses = sum(int(u.get("prompt_cache_miss_tokens") or 0) for u in llm_usages)
+            ratio = round(hits / (hits + misses), 4) if (hits + misses) else None
+            self.trace["usage"] = {
+                "llm_calls": len(llm_usages),
+                "cache_hit_tokens": hits,
+                "cache_miss_tokens": misses,
+                "cache_hit_ratio": ratio,
+            }
+            if ratio is None:
+                logger.info(f"AgentLoop [{self.key}] usage 无 cache 字段（非 DeepSeek 网关?）: {self.trace['usage']}")
+            elif ratio < 0.5:
+                logger.warning(
+                    f"AgentLoop [{self.key}] 上下文缓存命中率偏低: {self.trace['usage']}"
+                    f" —— 检查前缀是否变化（system prompt / 工具集改动会从改动点起断缓存）"
+                )
+            else:
+                logger.info(f"AgentLoop [{self.key}] usage: {self.trace['usage']}")
+
         # 终止兜底：guard 安全停止都给出明确原因（不是「服务不可用」）
         if final_answer:
             return final_answer
@@ -360,6 +400,23 @@ class AgentLoop:
         if self.session is None:
             return fallback
         return self.session.derive_messages()
+
+    def _record_usage(self, usage: dict, step: int) -> None:
+        """usage 观测（Step 1，纯旁路采集，不影响执行链）：
+        provider 返回的 usage → Event Log llm/usage 事件（log-only，可持久化/回放）。
+
+        data 取 DeepSeek 字段；其他 OpenAI 兼容网关可能缺 cache 字段（记 None 而非报错）。
+        每步 LLM 调用一条，紧跟对应 assistant/message 事件之后。
+        """
+        data = {
+            "step": step + 1,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "prompt_cache_hit_tokens": usage.get("prompt_cache_hit_tokens"),
+            "prompt_cache_miss_tokens": usage.get("prompt_cache_miss_tokens"),
+        }
+        if self.session:
+            self.session.append(LLM_USAGE, data)
 
     async def _call_tool_with_progress(self, registry, tool_name: str, args: dict, timeout: float) -> dict:
         """执行工具：所有 Tool 统一带 timeout；有进度查询 + 事件订阅者时额外轮询 → tool_progress 事件
@@ -439,6 +496,10 @@ class AgentLoop:
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                # usage 观测：include_usage 后 provider 在 [DONE] 前发纯 usage chunk（choices 空），
+                # 必须在本层循环捕获（break 在 [DONE] 处，放 break 之后会漏掉）
+                if chunk.get("usage"):
+                    msg["usage"] = chunk["usage"]
                 delta = chunk.get("choices", [{}])[0].get("delta", {}) or {}
 
                 # 推理过程（deepseek reasoning_content）— 只广播，不混入 content
@@ -473,10 +534,13 @@ class AgentLoop:
 
             msg["role"] = "assistant"
             step_latency = round((time.perf_counter() - t_step) * 1000)
-            self.trace.setdefault("steps", []).append({
+            entry = {
                 "step": step,
                 "type": "llm",
                 "content": msg.get("content", ""),
                 "latency_ms": step_latency,
-            })
+            }
+            if msg.get("usage"):
+                entry["usage"] = msg["usage"]  # usage 随 msg 带回，run() 统一记录事件
+            self.trace.setdefault("steps", []).append(entry)
             return msg
