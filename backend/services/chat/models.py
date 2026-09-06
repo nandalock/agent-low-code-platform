@@ -29,6 +29,7 @@ class ConversationResponse(BaseModel):
     status: str
     agent_key: Optional[str]
     assigned_to: Optional[str]
+    session_id: Optional[str] = None  # 最近一次 chat 使用的 Agent Session（轨迹回放定位用）
     created_at: datetime
     updated_at: datetime
 

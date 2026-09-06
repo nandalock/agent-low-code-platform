@@ -6,6 +6,12 @@ import { T, S, inputField, labelField, btnPrimary } from '@/app/theme';
 import { PanelLeftClose, PanelLeftOpen, Brain, ChevronDown, ChevronRight } from 'lucide-react';
 import McpToolBinding from '../_components/McpToolBinding';
 import CachePolicyEditor, { type CachePolicyData } from '../_components/CachePolicyEditor';
+import TrajectoryTimeline from '../_components/TrajectoryTimeline';
+import { useTrajectoryBatch } from '../_components/useTrajectoryBatch';
+import {
+  type TrajNode, type UsageRow, type TrajectorySnapshot,
+  answerTextOf, groupSnapshotByTurn,
+} from '@/lib/trajectory';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 const TENANT_ID = 1;
@@ -108,7 +114,9 @@ function getSavedSessionId(agentKey: string): string | null {
 
 interface ChatMsg {
   role: 'user' | 'agent'; content: string; time: string;
-  thinking?: string;
+  thinking?: string;                 // 遗留兜底（无轨迹的历史数据）
+  nodes?: TrajNode[];                // Agent Trajectory（think/tool 行；answer 不存这里）
+  usage?: UsageRow[];
 }
 
 // 历史会话项（服务端 conversations 列表，channel=agent:{key}，与 DeepSeek 会话列表同源）
@@ -117,6 +125,7 @@ interface HistConv {
   last_msg: string;
   last_time: string;
   count: number;
+  session_id?: string | null;  // 最近一次 chat 的 Agent Session（轨迹回放定位）
 }
 
 const DEFAULT_CONFIG = { system_prompt: '', fallback_reply: '', api_key: '', base_url: '', model: '', max_steps: 5 };
@@ -136,11 +145,10 @@ export default function AgentDetailPage() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [hist, setHist] = useState<HistConv[]>([]);
-  // 流式状态（deepseek harness 风格：思考面板 + 工具卡片 + 打字机）
-  const [liveThinking, setLiveThinking] = useState('');
-  const [liveAnswer, setLiveAnswer] = useState('');
-  const [liveTools, setLiveTools] = useState<{tool:string; args:any; status:'running'|'done'; summary?:string; stage?:string; seconds?:number}[]>([]);
-  const [liveSteps, setLiveSteps] = useState<{step:number; total:number}>({ step:0, total:0 });
+  // 实时 Trajectory：rAF 批处理 reducer（think/tool node 流）+ usage 低频 state
+  const { nodes: trajNodes, nodesRef, enqueue, forceFlush, reset } = useTrajectoryBatch();
+  const [liveUsage, setLiveUsage] = useState<UsageRow[]>([]);
+  const usageRef = useRef<UsageRow[]>([]);
 
   useEffect(() => {
     // mount：从 localStorage 恢复最近一场对话（重启浏览器 → 自动续聊最近会话）。
@@ -158,6 +166,7 @@ export default function AgentDetailPage() {
       .then(r => r.json()).then(d => {
         const items = (d.items || []).map((c: any) => ({
           id: c.id, last_msg: c.last_msg || '', last_time: c.last_time || '', count: c.msg_count || 0,
+          session_id: c.session_id || null,  // SELECT c.* 透传；老数据无 → null
         }));
         setHist(items);
       }).catch(() => {});
@@ -198,24 +207,60 @@ export default function AgentDetailPage() {
 
   useEffect(() => {
     if (!conversationId) { setLoadingHistory(false); return; }
-    setLoadingHistory(true);  // 会话切换 / 自动恢复时显示加载态
-    fetch(`${API}/api/chat/conversations/${conversationId}/messages`, { headers: { 'X-Tenant-ID': String(TENANT_ID) } })
-      .then(r => r.json()).then(data => {
-        const items = data.items || [];
-        if (items.length > 0) {
-          const msgs: ChatMsg[] = [];
-          for (const m of items) {
-            const time = m.created_at ? new Date(m.created_at).toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' }) : '';
-            const meta = m.metadata || {};
-            if (m.role === 'agent') msgs.push({ role:'agent', content:m.content, time, thinking: meta.thinking || undefined });
-            else if (m.role === 'customer') msgs.push({ role:'user', content:m.content, time });
-          }
-          setMessages(msgs);
+    let cancelled = false;
+    (async () => {
+      setLoadingHistory(true);  // 会话切换 / 自动恢复时显示加载态
+      try {
+        // 消息 + Session 轨迹并行拉取：conversations.session_id（服务端映射）→ 回放端点
+        // → think/tool 轨迹按 turn 对齐到末尾 agent 消息；无 session_id（老数据）降级
+        // metadata.thinking（原行为），不做字符串猜测。
+        const convR = await fetch(`${API}/api/chat/conversations/${conversationId}`, { headers: { 'X-Tenant-ID': String(TENANT_ID) } });
+        const conv = convR.ok ? await convR.json() : null;
+        const sid: string | null = conv?.session_id || null;
+        const msgsR = await fetch(`${API}/api/chat/conversations/${conversationId}/messages`, { headers: { 'X-Tenant-ID': String(TENANT_ID) } });
+        const data = await msgsR.json();
+        let snap: TrajectorySnapshot | null = null;
+        if (sid) {
+          const trR = await fetch(`${API}/api/agents/sessions/${sid}/trajectory`);
+          if (trR.ok) snap = await trR.json();
         }
-      }).catch(() => {}).finally(() => setLoadingHistory(false));
+        const items = data.items || [];
+        const msgs: ChatMsg[] = [];
+        for (const m of items) {
+          const time = m.created_at ? new Date(m.created_at).toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' }) : '';
+          const meta = m.metadata || {};
+          if (m.role === 'agent') msgs.push({ role:'agent', content:m.content, time, thinking: meta.thinking || undefined });
+          else if (m.role === 'customer') msgs.push({ role:'user', content:m.content, time });
+        }
+        // 轨迹对齐：session 覆盖该会话最近 N 个 agent turn（节点按 turn id 分组；
+        // 老数据无 session_id / 会话跨 session 时，超出的轮保持 thinking 降级）
+        if (snap && snap.nodes && snap.nodes.length > 0) {
+          const groups = groupSnapshotByTurn(snap);
+          let i = msgs.length - 1;
+          for (let t = groups.length - 1; t >= 0 && i >= 0; t--) {
+            while (i >= 0 && msgs[i].role !== 'agent') i--;
+            if (i < 0) break;
+            msgs[i] = { ...msgs[i], nodes: groups[t], usage: t === groups.length - 1 ? snap.usage : undefined };
+            i--;
+          }
+        }
+        if (!cancelled) setMessages(msgs);
+      } catch {
+        // 网络失败：保持现状
+      } finally {
+        if (!cancelled) setLoadingHistory(false);
+      }
+    })();
+    return () => { cancelled = true; };
   }, [conversationId]);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth' }); }, [messages]);
+  // 实时轨迹滚动跟随：rAF batch 后滚到底（auto 不排队）；轮末 smooth 滚动由上方 effect 承担
+  useEffect(() => {
+    if (sending) bottomRef.current?.scrollIntoView({ behavior:'auto' });
+  }, [trajNodes, sending]);
+  // 当前 turn 的实时回答文本（answer node 增量；渲染用）
+  const liveAnsText = answerTextOf(trajNodes);
 
   async function handleSaveConfig() {
     setSaving(true); setSaveMsg('');
@@ -254,20 +299,24 @@ export default function AgentDetailPage() {
 
   async function handleSend() {
     if (!input.trim() || sending) return;
+    const q = input;
     const now = new Date().toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' });
-    setMessages(prev => [...prev, { role:'user', content:input, time:now }]);
+    setMessages(prev => [...prev, { role:'user', content:q, time:now }]);
     setInput(''); setSending(true);
-    setLiveThinking(''); setLiveAnswer(''); setLiveTools([]); setLiveSteps({ step:0, total:0 });
+    setLiveUsage([]); usageRef.current = [];
+    reset();  // 清空上个 turn 的 trajectory nodes（flush 尾部滞留 + reducer reset）
     let finalAnswer = '';
-    let liveAns = '';  // 局部累积（避免 state 闭包读到旧值）
-    let liveThink = '';  // 局部累积思考（done 后用于生成首行摘要）
+    let legacyThink = '';   // session=None 遗留路径：thinking 降级累积（无轨迹时兜底显示）
+    let legacyAns = '';     // 遗留路径 answer/text 降级累积
     try {
-      const body: any = { question: input, visitor_id: VISITOR_ID };
+      const body: any = { question: q, visitor_id: VISITOR_ID };
       if (conversationId) body.conversation_id = conversationId;
       if (sessionId) body.session_id = sessionId;  // 多轮：回传 AgentRuntime Session id 续上历史
       const r = await fetch(`${API}/api/agents/${agentKey}/chat/stream`, { method:'POST', headers:{'Content-Type':'application/json','X-Tenant-ID':String(TENANT_ID)}, body:JSON.stringify(body) });
       if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
-      // 解析 SSE 事件流（data: JSON 空行分隔）
+      // 解析 SSE 事件流（data: JSON 空行分隔）：
+      //   traj/* → rAF 批处理（高频 delta 不进 React 同步路径）；usage → 低频 state；
+      //   done.answer 为最终权威文本（guard 轮合成回答也以它为准）。
       const reader = r.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';
@@ -283,45 +332,30 @@ export default function AgentDetailPage() {
           let ev: any;
           try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
           switch (ev.type) {
-            case 'step':
-              setLiveSteps({ step: ev.step, total: ev.total });
+            case 'traj/open':
+            case 'traj/delta':
+            case 'traj/update':
+            case 'traj/close':
+              enqueue(ev as any);  // 投影事件 → rAF buffer（≤60fps 批量渲染）
               break;
-            case 'thinking':
-              liveThink += ev.delta;
-              setLiveThinking(p => p + ev.delta);
+            case 'usage': {
+              const row = { ...ev } as UsageRow;
+              usageRef.current = [...usageRef.current, row];
+              setLiveUsage(usageRef.current);
+              break;
+            }
+            case 'thinking':  // 遗留路径（session=None）：不做实时展示，仅 done 后折叠兜底
+              legacyThink += ev.delta;
               break;
             case 'text':
-              setLiveAnswer(p => p + ev.delta);
-              break;
-            case 'tool_call':
-              setLiveTools(p => [...p, { tool: ev.tool, args: ev.args, status: 'running' }]);
-              break;
-            case 'tool_progress':
-              setLiveTools(p => {
-                const a = [...p];
-                const idx = a.findIndex(x => x.tool === ev.tool && x.status === 'running');
-                if (idx >= 0) a[idx] = { ...a[idx], stage: ev.stage, seconds: ev.seconds };
-                return a;
-              });
-              break;
-            case 'tool_result':
-              setLiveTools(p => {
-                const a = [...p];
-                const idx = a.findIndex(x => x.tool === ev.tool && x.status === 'running');
-                if (idx >= 0) a[idx] = { ...a[idx], status:'done', summary: ev.summary || '' };
-                return a;
-              });
-              break;
             case 'answer':
-              liveAns += ev.delta;
-              setLiveAnswer(p => p + ev.delta);
+              legacyAns += ev.delta;
               break;
             case 'done':
               if (ev.answer) finalAnswer = ev.answer;
               // session/conversation id 持久到 localStorage：重启浏览器自动续最近一场
               if (ev.session_id) { setSessionId(ev.session_id); localStorage.setItem(`sid_${agentKey}`, ev.session_id); }
               if (ev.conversation_id) { setConversationId(ev.conversation_id); localStorage.setItem(`conv_${agentKey}`, String(ev.conversation_id)); }
-              setLiveThinking(liveThink);  // 保留思考（折叠为首行摘要）
               break;
           }
         }
@@ -329,9 +363,19 @@ export default function AgentDetailPage() {
     } catch {
       finalAnswer = '请求失败，请稍后重试。';
     } finally {
+      forceFlush();  // 尾部滞留事件立即应用（done 后不再有 delta，收口一致性）
       setSending(false);
-      setMessages(prev => [...prev, { role:'agent', content: finalAnswer || liveAns || '抱歉，暂时无法处理。', time:new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}), thinking: liveThink || undefined }]);
-      setLiveThinking(''); setLiveAnswer(''); setLiveTools([]);
+      const nodes = nodesRef.current;  // 同步镜像：含本轮全部已应用 node
+      const ansText = answerTextOf(nodes);
+      const content = finalAnswer || ansText || legacyAns || '抱歉，暂时无法处理。';
+      setMessages(prev => [...prev, {
+        role:'agent', content, time:new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}),
+        // 轨迹存档（answer node 不存档：timeline 忽略它，气泡以 content 为准防重复）；
+        // 无节点（legacy/退化）→ 保留 thinking 供原 ThinkingPanel 兜底
+        nodes: nodes.length ? nodes : undefined,
+        usage: usageRef.current.length ? usageRef.current : undefined,
+        thinking: legacyThink || undefined,
+      }]);
     }
   }
 
@@ -472,8 +516,12 @@ export default function AgentDetailPage() {
             return (
               <div key={i} style={{ marginBottom:S.lg, display:'flex', flexDirection:'column', alignItems:isUser?'flex-end':'flex-start' }}>
                 <div style={{ fontSize:12, color:T.secondary, marginBottom:6 }}>{isUser?'测试用户':(agentName||agentKey)} · {msg.time}</div>
-                <div style={{ maxWidth:'min(72%, 820px)', minWidth:0 }}>
-                  {!isUser && msg.thinking && (
+                <div style={{ maxWidth:'min(72%, 820px)', minWidth:0, width:'100%' }}>
+                  {/* 历史轨迹（think/tool 行，来自 trajectory 回放端点）；无轨迹老数据 → thinking 降级 */}
+                  {!isUser && msg.nodes && msg.nodes.length > 0 && (
+                    <TrajectoryTimeline nodes={msg.nodes} usage={msg.usage} running={false} />
+                  )}
+                  {!isUser && (!msg.nodes || msg.nodes.length === 0) && msg.thinking && (
                     <ThinkingPanel thinking={msg.thinking} running={false} />
                   )}
                   <div style={{
@@ -490,46 +538,15 @@ export default function AgentDetailPage() {
             <div style={{ marginBottom:S.lg, display:'flex', flexDirection:'column', alignItems:'flex-start' }}>
               <div style={{ fontSize:12, color:T.secondary, marginBottom:6 }}>{agentName||agentKey} · 回复中</div>
               <div style={{ maxWidth:'min(72%, 820px)', minWidth:0, width:'100%' }}>
-                {/* DSH 式思考面板：折叠=最新一行跟读（流式）/ 首行摘要（完成），展开=全文 */}
-                {(liveThinking || liveSteps.step>0) && (
-                  <ThinkingPanel thinking={liveThinking} running={sending} />
-                )}
-                {/* 工具区（DSH tool rows：名称 + 状态动画 + 参数摘要） */}
-                {liveTools.length>0 && (
-                  <div style={{ display:'flex', flexDirection:'column', gap:6, marginBottom:S.sm }}>
-                    {liveTools.map((t,i) => (
-                      <div key={i} style={{ padding:`${S.sm}px ${S.base}px`, borderRadius:8, background:T.surface, border:`1px solid ${T.border}`, minWidth:0 }}>
-                        <div style={{ display:'flex', alignItems:'center', gap:S.sm, fontSize:12 }}>
-                          {t.status==='running' ? (
-                            <span style={{ width:12, height:12, borderRadius:'50%', border:'2px solid '+T.accent, borderTopColor:'transparent', animation:'spin 0.8s linear infinite', display:'inline-block', flexShrink:0 }} />
-                          ) : (
-                            <span style={{ color:T.success, flexShrink:0 }}>✓</span>
-                          )}
-                          <span style={{ fontWeight:600, color:T.text, fontFamily:'monospace' }}>{t.tool}</span>
-                          <span style={{ fontSize:11, color:T.secondary }}>{t.status==='running' ? '运行中' : '完成'}</span>
-                          {t.status==='running' && t.seconds ? <span style={{ fontSize:11, color:T.tertiary }}>{t.seconds}s</span> : null}
-                        </div>
-                        {t.args && Object.keys(t.args).length>0 && (
-                          <div style={{ marginTop:4, fontSize:11, color:T.secondary, fontFamily:'monospace', whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>
-                            {JSON.stringify(t.args, null, 0).slice(0, 160)}
-                          </div>
-                        )}
-                        {t.stage && (
-                          <div style={{ marginTop:4, fontSize:11, color:T.warning }}>{t.stage}{t.seconds ? `（${t.seconds}s）` : ''}</div>
-                        )}
-                        {t.status==='done' && t.summary && (
-                          <div style={{ marginTop:4, fontSize:11, color:T.success }}>→ {t.summary}</div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-                {/* 流式回答气泡（打字机） */}
-                {liveAnswer && (
+                {/* Agent Trajectory：think/tool 行按执行序实时投影（typed events → 后端投影 →
+                    rAF 批处理 ≤60fps；非字符串猜测）。answer node 由下方气泡渲染 */}
+                <TrajectoryTimeline nodes={trajNodes} usage={liveUsage} running={sending} />
+                {/* 实时回答气泡（打字机）：answer node 增量文本；done 后以权威 message content 收口 */}
+                {liveAnsText && (
                   <div data-streaming="true" style={{ padding:`${S.md}px ${S.base}px`, borderRadius:8, fontSize:14, lineHeight:1.55,
                     whiteSpace:'pre-wrap', wordBreak:'break-word',
                     background:T.surface, color:T.text, border:`1px solid ${T.border}`, borderBottomLeftRadius:2 }}>
-                    {liveAnswer}
+                    {liveAnsText}
                     <span className="stream-cursor" />
                   </div>
                 )}

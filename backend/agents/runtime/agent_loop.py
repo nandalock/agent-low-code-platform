@@ -29,6 +29,7 @@ from backend.agents.runtime.session import (
     STEP_END,
     STEP_START,
     TOOL_CALL,
+    TOOL_PROGRESS,
     TOOL_RESULT,
     TURN_END,
     TURN_START,
@@ -158,7 +159,7 @@ class AgentLoop:
                     break
 
                 if self.session:
-                    self.session.append(STEP_START, {"step": step + 1})
+                    self.session.append(STEP_START, {"step": step + 1, "total": max_steps})
 
                 t_step = time.perf_counter()
                 # LLM 请求超时不能突破 max_wall_time：按剩余时间裁剪
@@ -185,7 +186,9 @@ class AgentLoop:
                     f"tools={[t['function']['name'] for t in tools]}"
                 )
 
-                if self.on_event:
+                # step 进度事件：Session 开启时由 session 事件链（step/start → 投影）送达，
+                # 只对 session=None 的遗留路径保留 on_event 直推（legacy）
+                if self.session is None and self.on_event:
                     await self.on_event({"type": "step", "step": step + 1, "total": max_steps})
 
                 if payload.get("stream"):
@@ -267,7 +270,9 @@ class AgentLoop:
                             "tool_call_id": tc["id"],
                         })
 
-                    if self.on_event:
+                    # tool/call 已入 Session Log（含 tool_call_id）；on_event 直推仅限
+                    # session=None 遗留路径，避免同一事件两套 schema 并行下发
+                    if self.session is None and self.on_event:
                         await self.on_event({"type": "tool_call", "tool": mcp_name, "args": args})
 
                     t_tool = time.perf_counter()
@@ -275,7 +280,9 @@ class AgentLoop:
                         registry = get_registry()
                         # per-tool timeout：优先 registry 声明，未声明用默认值；执行统一走带超时的调用
                         tool_timeout = registry.get_tool_timeout(mcp_name) or DEFAULT_TOOL_TIMEOUT
-                        tool_result = await self._call_tool_with_progress(registry, mcp_name, args, tool_timeout)
+                        tool_result = await self._call_tool_with_progress(
+                            registry, mcp_name, args, tool_timeout, tc["id"],
+                        )
                     except Exception as e:
                         tool_result = {"error": str(e)}
                     tool_latency = round((time.perf_counter() - t_tool) * 1000)
@@ -291,7 +298,7 @@ class AgentLoop:
                             "content": json.dumps(tool_result, ensure_ascii=False),
                         })
 
-                    if self.on_event:
+                    if self.session is None and self.on_event:
                         await self.on_event({
                             "type": "tool_result", "tool": mcp_name,
                             "summary": f"{len(tool_result.get('rows', []))} 条结果",
@@ -418,22 +425,34 @@ class AgentLoop:
         if self.session:
             self.session.append(LLM_USAGE, data)
 
-    async def _call_tool_with_progress(self, registry, tool_name: str, args: dict, timeout: float) -> dict:
-        """执行工具：所有 Tool 统一带 timeout；有进度查询 + 事件订阅者时额外轮询 → tool_progress 事件
+    async def _call_tool_with_progress(
+        self, registry, tool_name: str, args: dict, timeout: float, tool_call_id: str,
+    ) -> dict:
+        """执行工具：所有 Tool 统一带 timeout；有进度查询 + 事件订阅者时额外轮询 → tool/progress 事件
 
         兼容性：progress_fn 为 None（未注册进度查询 / 无 on_event）时不再「没有超时」，
         退化为 asyncio.wait_for 兜底，超时返回 error 结果而非让 AgentLoop 异常退出。
+
+        tool/progress 是过程事件：Session 开启时入 Event Log（带 tool_call_id，投影/回放
+        可见）；仅 session=None 遗留路径走 on_event 直推。
         """
         progress_fn = registry.get_progress_query(tool_name)
 
         async def _run():
             return await registry.call_async(tool_name, args)
 
-        if progress_fn is None or self.on_event is None:
+        if progress_fn is None or (self.on_event is None and self.session is None):
             try:
                 return await asyncio.wait_for(_run(), timeout=timeout)
             except asyncio.TimeoutError:
                 return {"error": f"工具 {tool_name} 执行超时（>{timeout:.0f}s），已取消"}
+
+        async def _emit_progress(stage: str, seconds: int) -> None:
+            data = {"tool": tool_name, "tool_call_id": tool_call_id, "stage": stage, "seconds": seconds}
+            if self.session:
+                self.session.append(TOOL_PROGRESS, data)
+            elif self.on_event:
+                await self.on_event({"type": "tool_progress", **data})
 
         start = time.perf_counter()
         task = asyncio.create_task(_run())
@@ -445,12 +464,7 @@ class AgentLoop:
                     await task
                 except asyncio.CancelledError:
                     pass
-                await self.on_event({
-                    "type": "tool_progress",
-                    "tool": tool_name,
-                    "stage": f"工具执行超时（>{timeout:.0f}s），已取消",
-                    "seconds": round(timeout),
-                })
+                await _emit_progress(f"工具执行超时（>{timeout:.0f}s），已取消", round(timeout))
                 return {"error": f"工具 {tool_name} 执行超时（>{timeout:.0f}s），已取消"}
             await asyncio.sleep(2)
             try:
@@ -459,12 +473,7 @@ class AgentLoop:
                 stage = ""
             if stage and stage != last_stage:
                 last_stage = stage
-                await self.on_event({
-                    "type": "tool_progress",
-                    "tool": tool_name,
-                    "stage": stage,
-                    "seconds": round(time.perf_counter() - start),
-                })
+                await _emit_progress(stage, round(time.perf_counter() - start))
         return task.result()
 
     async def _call_llm_stream(
@@ -502,12 +511,14 @@ class AgentLoop:
                     msg["usage"] = chunk["usage"]
                 delta = chunk.get("choices", [{}])[0].get("delta", {}) or {}
 
-                # 推理过程（deepseek reasoning_content）— 只广播，不混入 content
+                # 推理过程（deepseek reasoning_content）— 只广播，不混入 content。
+                # assistant/chunk 入 Session Log；on_event 直推仅限 session=None 遗留路径
                 r = delta.get("reasoning_content")
                 if r:
                     if self.session:
                         self.session.append(ASSISTANT_CHUNK, {"kind": "thinking", "delta": r})
-                    await self.on_event({"type": "thinking", "delta": r})
+                    elif self.on_event:
+                        await self.on_event({"type": "thinking", "delta": r})
 
                 # 正文增量
                 c = delta.get("content")
@@ -515,7 +526,8 @@ class AgentLoop:
                     msg["content"] = msg.get("content", "") + c
                     if self.session:
                         self.session.append(ASSISTANT_CHUNK, {"kind": "text", "delta": c})
-                    await self.on_event({"type": "text", "delta": c})
+                    elif self.on_event:
+                        await self.on_event({"type": "text", "delta": c})
 
                 # 工具调用按 index 累积（流式下是分段片段）
                 for tc in delta.get("tool_calls") or []:
