@@ -3,7 +3,7 @@
 事件类型与 LLM messages 的映射由 Surface + derive_event_message 负责：
   - surface 事件（进入 LLM Context）: session/seed, user/message, assistant/message, tool/result
   - 过程事件（仅 Event Log，不进入 LLM）: turn/start, step/start, assistant/chunk,
-    tool/call, step/end, turn/end, llm/usage
+    tool/call, tool/progress, step/end, turn/end, llm/usage
 
 session/seed 是会话创建时注入的初始 LLM 消息（system prompt / 上游 context），
 作为事件写入 Event Log 开头（Event Log 是唯一真源），header.seed_length 记录数量；
@@ -25,6 +25,8 @@ ASSISTANT_CHUNK = "assistant/chunk"      # 流式过程事件（data: kind=think
 ASSISTANT_MESSAGE = "assistant/message"  # 完整 assistant message（含 tool_calls）
 TOOL_CALL = "tool/call"
 TOOL_RESULT = "tool/result"
+TOOL_PROGRESS = "tool/progress"  # 长耗时 Tool 的阶段进度（data: tool + tool_call_id + stage + seconds），
+                                 # 过程事件（log-only），不进 surface / 不参与 derive_messages
 LLM_USAGE = "llm/usage"   # 每次 LLM 调用的 usage（provider 返回；data: step + prompt/cache token 统计），
                           # log-only 观测事件（Step 1），不进 surface / 不参与 derive_messages
 

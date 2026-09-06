@@ -4,17 +4,23 @@
   - 记录完整执行事件（log / seq / time 自动生成，log 外部只读）
   - 维护 ordered surface（LLM 可见子集）
   - 由 surface 派生 OpenAI 兼容 Message[]（derive_messages）
+  - 同步广播 append 事件给 listener（UI projection / 持久化旁路）
 
 Event Log 是唯一真源：会话创建时的初始消息（system prompt / 上游 context）
 以 session/seed 事件写入 Log 开头（header.seed_length 记录数量），不做第二份存储；
 LLM messages 始终由 derive_messages() 派生，不单独保存。
 
-不负责：实时广播（EventSink）、运行统计（trace）、Context Compaction、
-SubAgent Session、Session 生命周期（SessionStore）、持久化（SessionPersistence）。
+广播（listener）：append() 后同步通知已注册 listener（add_listener）。listener
+是纯同步回调（Session.append 无 await 点，单进程事件循环内天然保序），用于
+UI projection / 持久化等旁路消费；from_events 重建不回放 listener。
+不负责：运行统计（trace）、Context Compaction、SubAgent Session、
+Session 生命周期（SessionStore）、持久化（SessionPersistence）。
 Session 不感知任何外部存储（JSONL / SQLite / Postgres）——Persistence 是独立
 capability seam，当前阶段不参与执行链。
 """
+import logging
 import time
+from collections.abc import Callable
 
 from backend.agents.runtime.session.events import (
     SEED,
@@ -23,6 +29,8 @@ from backend.agents.runtime.session.events import (
     new_session_id,
 )
 from backend.agents.runtime.session.surface import SurfaceManager
+
+logger = logging.getLogger(__name__)
 
 
 class Session:
@@ -42,6 +50,7 @@ class Session:
         )
         self._log: list[SessionEvent] = []
         self._surface = SurfaceManager()
+        self._listeners: list[Callable[[SessionEvent], None]] = []
         self._seq = 0
         # 初始 LLM 消息（system / 上游 context）→ seed 事件写入 Event Log：
         # LLM 可见（surface 事件）、随 Log 保存，Event Log 保持唯一真源
@@ -77,6 +86,23 @@ class Session:
     def surface(self) -> SurfaceManager:
         return self._surface
 
+    # ── listener（旁路广播）──
+
+    def add_listener(self, cb: Callable[[SessionEvent], None]) -> None:
+        """注册 append 广播 listener（同步回调，append 后按注册序调用）。
+
+        单进程事件循环内 append 无 await 间隙，listener 收到的事件顺序与
+        日志 seq 完全一致；listener 抛异常只记日志，不中断执行链。
+        Session 会被 SessionStore 跨轮复用 → 调用方负责在轮末 remove_listener。
+        """
+        if cb not in self._listeners:
+            self._listeners.append(cb)
+
+    def remove_listener(self, cb: Callable[[SessionEvent], None]) -> None:
+        """移除 listener（幂等：不存在时静默）"""
+        if cb in self._listeners:
+            self._listeners.remove(cb)
+
     @property
     def init_messages(self) -> list[dict]:
         """seed 事件派生（从 Event Log 读出，不做第二份存储）"""
@@ -94,15 +120,21 @@ class Session:
     # ── 写入 ──
 
     def append(self, type: str, data: dict) -> SessionEvent:
-        """追加一条执行事实：自增 seq → 记 time → 写 log → 通知 surface。
+        """追加一条执行事实：自增 seq → 记 time → 写 log → 通知 surface → 广播 listener。
 
         只有符合 Surface 规则的事件进入 SurfaceManager；不在这里处理
-        Persistence（独立 capability seam，外部事件监听者自行消费）。
+        Persistence（独立 capability seam）——listener 是旁路消费点
+        （UI projection / 持久化桥），一个死掉的 listener 不能断掉执行链。
         """
         self._seq += 1
         event = SessionEvent(type=type, seq=self._seq, time=time.time(), data=data)
         self._log.append(event)
         self._surface.append(event)
+        for cb in list(self._listeners):
+            try:
+                cb(event)
+            except Exception:
+                logger.exception(f"Session listener 异常（事件 {type} seq={event.seq}），已隔离")
         return event
 
     # ── 重建 ──

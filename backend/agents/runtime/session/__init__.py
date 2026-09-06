@@ -17,6 +17,7 @@ from backend.agents.runtime.session.events import (
     STEP_START,
     SURFACE_EVENT_TYPES,
     TOOL_CALL,
+    TOOL_PROGRESS,
     TOOL_RESULT,
     TURN_END,
     TURN_START,
@@ -57,6 +58,7 @@ __all__ = [
     "ASSISTANT_MESSAGE",
     "LLM_USAGE",
     "TOOL_CALL",
+    "TOOL_PROGRESS",
     "TOOL_RESULT",
     "SURFACE_EVENT_TYPES",
 ]

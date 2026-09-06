@@ -6,6 +6,7 @@
 import json
 import logging
 import time
+from collections.abc import Callable
 
 import aiohttp
 
@@ -15,6 +16,7 @@ from backend.agents.runtime.agent_loop import AgentLoop
 from backend.agents.runtime.events import EventSink
 from backend.agents.runtime.session import (
     Session,
+    SessionEvent,
     get_session_persistence,
     get_session_store,
 )
@@ -65,6 +67,7 @@ class AgentRuntime(BaseAgent):
         context: dict | None = None,
         on_event: EventSink | None = None,
         session_id: str | None = None,
+        session_event_sink: Callable[[SessionEvent], None] | None = None,
     ) -> AgentReply:
         t0 = time.perf_counter()
         config = self._cfg()
@@ -139,7 +142,19 @@ class AgentRuntime(BaseAgent):
             on_event=on_event,
             session=session,
         )
-        answer = await loop.run(question, context)
+
+        # session_event_sink：本轮 Session 事件的同步旁路消费（UI projection 等）。
+        # Session.append 同步回调、无 await 间隙 → sink 按 seq 收到全部事件；
+        # Session 被 SessionStore 跨轮复用 → listener 只在 loop.run 期间挂载，
+        # finally 摘除，保证不跨轮泄漏（事件不会迟到下一轮的投影）。
+        attached = session is not None and session_event_sink is not None
+        if attached:
+            session.add_listener(session_event_sink)
+        try:
+            answer = await loop.run(question, context)
+        finally:
+            if attached:
+                session.remove_listener(session_event_sink)
 
         # turn 完成 = 持久化边界：本 turn 的 Event Log（turn/start → user → steps → turn/end）
         # 经 append_events + flush 落库（一次 flush = 一个事务）。AgentLoop 不感知任何存储 ——

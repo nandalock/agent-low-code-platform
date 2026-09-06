@@ -9,6 +9,8 @@ from pydantic import BaseModel
 from backend.agents import list_agents, get_agent, register
 from backend.agents.base import AgentReply
 from backend.agents.runtime import AgentRuntime
+from backend.agents.runtime.session import get_session_persistence, get_session_store
+from backend.agents.runtime.session.projection import TrajectoryProjector, project_snapshot
 from backend.agents.router.router_runtime import RouterRuntime, invalidate_desc_cache
 from backend.agents.config_service import get_agent_config, save_agent_config, get_agent_definition
 from backend.agents.config_service import list_l1_keywords, create_l1_keyword, update_l1_keyword, delete_l1_keyword
@@ -269,16 +271,18 @@ async def agent_chat_stream(
     body: ChatRequest,
     x_tenant_id: int = Header(alias="X-Tenant-ID"),
 ):
-    """SSE 流式聊天（deepseek harness 风格事件流）。
+    """SSE 流式聊天（Session Event → Trajectory Projection → UI events）。
 
-    事件（data: JSON）:
+    AgentLoop 执行事实写入 Session Event Log；本层经 session_event_sink 桥接
+    TrajectoryProjector，把 typed events 投影为 UI 可直接渲染的 node 事件：
       {"type":"step","step":1,"total":8}        循环步进
-      {"type":"thinking","delta":"..."}         推理过程增量（reasoning_content）
-      {"type":"text","delta":"..."}             思考间隙文本增量
-      {"type":"tool_call","tool":"...","args":{}}   工具调用
-      {"type":"tool_result","tool":"...","summary":"..."} 工具结果
-      {"type":"answer","delta":"..."}           最终回答增量
-      {"type":"done","answer":"...","tier":"llm"} 结束
+      {"type":"traj/open","node":{...}}         think/tool/answer node 建立（全量字段）
+      {"type":"traj/delta","id":"...","field":"thinking"|"text","delta":"..."}  增量
+      {"type":"traj/update","id":"...","patch":{...}}  tool 状态/结果、answer 对账（全量值）
+      {"type":"traj/close","id":"..."}          node 完成
+      {"type":"usage","step":1,"prompt_tokens":...}  LLM usage（观测）
+      {"type":"done","answer":"...","tier":"llm"} 结束（answer 为最终权威文本）
+    session=None 遗留路径：AgentLoop 直接 on_event 推 legacy thinking/text/tool_* 事件。
     """
     gateway = get_gateway()
     # 0. 入口存在性检查（与旧行为一致：Agent 不存在 → 404，且不创建会话/不落库）
@@ -303,12 +307,21 @@ async def agent_chat_stream(
 
     async def event_gen():
         queue: asyncio.Queue = asyncio.Queue()
-        thinking_parts: list[str] = []  # 累积思考过程，随消息落库持久化
+        thinking_parts: list[str] = []  # 累积思考过程，随消息落库持久化（旧数据/无轨迹回退兜底）
+        projector = TrajectoryProjector()  # Session typed events → UI trajectory node 事件
 
         async def on_event(ev: dict):
             await queue.put(ev)
 
-        task = asyncio.create_task(gateway.chat(rctx, body.question, on_event=on_event))
+        # session 事件桥：Session.append 同步内联触发（无 await 间隙，与 log seq 严格保序）
+        # → projector 投影 → 产物入队（put_nowait：同一事件循环内无背压风险）
+        def on_session_event(ev):
+            for uev in projector.handle(ev):
+                queue.put_nowait(uev)
+
+        task = asyncio.create_task(
+            gateway.chat(rctx, body.question, on_event=on_event, session_event_sink=on_session_event),
+        )
         try:
             while True:
                 try:
@@ -317,7 +330,11 @@ async def agent_chat_stream(
                     if task.done():
                         break
                     continue
+                # thinking 累积双路径兼容：Session 开启 → traj/delta(field=thinking)；
+                # session=None 遗留 → legacy thinking
                 if ev.get("type") == "thinking":
+                    thinking_parts.append(ev.get("delta", ""))
+                elif ev.get("type") == "traj/delta" and ev.get("field") == "thinking":
                     thinking_parts.append(ev.get("delta", ""))
                 # 会话 id 随 done 事件回传：前端据此恢复历史消息（conv_id 属于 API 层概念，
                 # AgentRuntime 不感知 conversation — 分层保持 Runtime 无状态）
@@ -386,6 +403,28 @@ async def agent_route_test(
         "routing_result": routing_result,
         "trace": reply.trace,
     }
+
+
+@router.get("/sessions/{session_id}/trajectory")
+async def agent_session_trajectory(session_id: str) -> dict:
+    """读取 Session 的 Agent 轨迹快照（Session Event → Conversation Projection）。
+
+    会话的 Event Log（Postgres durable）经纯函数投影 → UI 可直接渲染的
+    think/tool/answer node 序列 + usage。历史会话回放用：前端据 conversations.session_id
+    恢复完整 Think/Tool 轨迹，而非仅有最终消息。
+    读路径：SessionStore 热区优先，miss → Persistence.load（冷恢复）；两者皆无 → 404。
+    """
+    store = get_session_store()
+    session = store.get(session_id)
+    if session is not None:
+        events = session.events
+    else:
+        loaded = get_session_persistence().load(session_id)
+        if loaded is None:
+            raise HTTPException(404, "session not found")
+        _, events = loaded
+    snap = project_snapshot(events)
+    return {"session_id": session_id, **snap}
 
 
 # ── L1 关键字 CRUD ──
