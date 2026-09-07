@@ -1,4 +1,4 @@
-"""TrajectoryProjector 投影测试（纯内存，无 DB 依赖）
+"""TrajectoryProjection 投影测试（纯内存，无 DB 依赖）
 
 覆盖目标（Agent Trajectory UI 的 Conversation Projection 层）：
   A   think/tool 严格交替保序（think A → tool A → think B → tool B）
@@ -13,12 +13,12 @@
   旧数据兼容（step/start 无 total）、增量 == 快照回放、多 turn、Session listener
 
 运行方式（backend 容器内）:
-  python -m pytest backend/tests/test_projection.py -v
+  python -m pytest backend/tests/test_trajectory_projection.py -v
 """
 import uuid
 
 from backend.agents.runtime.session.events import SessionEvent
-from backend.agents.runtime.session.projection import TrajectoryProjector, project_snapshot
+from backend.agents.runtime.session.trajectory_projection import TrajectoryProjection, project_trajectory
 from backend.agents.runtime.session.session import Session
 
 
@@ -35,7 +35,7 @@ class _Seq:
 
 def _run(events):
     """折叠 handle：返回 (全部 UI 事件, 终态快照)"""
-    p = TrajectoryProjector()
+    p = TrajectoryProjection()
     out: list[dict] = []
     for ev in events:
         out.extend(p.handle(ev))
@@ -350,14 +350,14 @@ def test_usage_passthrough():
 
 def test_old_step_data_without_total():
     s = _Seq()
-    p = TrajectoryProjector()
+    p = TrajectoryProjection()
     p.handle(s.ev("turn/start", {}))
     p.handle(s.ev("step/start", {"step": 1}))  # 旧日志无 total
     p.handle(s.ev("assistant/chunk", {"kind": "thinking", "delta": "x"}))
     p.handle(s.ev("step/end", {"step": 1}))
     p.handle(s.ev("turn/end", {}))
     # step UI 事件无 total 键；不抛异常
-    p2 = TrajectoryProjector()
+    p2 = TrajectoryProjection()
     step_evs = [e for e in (p2.handle(e) for e in [
         s.ev("turn/start", {}), s.ev("step/start", {"step": 1}),
     ])]
@@ -386,7 +386,7 @@ def test_replay_determinism():
     events.append(s.ev("turn/end", {"stop_reason": "completed"}))
 
     out, incremental = _run(events)
-    snapshot = project_snapshot(events)
+    snapshot = project_trajectory(events)
     assert incremental["nodes"] == snapshot["nodes"]
     assert incremental["usage"] == snapshot["usage"]
     # 严格执行序：Think → Tool → Tool → Think → Tool → Tool → Think → Answer
@@ -439,3 +439,33 @@ def test_session_listener_lifecycle():
     got2: list[str] = []
     rebuilt.add_listener(lambda ev: got2.append(ev.type))
     assert got2 == []
+
+
+# ── open 快照语义（回归：活引用污染已入队事件） ──
+
+def test_open_event_is_emit_time_snapshot():
+    """traj/open 必须携带发射时刻的快照：后续 chunk 累积不得污染已入队事件。
+
+    回归场景：_open 曾把内部 node 活引用放入事件，SSE 出队序列化晚于
+    node['text'] += delta → open 负载已含首 delta，前端 open.text + 首条
+    traj/delta 双份叠加（每段思考首词双写：TheThe / 用户用户）。
+    """
+    s = _Seq()
+    p = TrajectoryProjection()
+    p.handle(s.ev("turn/start", {"agent": "t"}))
+    p.handle(s.ev("step/start", {"step": 1, "total": 5}))
+
+    # 首 chunk：handle 返回 [traj/open, traj/delta]，模拟「open 已入队但未序列化」
+    out = p.handle(s.ev("assistant/chunk", {"kind": "thinking", "delta": "用户"}))
+    open_ev, first_delta = out[0], out[1]
+
+    # 队列延迟期间后续 chunk 到达 → 投影器内部 node 被继续改写
+    p.handle(s.ev("assistant/chunk", {"kind": "thinking", "delta": "想"}))
+    p.handle(s.ev("assistant/chunk", {"kind": "thinking", "delta": "找"}))
+
+    assert open_ev["type"] == "traj/open"
+    assert open_ev["node"]["text"] == ""          # 发射时刻快照：未被后续 += 污染
+    assert first_delta["delta"] == "用户"          # 内容只经 delta 推一次
+    # 内部累积不受影响（真实事件流下 finish 快照仍是全文）
+    assert p._find("t1.s1.think")["text"] == "用户想找"
+    assert p.finish()["nodes"][0]["text"] == "用户想找"

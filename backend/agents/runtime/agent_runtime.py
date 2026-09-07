@@ -20,6 +20,7 @@ from backend.agents.runtime.session import (
     get_session_persistence,
     get_session_store,
 )
+from backend.agents.runtime.session.trace_projection import TraceProjection
 from backend.core.http import get_http_session
 from backend.mcp_service.registry import get_registry
 
@@ -71,7 +72,6 @@ class AgentRuntime(BaseAgent):
     ) -> AgentReply:
         t0 = time.perf_counter()
         config = self._cfg()
-        trace = {"steps": [], "total_ms": 0}
 
         try:
             registry = get_registry()
@@ -79,7 +79,24 @@ class AgentRuntime(BaseAgent):
         except RuntimeError:
             tool_schemas = []
 
-        # Session 开关（默认开）：开 → 记录 Event Log 并派生 LLM 消息；关 → 保持原 messages 行为。
+        def _build_init_messages() -> list[dict]:
+            """seed 注入内容（system prompt / 上游 context）——只对真正新建的 Session 注入；
+            恢复出的 Session 的 seed 已在 Event Log 里（Event Log 是唯一事实来源），不重复注入。"""
+            init_messages = [{"role": "system", "content": config.get("system_prompt", "")}]
+            if context:
+                context_str = json.dumps(context, ensure_ascii=False, indent=2)
+                init_messages.append({
+                    "role": "system",
+                    "content": f"【上游节点输出，供你参考】\n{context_str}",
+                })
+            return init_messages
+
+        # Session 开关（默认开）：
+        # 开 → Session 生命周期走 SessionStore + Persistence（见下三段式）；
+        # 关 → 创建「临时 Session」（不注册 SessionStore / 不落库 / 不返回 session_id）：
+        #      Session 仍是 AgentLoop 的唯一执行事实源与 LLM 消息派生源（AgentLoop 必填），
+        #      TraceProjection 照常工作；临时事件随 Session 丢弃，无外部副作用。
+        #
         # 多轮 Session 三段式取 Session（SessionStore 只查内存热区，冷恢复编排在本层）：
         #   A. session_id + SessionStore.get() 命中 → 直接继续（进程内热 Session，跨请求保持上下文）
         #   B. session_id + Store miss + Persistence 命中 → load Event Log → from_events() replay
@@ -87,14 +104,13 @@ class AgentRuntime(BaseAgent):
         #   C. session_id 无（首轮）或完全不存在（进程与 DB 均无）→ create() 新建。
         #      C 的「未知 session_id 被静默续接」正是要避免的失忆场景：命中 C 时打 warning
         #      日志（可观察），并把新 session_id 随 reply/done 回传，客户端应更新本地 id。
-        # init_messages（system prompt / 上游 context）只对「真正新建」注入为 seed 事件；
-        # 恢复出的 Session 的 seed 已在 Event Log 里（Event Log 是唯一事实来源），不重复注入。
         # AgentRuntime 是无状态执行器：Session 生命周期归 SessionStore，Runtime 只取用不持有。
         # Persistence 是独立 capability（默认 Noop，main.py startup 装配 Postgres）：
         #   新建后先固化 header + seed（第 0 状态），turn 完成是 flush 持久化边界。
         persistence = get_session_persistence()
-        session = None
-        if bool(config.get("session_enabled", True)):
+        session_enabled = bool(config.get("session_enabled", True))
+        session: Session | None = None
+        if session_enabled:
             store = get_session_store()
             if session_id:
                 session = store.get(session_id)
@@ -115,14 +131,7 @@ class AgentRuntime(BaseAgent):
                             f"客户端请改用本次返回的新 session_id"
                         )
             if session is None:
-                init_messages = [{"role": "system", "content": config.get("system_prompt", "")}]
-                if context:
-                    context_str = json.dumps(context, ensure_ascii=False, indent=2)
-                    init_messages.append({
-                        "role": "system",
-                        "content": f"【上游节点输出，供你参考】\n{context_str}",
-                    })
-                session = store.create(init_messages=init_messages)
+                session = store.create(init_messages=_build_init_messages())
                 # 新会话先固化：header + seed 事件落库（幂等）。进程在 turn 中途崩溃时
                 # DB 至少保有第 0 状态（system prompt / 上游 context），冷恢复不丢初始上下文。
                 try:
@@ -130,6 +139,8 @@ class AgentRuntime(BaseAgent):
                 except Exception:
                     logger.exception(f"AgentRuntime [{self.key}] Session header 注册失败: {session.header.id}")
                 _flush_session_events(persistence, session)
+        else:
+            session = Session(init_messages=_build_init_messages())
 
         # 准备运行环境，创建并驱动 AgentLoop（执行循环在 Loop 内部；Session 由 Runtime 注入）
         loop = AgentLoop(
@@ -138,35 +149,57 @@ class AgentRuntime(BaseAgent):
             llm_params=self._llm_params(config),
             tool_schemas=tool_schemas,
             tenant_id=tenant_id,
-            trace=trace,
             on_event=on_event,
             session=session,
         )
 
-        # session_event_sink：本轮 Session 事件的同步旁路消费（UI projection 等）。
-        # Session.append 同步回调、无 await 间隙 → sink 按 seq 收到全部事件；
+        # 派生消费者装配：TraceProjection（→ AgentReply.trace / done.trace）与
+        # session_event_sink（→ UI projection）都是 Session listener，不产生事实。
+        # Session.append 同步回调、无 await 间隙 → 按 seq 收到全部事件；
         # Session 被 SessionStore 跨轮复用 → listener 只在 loop.run 期间挂载，
-        # finally 摘除，保证不跨轮泄漏（事件不会迟到下一轮的投影）。
-        attached = session is not None and session_event_sink is not None
-        if attached:
+        # finally 统一摘除，保证不跨轮泄漏（事件不会迟到下一轮的投影/快照）。
+        projection = TraceProjection()
+        session.add_listener(projection.handle)
+        attached_sink = session_event_sink is not None
+        if attached_sink:
             session.add_listener(session_event_sink)
         try:
             answer = await loop.run(question, context)
         finally:
-            if attached:
+            session.remove_listener(projection.handle)
+            if attached_sink:
                 session.remove_listener(session_event_sink)
 
-        # turn 完成 = 持久化边界：本 turn 的 Event Log（turn/start → user → steps → turn/end）
-        # 经 append_events + flush 落库（一次 flush = 一个事务）。AgentLoop 不感知任何存储 ——
-        # 事件由 Session 收全，此处一次性交给 Persistence。done 事件在 flush 之后发出，
-        # 客户端收到 done ≈ 本 turn 事件已 durable（flush 失败仅记日志，语义见 _flush_session_events）。
-        if session is not None:
+        # turn 完成 = 持久化边界（仅正式 Session）：本 turn 的 Event Log
+        # （turn/start → user → steps → turn/end）经 append_events + flush 落库
+        # （一次 flush = 一个事务）。AgentLoop 不感知任何存储 —— 事件由 Session 收全，
+        # 此处一次性交给 Persistence。done 事件在 flush 之后发出，客户端收到 done ≈
+        # 本 turn 事件已 durable（flush 失败仅记日志，语义见 _flush_session_events）。
+        if session_enabled:
             _flush_session_events(persistence, session)
 
+        # trace = TraceProjection.snapshot()：派生观测视图（steps/limits/usage/stop_reason
+        # 全部来自 Event Log 投影），不是第二套事实存储。AgentLoop 只产生事件，不写 trace。
+        trace = projection.snapshot()
+        # total_ms：运行时观测指标（含 session 装配/持久化开销），在投影之外维护
         trace["total_ms"] = round((time.perf_counter() - t0) * 1000)
         tier = "llm" if any(s.get("type") == "llm" for s in trace.get("steps", [])) else "fallback"
-        # session_id 返回给客户端：首轮为新建 Session 的 id，后续轮次客户端原样带回
-        sid = session.header.id if session is not None else None
+        # usage 汇总命中率日志（纯观测，从投影结果读取，语义同旧 AgentLoop 轮末日志）
+        usage = trace.get("usage")
+        if usage is not None:
+            ratio = usage.get("cache_hit_ratio")
+            if ratio is None:
+                logger.info(f"AgentLoop [{self.key}] usage 无 cache 字段（非 DeepSeek 网关?）: {usage}")
+            elif ratio < 0.5:
+                logger.warning(
+                    f"AgentLoop [{self.key}] 上下文缓存命中率偏低: {usage}"
+                    f" —— 检查前缀是否变化（system prompt / 工具集改动会从改动点起断缓存）"
+                )
+            else:
+                logger.info(f"AgentLoop [{self.key}] usage: {usage}")
+        # session_id 返回给客户端：首轮为新建 Session 的 id，后续轮次客户端原样带回；
+        # 临时 Session（session_enabled=False）不返回 id。
+        sid = session.header.id if session_enabled else None
         if on_event:
             await on_event({"type": "done", "answer": answer, "tier": tier, "trace": trace, "session_id": sid})
         return AgentReply(answer=answer, tier=tier, trace=trace, session_id=sid)
