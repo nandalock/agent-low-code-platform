@@ -1,12 +1,16 @@
-"""TrajectoryProjector — Session typed events → UI Trajectory nodes（Conversation Projection）
+"""TrajectoryProjection — Session typed events → UI Trajectory nodes（Conversation Projection）
 
 Event Log 是执行事实（真源）；本模块把 typed SessionEvent 投影为 UI 可直接渲染的
 node 序列（think / tool / answer），并产出增量 UI 事件（traj/open|delta|update|close +
 usage）供 SSE 实时推送。这是「Session Event → Conversation Node → UI Projection」
 的中间层：前端 reducer 只按全量字段值更新，不做任何拼装/猜测。
 
+命名（DSH 词汇对齐）：本包内三个派生视图按用途并列 —— surface.py（模型消息）、
+trajectory_projection.py（UI/回放，本文件）、trace_projection.py（执行摘要/telemetry）。
+三者都消费同一 Event Log，互不依赖；命名 = "<用途>_projection"。
+
 设计约束：
-  - 纯状态机：handle(ev) 逐事件消费；project_snapshot(events) == fold(handle)。
+  - 纯状态机：handle(ev) 逐事件消费；project_trajectory(events) == fold(handle)。
     实时增量与历史回放严格同构（同一事件流 → 同一 node 终态）。
   - Node identity：
       think   = t{turn}.s{step}.think        每 step 至多一个，reasoning delta 累积
@@ -73,8 +77,8 @@ def _classify_result(content: str) -> tuple[str, str | None, str | None]:
     return ST_SUCCESS, (text[:_MAX_SUMMARY_CHARS] + "…" if len(text) > _MAX_SUMMARY_CHARS else text or None), None
 
 
-class TrajectoryProjector:
-    """增量投影器：每 SessionEvent → 0..N 个 UI 事件（dict）。
+class TrajectoryProjection:
+    """增量投影：每 SessionEvent → 0..N 个 UI 事件（dict）。
 
     单实例只服务一个「事件流消费端」（一次 SSE 请求 / 一次回放）。
     turn/step 从 1 编号，node id 为不透明键（UI 只按 id 引用，不解析）。
@@ -131,7 +135,12 @@ class TrajectoryProjector:
     def _open(self, node: dict, ev_type: str) -> list[dict]:
         self.nodes.append(node)
         self._by_id[node["id"]] = node
-        return [{"type": ev_type, "node": node}]
+        # 事件必须携带发射时刻的快照（拷贝），不是内部 node 的活引用：
+        # 后续 _on_chunk 的 node["text"] += / _update 的 node.update 会改写内部 node，
+        # 若事件共享同一 dict，SSE 出队序列化时 open 负载已被污染 → 前端把首 delta
+        # 既从 open.text 又经 traj/delta 各加一次（每段首词双写）。dict() 浅拷贝即够
+        # （node 字段均为字符串/数字等不可变值）。
+        return [{"type": ev_type, "node": dict(node)}]
 
     def _find(self, node_id: str) -> dict | None:
         return self._by_id.get(node_id)
@@ -293,12 +302,13 @@ class TrajectoryProjector:
         return [{"type": "usage", **u}]
 
 
-def project_snapshot(events: list[SessionEvent]) -> dict:
-    """纯函数：完整事件流 → 终态快照 {"nodes": [...], "usage": [...]}。
+def project_trajectory(events: list[SessionEvent]) -> dict:
+    """纯函数（回放 fold）：完整事件流 → 终态快照 {"nodes": [...], "usage": [...]}。
 
     与实时增量投影严格同构：等价于对同一事件流逐个 handle() 后 finish()。
+    命名与 trace_projection.project_trace 对称（<视图>_project 均为回放 fold）。
     """
-    p = TrajectoryProjector()
+    p = TrajectoryProjection()
     for ev in events:
         p.handle(ev)
     return p.finish()

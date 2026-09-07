@@ -10,7 +10,7 @@ from backend.agents import list_agents, get_agent, register
 from backend.agents.base import AgentReply
 from backend.agents.runtime import AgentRuntime
 from backend.agents.runtime.session import get_session_persistence, get_session_store
-from backend.agents.runtime.session.projection import TrajectoryProjector, project_snapshot
+from backend.agents.runtime.session.trajectory_projection import TrajectoryProjection, project_trajectory
 from backend.agents.router.router_runtime import RouterRuntime, invalidate_desc_cache
 from backend.agents.config_service import get_agent_config, save_agent_config, get_agent_definition
 from backend.agents.config_service import list_l1_keywords, create_l1_keyword, update_l1_keyword, delete_l1_keyword
@@ -274,7 +274,7 @@ async def agent_chat_stream(
     """SSE 流式聊天（Session Event → Trajectory Projection → UI events）。
 
     AgentLoop 执行事实写入 Session Event Log；本层经 session_event_sink 桥接
-    TrajectoryProjector，把 typed events 投影为 UI 可直接渲染的 node 事件：
+    TrajectoryProjection，把 typed events 投影为 UI 可直接渲染的 node 事件：
       {"type":"step","step":1,"total":8}        循环步进
       {"type":"traj/open","node":{...}}         think/tool/answer node 建立（全量字段）
       {"type":"traj/delta","id":"...","field":"thinking"|"text","delta":"..."}  增量
@@ -308,7 +308,7 @@ async def agent_chat_stream(
     async def event_gen():
         queue: asyncio.Queue = asyncio.Queue()
         thinking_parts: list[str] = []  # 累积思考过程，随消息落库持久化（旧数据/无轨迹回退兜底）
-        projector = TrajectoryProjector()  # Session typed events → UI trajectory node 事件
+        projector = TrajectoryProjection()  # Session typed events → UI trajectory node 事件
 
         async def on_event(ev: dict):
             await queue.put(ev)
@@ -423,7 +423,7 @@ async def agent_session_trajectory(session_id: str) -> dict:
         if loaded is None:
             raise HTTPException(404, "session not found")
         _, events = loaded
-    snap = project_snapshot(events)
+    snap = project_trajectory(events)
     return {"session_id": session_id, **snap}
 
 

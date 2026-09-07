@@ -7,9 +7,10 @@ import { PanelLeftClose, PanelLeftOpen, Brain, ChevronDown, ChevronRight } from 
 import McpToolBinding from '../_components/McpToolBinding';
 import CachePolicyEditor, { type CachePolicyData } from '../_components/CachePolicyEditor';
 import TrajectoryTimeline from '../_components/TrajectoryTimeline';
+import TraceSummaryRow from '../_components/TraceSummaryRow';
 import { useTrajectoryBatch } from '../_components/useTrajectoryBatch';
 import {
-  type TrajNode, type UsageRow, type TrajectorySnapshot,
+  type TrajNode, type UsageRow, type TraceSummary, type TrajectorySnapshot,
   answerTextOf, groupSnapshotByTurn,
 } from '@/lib/trajectory';
 
@@ -117,6 +118,7 @@ interface ChatMsg {
   thinking?: string;                 // 遗留兜底（无轨迹的历史数据）
   nodes?: TrajNode[];                // Agent Trajectory（think/tool 行；answer 不存这里）
   usage?: UsageRow[];
+  trace?: TraceSummary;              // 执行摘要（TraceProjection 产物；history 来自 metadata.trace，实时来自 done.trace）
 }
 
 // 历史会话项（服务端 conversations 列表，channel=agent:{key}，与 DeepSeek 会话列表同源）
@@ -145,6 +147,7 @@ export default function AgentDetailPage() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [hist, setHist] = useState<HistConv[]>([]);
+  const histRef = useRef<HistConv[]>([]);  // hist 镜像：SSE 循环内判断「是否新会话」用
   // 实时 Trajectory：rAF 批处理 reducer（think/tool node 流）+ usage 低频 state
   const { nodes: trajNodes, nodesRef, enqueue, forceFlush, reset } = useTrajectoryBatch();
   const [liveUsage, setLiveUsage] = useState<UsageRow[]>([]);
@@ -168,9 +171,24 @@ export default function AgentDetailPage() {
           id: c.id, last_msg: c.last_msg || '', last_time: c.last_time || '', count: c.msg_count || 0,
           session_id: c.session_id || null,  // SELECT c.* 透传；老数据无 → null
         }));
+        histRef.current = items;
         setHist(items);
       }).catch(() => {});
   }, [agentKey]);
+
+  // 重新拉历史列表：新建会话首次回复后（conversation_id 刚产生，不在 hist 里）
+  // 下拉框会卡在「当前会话（恢复中…）」—— 拉到新会话即可消除
+  const refreshHist = () => {
+    fetch(`${API}/api/chat/conversations?channel=agent:${agentKey}`, { headers: { 'X-Tenant-ID': String(TENANT_ID) } })
+      .then(r => r.json()).then(d => {
+        const items = (d.items || []).map((c: any) => ({
+          id: c.id, last_msg: c.last_msg || '', last_time: c.last_time || '', count: c.msg_count || 0,
+          session_id: c.session_id || null,
+        }));
+        histRef.current = items;
+        setHist(items);
+      }).catch(() => {});
+  };
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const [config, setConfig] = useState(DEFAULT_CONFIG);
@@ -229,7 +247,7 @@ export default function AgentDetailPage() {
         for (const m of items) {
           const time = m.created_at ? new Date(m.created_at).toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' }) : '';
           const meta = m.metadata || {};
-          if (m.role === 'agent') msgs.push({ role:'agent', content:m.content, time, thinking: meta.thinking || undefined });
+          if (m.role === 'agent') msgs.push({ role:'agent', content:m.content, time, thinking: meta.thinking || undefined, trace: meta.trace || undefined });
           else if (m.role === 'customer') msgs.push({ role:'user', content:m.content, time });
         }
         // 轨迹对齐：session 覆盖该会话最近 N 个 agent turn（节点按 turn id 分组；
@@ -306,6 +324,7 @@ export default function AgentDetailPage() {
     setLiveUsage([]); usageRef.current = [];
     reset();  // 清空上个 turn 的 trajectory nodes（flush 尾部滞留 + reducer reset）
     let finalAnswer = '';
+    let doneTrace: TraceSummary | undefined;  // done.trace：本轮执行摘要（TraceProjection 产物）
     let legacyThink = '';   // session=None 遗留路径：thinking 降级累积（无轨迹时兜底显示）
     let legacyAns = '';     // 遗留路径 answer/text 降级累积
     try {
@@ -353,9 +372,15 @@ export default function AgentDetailPage() {
               break;
             case 'done':
               if (ev.answer) finalAnswer = ev.answer;
+              doneTrace = ev.trace;  // 执行摘要（后端 TraceProjection 产物，随 done 回传）
               // session/conversation id 持久到 localStorage：重启浏览器自动续最近一场
               if (ev.session_id) { setSessionId(ev.session_id); localStorage.setItem(`sid_${agentKey}`, ev.session_id); }
-              if (ev.conversation_id) { setConversationId(ev.conversation_id); localStorage.setItem(`conv_${agentKey}`, String(ev.conversation_id)); }
+              if (ev.conversation_id) {
+                const cid = Number(ev.conversation_id);
+                setConversationId(cid); localStorage.setItem(`conv_${agentKey}`, String(cid));
+                // 首次回复产生的新会话：刷新历史列表，否则下拉框停在「当前会话（恢复中…）」
+                if (!histRef.current.some(h => h.id === cid)) refreshHist();
+              }
               break;
           }
         }
@@ -375,6 +400,7 @@ export default function AgentDetailPage() {
         nodes: nodes.length ? nodes : undefined,
         usage: usageRef.current.length ? usageRef.current : undefined,
         thinking: legacyThink || undefined,
+        trace: doneTrace,
       }]);
     }
   }
@@ -530,6 +556,8 @@ export default function AgentDetailPage() {
                     background:isUser?T.accent:T.surface, color:isUser?'#fff':T.text,
                     border:isUser?'none':`1px solid ${T.border}`, borderBottomRightRadius:isUser?2:8, borderBottomLeftRadius:isUser?8:2,
                   }}>{msg.content}</div>
+                  {/* 执行摘要（TraceProjection）：N 步 · 耗时 · token/命中 · 停止原因；点击展开每步明细 */}
+                  {!isUser && msg.trace && <TraceSummaryRow trace={msg.trace} />}
                 </div>
               </div>
             );

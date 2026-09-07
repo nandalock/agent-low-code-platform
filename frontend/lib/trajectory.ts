@@ -72,6 +72,33 @@ export interface TrajectorySnapshot {
   usage: UsageRow[];
 }
 
+// ── 执行摘要（TraceProjection 产物：AgentReply.trace / messages.metadata.trace） ──
+// 与后端 trace dict 一一对应（后端为条件性出现 key，这里全部可选）。
+
+export interface TraceStepEntry {
+  step?: number;                    // 0-based
+  type?: 'llm' | 'tool';
+  content?: string | null;          // llm 步正文
+  tool?: string;                    // tool 步工具名
+  args?: Record<string, unknown> | null;
+  output?: unknown;                 // tool 步原始结果（可能很大，展示时截断）
+  latency_ms?: number;
+  usage?: UsageRow | null;          // llm 步的 4-key token 统计
+}
+
+export interface TraceSummary {
+  steps?: TraceStepEntry[];
+  limits?: { max_steps?: number; max_tool_calls?: number; max_wall_time?: number };
+  usage?: {
+    llm_calls?: number;
+    cache_hit_tokens?: number;
+    cache_miss_tokens?: number;
+    cache_hit_ratio?: number | null;
+  };
+  stop_reason?: string | null;
+  total_ms?: number;
+}
+
 // ── 纯 reducer ──
 
 function upsert(list: TrajNode[], node: TrajNode): TrajNode[] {
@@ -178,4 +205,50 @@ export function groupSnapshotByTurn(snap: TrajectorySnapshot): TrajNode[][] {
     turns[turn].push(node);
   }
   return turns;
+}
+
+// ── 执行摘要展示 helpers（TraceProjection dict 的纯文本化，无渲染状态） ──
+
+export const STOP_REASON_LABELS: Record<string, string> = {
+  completed: '正常完成',
+  error: '异常结束',
+  max_steps: '轮数超限停止',
+  max_tool_calls: '工具调用超限停止',
+  max_wall_time: '超时停止',
+  repeat_tool: '重复调用停止',
+  tool_timeout: '工具超时停止',
+};
+
+export function stopReasonLabel(reason?: string | null): string {
+  if (!reason) return '';
+  return STOP_REASON_LABELS[reason] ?? reason;
+}
+
+/** 耗时：<1s 显示 ms，否则显示秒 */
+export function formatDuration(ms?: number): string {
+  if (ms == null) return '';
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** token 数：≥1 万显示 "x.x万"，否则原样 */
+export function formatTokens(n?: number | null): string {
+  if (n == null) return '0';
+  return n >= 10000 ? `${(n / 10000).toFixed(1)}万` : String(n);
+}
+
+/** 一行摘要文案：steps 数 · 总耗时 · 输入/输出/命中 · 停止原因（缺哪段就不显示哪段） */
+export function traceSummaryLine(t: TraceSummary): string {
+  const parts: string[] = [];
+  if (t.steps?.length) parts.push(`${t.steps.length} 步`);
+  if (t.total_ms != null) parts.push(`耗时 ${formatDuration(t.total_ms)}`);
+  if (t.usage?.llm_calls) {
+    const { llm_calls: calls, cache_hit_tokens: hit, cache_miss_tokens: miss, cache_hit_ratio: ratio } = t.usage;
+    parts.push(`LLM ×${calls}`);
+    if (hit != null || miss != null) {
+      if (ratio != null) parts.push(`缓存命中 ${Math.round(ratio * 100)}%`);
+      else parts.push('无缓存统计');
+    }
+  }
+  if (t.stop_reason) parts.push(stopReasonLabel(t.stop_reason));
+  return parts.join(' · ');
 }
