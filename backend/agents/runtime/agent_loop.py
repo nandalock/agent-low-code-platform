@@ -4,7 +4,10 @@
   Runtime 负责提供运行环境（config / tool schemas / llm params / Session / on_event）
   并装配派生消费者（TraceProjection / session_event_sink）；
   Loop 负责驱动 Agent 执行（derive messages、调用 LLM、消费 stream、判断 tool_calls、
-  执行 ToolRegistry / MCP、把 tool_result 写回 Session、生成最终 answer）。
+  经 ToolRuntime 执行 Tool、把 tool_result 写回 Session、生成最终 answer）。
+  Loop 不认识 MCP / HTTP / STDIO / server_id —— 这些都在 ToolRuntime + Executor 里；
+  Loop 也不感知 Tool 生命周期事件（started / progress / completed / failed）——
+  只负责每次调用构造 ToolContext（session_id / agent_id / event_sink），事件由 Runtime 层发出。
 
 事实记录原则：Session Event Log 是 Agent 执行事实的唯一 Source of Truth ——
   Loop 只 session.append(...) 产生事实，不再维护任何第二套执行 trace
@@ -14,12 +17,11 @@
   max_steps      — LLM→Tool 循环轮数上限（AgentRuntime._llm_params 配置）
   max_tool_calls — 整个 run 的 Tool 调用次数上限（AgentRuntime._llm_params 配置）
   max_wall_time  — 整个 run 的总时长上限（AgentRuntime._llm_params 配置）
-  tool timeout   — 单个 Tool 的最大执行时间（ToolRegistry 提供，未声明用 DEFAULT_TOOL_TIMEOUT）
+  tool timeout   — 单个 Tool 的最大执行时间（Executor 生效：声明式 timeout 或 DEFAULT_TOOL_TIMEOUT）
   repeat tool    — 连续重复调用相同 Tool + 标准化参数达到 REPEAT_TOOL_THRESHOLD 后停止
   Session        — 执行事实源（AgentRuntime 创建并注入，必填）：Loop append 事件，
                    LLM 消息由 session.derive_messages() 派生（seed 由 Runtime 注入）
 """
-import asyncio
 import json
 import logging
 import time
@@ -34,20 +36,19 @@ from backend.agents.runtime.session import (
     STEP_END,
     STEP_START,
     TOOL_CALL,
-    TOOL_PROGRESS,
     TOOL_RESULT,
     TURN_END,
     TURN_START,
     USER_MESSAGE,
     Session,
 )
+from backend.agents.runtime.tool_event_sink import SessionToolEventSink
 from backend.core.http import get_http_session
-from backend.tool_system.registry.registry import get_registry
+from backend.tool_system.context import ToolContext
+from backend.tool_system.runtime.runtime import get_tool_runtime
 
 logger = logging.getLogger(__name__)
 
-# 未注册 timeout 的 Tool 使用该默认值（秒）
-DEFAULT_TOOL_TIMEOUT = 30
 # 连续重复调用相同 Tool + 相同参数达到该次数后触发保护（前两次重复允许，第三次停止）
 REPEAT_TOOL_THRESHOLD = 3
 
@@ -239,12 +240,8 @@ class AgentLoop:
                     })
 
                     try:
-                        registry = get_registry()
-                        # per-tool timeout：优先 registry 声明，未声明用默认值；执行统一走带超时的调用
-                        tool_timeout = registry.get_tool_timeout(mcp_name) or DEFAULT_TOOL_TIMEOUT
-                        tool_result = await self._call_tool_with_progress(
-                            registry, mcp_name, args, tool_timeout, tc["id"],
-                        )
+                        # 执行统一走 ToolRuntime：timeout / transport / 生命周期事件由 Runtime 层负责
+                        tool_result = await self._execute_tool(mcp_name, args, tc["id"])
                     except Exception as e:
                         tool_result = {"error": str(e)}
 
@@ -327,52 +324,18 @@ class AgentLoop:
         }
         self.session.append(LLM_USAGE, data)
 
-    async def _call_tool_with_progress(
-        self, registry, tool_name: str, args: dict, timeout: float, tool_call_id: str,
-    ) -> dict:
-        """执行工具：所有 Tool 统一带 timeout；有进度查询时额外轮询 → tool/progress 事件
+    async def _execute_tool(self, tool_name: str, args: dict, tool_call_id: str) -> dict:
+        """执行一次 Tool：只构造 ToolContext（含事件出口）并交给 ToolRuntime。
 
-        兼容性：progress_fn 为 None（未注册进度查询）时不再「没有超时」，
-        退化为 asyncio.wait_for 兜底，超时返回 error 结果而非让 AgentLoop 异常退出。
-
-        tool/progress 是过程事件（log-only）：入 Event Log（带 tool_call_id，投影/回放可见）。
+        Tool 生命周期事件（started / progress / completed / failed）由 ToolRuntime /
+        Executor 经 context.event_sink 发出，本 Loop 不感知、不拼装。
         """
-        progress_fn = registry.get_progress_query(tool_name)
-
-        async def _run():
-            return await registry.call_async(tool_name, args)
-
-        if progress_fn is None:
-            try:
-                return await asyncio.wait_for(_run(), timeout=timeout)
-            except asyncio.TimeoutError:
-                return {"error": f"工具 {tool_name} 执行超时（>{timeout:.0f}s），已取消"}
-
-        async def _emit_progress(stage: str, seconds: int) -> None:
-            data = {"tool": tool_name, "tool_call_id": tool_call_id, "stage": stage, "seconds": seconds}
-            self.session.append(TOOL_PROGRESS, data)
-
-        start = time.perf_counter()
-        task = asyncio.create_task(_run())
-        last_stage = ""
-        while not task.done():
-            if time.perf_counter() - start > timeout:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                await _emit_progress(f"工具执行超时（>{timeout:.0f}s），已取消", round(timeout))
-                return {"error": f"工具 {tool_name} 执行超时（>{timeout:.0f}s），已取消"}
-            await asyncio.sleep(2)
-            try:
-                stage = progress_fn(args) or ""
-            except Exception:
-                stage = ""
-            if stage and stage != last_stage:
-                last_stage = stage
-                await _emit_progress(stage, round(time.perf_counter() - start))
-        return task.result()
+        context = ToolContext(
+            session_id=self.session.header.id,
+            agent_id=self.key,
+            event_sink=SessionToolEventSink(self.session, tool_call_id, forward=self.on_event),
+        )
+        return await get_tool_runtime().execute(tool_name, args, context)
 
     async def _call_llm_stream(
         self, session, base_url: str, api_key: str, payload: dict, remaining: float,

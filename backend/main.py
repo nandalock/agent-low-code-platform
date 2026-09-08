@@ -42,6 +42,7 @@ async def startup():
     from backend.agents.human_handoff.agent import HumanHandoffAgent
     from backend.agents.config_service import list_agent_definitions
     from backend.tool_system.registry.registry import init_registry
+    from backend.tool_system.runtime.runtime import init_tool_runtime
 
     from backend.core.seeds import seed_orders
     from backend.agents.runtime.session import PostgresSessionPersistence, set_session_persistence
@@ -93,6 +94,13 @@ async def startup():
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"ToolRegistry 初始化失败（不影响服务启动）: {e}")
+
+    # Tool 执行入口（Registry 解析 → Executor 执行）；AgentLoop / API 都经它调用工具
+    try:
+        init_tool_runtime()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"ToolRuntime 初始化失败（工具调用不可用）: {e}")
 
     # 装配：论文域工具内部进度 → registry 进度查询（平台扩展点示例）
     try:
