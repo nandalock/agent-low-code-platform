@@ -95,7 +95,7 @@ agent-low-code-platform/
 │   ├── api/             # REST & WebSocket endpoints
 │   ├── core/            # Infrastructure: db connection & schema, JWT auth, RAG embeddings & reranker
 │   ├── engine/          # Workflow engine (builder, handlers, state, middlewares)
-│   ├── tool_system/     # Tool infra: adapters (MCP client) · registry · runtime(reserved)
+│   ├── tool_system/     # Tool infra: adapters (MCP client) · registry (metadata/resolve) · runtime (execute + events) · context
 │   ├── tool_packages/   # Tool implementations: paper MCP server · builtin MCP server
 │   ├── services/        # Business domains: faq · chat · memory · cache
 │   └── integrations/    # 3rd-party channel integrations (xianyu)

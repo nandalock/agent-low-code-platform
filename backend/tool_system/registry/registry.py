@@ -1,30 +1,51 @@
 """MCP 工具全局注册表 — 启动时连所有 MCP server，建 {tool_name → info} 索引
 
-支持两种传输模式:
+职责边界（本阶段拆分后）：
+  Registry 只负责 metadata / schema / resolve（产出 ToolDescriptor）；
+  执行 / MCP call / transport 调度全部归 ToolRuntime + Executor（见 tool_system/runtime/）。
+  Registry 用 McpClient 只为了「发现工具列表」，不参与任何工具调用。
+
+支持两种传输模式（发现阶段）:
   - HTTP: 长连接，client 缓存复用
-  - STDIO: 按需连接，调完即断
+  - STDIO: 按需连接，拉完 schema 即断
 """
 import json, logging
 from backend.core.connection import get_conn
 from backend.tool_system.adapters.mcp import McpClient, get_mcp_client, MCP_URL
+from backend.tool_system.registry.descriptor import ToolDescriptor
 
 logger = logging.getLogger(__name__)
 
 
+def _parse_stdio_config(srv: dict) -> dict:
+    """解析 DB 里的 stdio 配置（args / env 可能是 JSON 字符串）"""
+    args = srv.get("args") or []
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (json.JSONDecodeError, TypeError):
+            args = []
+    env = srv.get("env") or {}
+    if isinstance(env, str):
+        try:
+            env = json.loads(env)
+        except (json.JSONDecodeError, TypeError):
+            env = {}
+    return {"command": srv.get("command", ""), "args": args, "env": env}
+
+
 class ToolRegistry:
-    """全局 MCP 工具索引 + Agent 绑定查询"""
+    """全局 MCP 工具索引 + Agent 绑定查询 + ToolDescriptor 解析"""
 
     def __init__(self):
         # tool_name → {server_id, schema, transport}
         self._index: dict[str, dict] = {}
-        # server_id → McpClient (仅 HTTP)
-        self._http_clients: dict[int, McpClient] = {}
-        # server_id → server config (仅 STDIO，用于按需重连)
-        self._stdio_configs: dict[int, dict] = {}
+        # server_id → server config（索引时缓存，resolve 时填进 ToolDescriptor）
+        self._server_configs: dict[int, dict] = {}
         # 工具进度查询（可选扩展点）：tool_name → fn(args) -> stage_str
         # 领域 MCP 可在装配层注册，AgentRuntime 执行工具期间轮询 → tool_progress 事件
         self._progress_queries: dict[str, object] = {}
-        # 工具执行超时（可选扩展点）：tool_name → 秒；未注册的 Tool 由 AgentLoop 使用默认值
+        # 工具执行超时（可选扩展点）：tool_name → 秒；未声明的 Tool 由 Executor 使用默认值
         self._tool_timeouts: dict[str, float] = {}
         self._ready = False
 
@@ -40,7 +61,8 @@ class ToolRegistry:
     # ── 工具执行超时（领域扩展点） ──
 
     def register_tool_timeout(self, tool_name: str, seconds: float) -> None:
-        """注册工具执行超时（秒）。未注册的 Tool 由 AgentLoop 使用 DEFAULT_TOOL_TIMEOUT"""
+        """声明工具执行超时（秒）— 存的是元数据，执行时由 Executor 生效。
+        未声明的 Tool 由 Executor 使用 DEFAULT_TOOL_TIMEOUT"""
         self._tool_timeouts[tool_name] = seconds
 
     def get_tool_timeout(self, tool_name: str) -> float | None:
@@ -59,7 +81,7 @@ class ToolRegistry:
                 continue
 
             try:
-                await self._connect_and_index(srv, cache_client=(transport == "http"))
+                await self._connect_and_index(srv)
             except Exception as e:
                 logger.warning(f"MCP 服务 [{srv['id']}] {srv['name']} 连接失败: {e}")
         self._ready = True
@@ -67,46 +89,33 @@ class ToolRegistry:
 
     async def connect_server(self, srv: dict) -> int:
         """外部 API 调用：连接一个 server 并索引其工具。返回工具数。已连接过则跳过（幂等）。"""
-        transport = srv.get("transport", "http")
         sid = srv["id"]
         # 幂等：该 server 已连接并索引过则直接返回，避免 tools/all 每次全量重连
-        if (transport == "http" and sid in self._http_clients) or (transport == "stdio" and sid in self._stdio_configs):
+        if sid in self._server_configs:
             return sum(1 for v in self._index.values() if v["server_id"] == sid)
         try:
-            await self._connect_and_index(srv, cache_client=(transport == "http"))
+            await self._connect_and_index(srv)
         except Exception as e:
             logger.warning(f"connect_server [{srv.get('name')}] 失败: {e}")
             raise
         return sum(1 for v in self._index.values() if v["server_id"] == srv["id"])
 
-    async def _connect_and_index(self, srv: dict, cache_client: bool):
-        """连接单个 server，拉工具列表写入 _index"""
+    async def _connect_and_index(self, srv: dict):
+        """连接单个 server，拉工具列表写入 _index，并缓存 server 配置供 resolve 出描述"""
         sid = srv["id"]
         transport = srv.get("transport", "http")
 
         if transport == "http":
-            client = await get_mcp_client(srv.get("url") or MCP_URL)
-            if cache_client:
-                self._http_clients[sid] = client
+            url = srv.get("url") or MCP_URL
+            client = await get_mcp_client(url)  # adapter 按 URL 缓存连接，executor 复用同一实例
+            self._server_configs[sid] = {"id": sid, "name": srv["name"], "transport": transport, "url": url}
             for t in client.tools:
                 self._index[t["name"]] = {"server_id": sid, "schema": t, "transport": transport}
         else:
             # stdio: 临时连接拉 schema，然后断开
-            args = srv.get("args") or []
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except (json.JSONDecodeError, TypeError):
-                    args = []
-            env = srv.get("env") or {}
-            if isinstance(env, str):
-                try:
-                    env = json.loads(env)
-                except (json.JSONDecodeError, TypeError):
-                    env = {}
-
-            self._stdio_configs[sid] = {"command": srv.get("command", ""), "args": args, "env": env}
-            client = McpClient(transport="stdio", command=srv.get("command", ""), args=args, env=env)
+            cfg = _parse_stdio_config(srv)
+            self._server_configs[sid] = {"id": sid, "name": srv["name"], "transport": transport, **cfg}
+            client = McpClient(transport="stdio", **cfg)
             try:
                 await client.connect()
                 for t in client.tools:
@@ -150,73 +159,33 @@ class ToolRegistry:
                 schemas.append(_to_openai_function(entry["schema"]))
         return schemas
 
-    async def call_async(self, tool_name: str, args: dict) -> dict:
-        """异步执行工具调用。HTTP 用缓存 client，stdio 临时连接后断开。"""
+    async def resolve(self, tool_name: str) -> ToolDescriptor | None:
+        """解析工具 → ToolDescriptor（未索引则懒加载）。
+
+        这是 Registry 对执行侧的唯一出口：产出描述即止，不执行、不碰 transport。
+        """
         entry = self._index.get(tool_name)
         if not entry:
             entry = await self._lazy_load_tool(tool_name)
         if not entry:
-            raise KeyError(f"工具未注册: {tool_name}")
+            return None
 
-        transport = entry.get("transport", "http")
-        if transport == "http":
-            client = self._http_clients.get(entry["server_id"])
-            if not client:
-                raise RuntimeError(f"HTTP client 未连接: server {entry['server_id']}")
-            rows = await client.call(tool_name, args)
-        else:
-            # stdio: 每次调用创建临时连接
-            cfg = self._stdio_configs.get(entry["server_id"], {})
-            client = McpClient(
-                transport="stdio",
-                command=cfg.get("command", ""),
-                args=cfg.get("args", []),
-                env=cfg.get("env", {}),
-            )
-            try:
-                await client.connect()
-                rows = await client.call(tool_name, args)
-            finally:
-                await client.disconnect()
-
-        return {"tool": tool_name, "rows": rows, "count": len(rows)}
+        return ToolDescriptor(
+            name=tool_name,
+            type="mcp",
+            transport=entry.get("transport", "http"),
+            server_id=entry["server_id"],
+            schema=entry["schema"],
+            server=self._server_configs.get(entry["server_id"], {}),
+            timeout=self.get_tool_timeout(tool_name),
+        )
 
     async def _lazy_load_tool(self, tool_name: str) -> dict | None:
-        """懒加载：遍历所有 MCP server，找到包含该 tool 的 server 并连接"""
+        """懒加载：遍历所有 MCP server，找到包含该 tool 的 server 并索引"""
         servers = self._list_servers()
         for srv in servers:
-            transport = srv.get("transport", "http")
             try:
-                if transport == "http":
-                    url = srv.get("url") or MCP_URL
-                    client = await get_mcp_client(url)
-                    self._http_clients[srv["id"]] = client
-                    for t in client.tools:
-                        if t["name"] not in self._index:
-                            self._index[t["name"]] = {"server_id": srv["id"], "schema": t, "transport": transport}
-                else:
-                    args = srv.get("args") or []
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except (json.JSONDecodeError, TypeError):
-                            args = []
-                    env = srv.get("env") or {}
-                    if isinstance(env, str):
-                        try:
-                            env = json.loads(env)
-                        except (json.JSONDecodeError, TypeError):
-                            env = {}
-                    self._stdio_configs[srv["id"]] = {"command": srv.get("command", ""), "args": args, "env": env}
-                    client = McpClient(transport="stdio", command=srv.get("command", ""), args=args, env=env)
-                    try:
-                        await client.connect()
-                        for t in client.tools:
-                            if t["name"] not in self._index:
-                                self._index[t["name"]] = {"server_id": srv["id"], "schema": t, "transport": transport}
-                    finally:
-                        await client.disconnect()
-
+                await self._connect_and_index(srv)
                 if tool_name in self._index:
                     logger.info(f"懒加载工具 [{tool_name}] 来自 {srv['name']}")
                     return self._index[tool_name]

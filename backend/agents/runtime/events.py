@@ -15,6 +15,7 @@ from typing import Awaitable, Callable
 # 事件回调签名：上层 UI / SSE 订阅 AgentLoop 事件
 EventSink = Callable[[dict], Awaitable[None]]
 
-# 兼容保留（已废弃）：AgentLoop 已改为 per-tool timeout（ToolRegistry.get_tool_timeout，
-# 未声明用 DEFAULT_TOOL_TIMEOUT=30s），不再作为所有 Tool 的唯一超时。仅保留导出避免破坏 import。
+# 兼容保留（已废弃）：AgentLoop 已改为 per-tool timeout（声明式 timeout 存于 Registry 元数据，
+# 由 ToolRuntime / Executor 生效；未声明用 DEFAULT_TOOL_TIMEOUT=30s），
+# 不再作为所有 Tool 的唯一超时。仅保留导出避免破坏 import。
 TOOL_POLL_TIMEOUT = 600

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Body, HTTPException
 from backend.core.connection import get_conn
 from backend.tool_system.adapters.mcp import get_mcp_client, McpClient, MCP_URL
 from backend.tool_system.registry.registry import get_registry
+from backend.tool_system.runtime.runtime import get_tool_runtime
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/mcp", tags=["MCP"])
@@ -186,9 +187,8 @@ async def api_server_call(sid: int, payload: dict = Body(...)):
                 await client.connect()
                 rows = await client.call(name, args)
         else:
-            # stdio: 通过 registry 调用（自动重连子进程）
-            registry = get_registry()
-            result = await registry.call_async(name, args)
+            # stdio: 通过 ToolRuntime 调用（Executor 负责临时子进程生命周期）
+            result = await get_tool_runtime().execute(name, args)
             rows = result["rows"]
         return {"tool": name, "rows": rows, "count": len(rows)}
     except KeyError:
@@ -299,10 +299,9 @@ async def api_get_tool(name: str):
 
 @router.post("/tools/{name}/call")
 async def api_call_tool(name: str, args: dict = Body(...)):
-    """调用工具 — 从 registry 查所属 server，路由到正确的 server 执行"""
+    """调用工具 — 经 ToolRuntime 执行（Registry 解析 → Executor 路由到正确的 server）"""
     try:
-        registry = get_registry()
-        result = await registry.call_async(name, args)
+        result = await get_tool_runtime().execute(name, args)
     except KeyError:
         raise HTTPException(404, f"工具不存在: {name}")
     except RuntimeError as e:
