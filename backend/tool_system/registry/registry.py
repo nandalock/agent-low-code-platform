@@ -6,7 +6,7 @@
 """
 import json, logging
 from backend.core.connection import get_conn
-from backend.mcp_service.client import McpClient, get_mcp_client, MCP_URL
+from backend.tool_system.adapters.mcp import McpClient, get_mcp_client, MCP_URL
 
 logger = logging.getLogger(__name__)
 
