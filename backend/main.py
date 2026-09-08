@@ -41,7 +41,7 @@ async def startup():
     from backend.agents.router import RouterAgent, RouterRuntime
     from backend.agents.human_handoff.agent import HumanHandoffAgent
     from backend.agents.config_service import list_agent_definitions
-    from backend.mcp_service.registry import init_registry
+    from backend.tool_system.registry.registry import init_registry
 
     from backend.core.seeds import seed_orders
     from backend.agents.runtime.session import PostgresSessionPersistence, set_session_persistence
@@ -71,7 +71,7 @@ async def startup():
     # asyncio.create_task(auto_connect())  # 闲鱼已禁用
 
     # 先启动本地 MCP server (9001)，ToolRegistry 需要连接它
-    from backend.mcp_service.server import mcp as mcp_server
+    from backend.tool_packages.builtin.server import mcp as mcp_server
     from starlette.middleware.cors import CORSMiddleware as StarletteCORS
     import uvicorn
     mcp_app = mcp_server.streamable_http_app()
@@ -81,7 +81,7 @@ async def startup():
     await asyncio.sleep(0.5)  # 等 MCP server 就绪
 
     # 论文域 MCP server (9002) — 领域扩展点，新域继续往下加
-    from backend.mcp_servers.paper.server import mcp as paper_mcp
+    from backend.tool_packages.paper.server import mcp as paper_mcp
     paper_app = paper_mcp.streamable_http_app()
     paper_app.add_middleware(StarletteCORS, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["Mcp-Session-Id"])
     paper_config = uvicorn.Config(paper_app, host="0.0.0.0", port=9002, log_level="info")
@@ -96,8 +96,8 @@ async def startup():
 
     # 装配：论文域工具内部进度 → registry 进度查询（平台扩展点示例）
     try:
-        from backend.mcp_servers.paper.server import get_stage
-        from backend.mcp_service.registry import get_registry
+        from backend.tool_packages.paper.server import get_stage
+        from backend.tool_system.registry.registry import get_registry
         _registry = get_registry()
         for _tool in ("summarize_paper", "fetch_paper_text"):
             _registry.register_progress_query(_tool, lambda args, _t=_tool: get_stage(args.get("url", "")))

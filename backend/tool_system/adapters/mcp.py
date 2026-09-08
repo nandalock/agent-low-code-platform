@@ -31,7 +31,7 @@ class McpClient:
         self._transport_type = transport
         self._url = url
         self._command = command
-        self._args = args or ["-m", "backend.mcp_service.server"]
+        self._args = args or ["-m", "backend.tool_packages.builtin.server"]
         self._env = env or {}
         self._tools: list[dict] = []
         self._session: ClientSession | None = None

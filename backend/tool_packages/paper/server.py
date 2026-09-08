@@ -10,9 +10,9 @@ import logging
 
 from mcp.server.fastmcp import FastMCP
 
-from backend.mcp_servers.paper import sources
-from backend.mcp_servers.paper.cache import get as cache_get, set as cache_set
-from backend.mcp_servers.paper.llm import LLMNotConfigured, summarize_paper_llm
+from backend.tool_packages.paper import sources
+from backend.tool_packages.paper.cache import get as cache_get, set as cache_set
+from backend.tool_packages.paper.llm import LLMNotConfigured, summarize_paper_llm
 
 logger = logging.getLogger(__name__)
 mcp = FastMCP("paper-mcp")

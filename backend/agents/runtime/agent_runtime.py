@@ -22,7 +22,7 @@ from backend.agents.runtime.session import (
 )
 from backend.agents.runtime.session.trace_projection import TraceProjection
 from backend.core.http import get_http_session
-from backend.mcp_service.registry import get_registry
+from backend.tool_system.registry.registry import get_registry
 
 logger = logging.getLogger(__name__)
 

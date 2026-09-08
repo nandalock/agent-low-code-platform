@@ -95,7 +95,8 @@ agent-low-code-platform/
 │   ├── api/             # REST & WebSocket endpoints
 │   ├── core/            # Infrastructure: db connection & schema, JWT auth, RAG embeddings & reranker
 │   ├── engine/          # Workflow engine (builder, handlers, state, middlewares)
-│   ├── mcp_service/     # MCP client, registry & built-in server
+│   ├── tool_system/     # Tool infra: adapters (MCP client) · registry · runtime(reserved)
+│   ├── tool_packages/   # Tool implementations: paper MCP server · builtin MCP server
 │   ├── services/        # Business domains: faq · chat · memory · cache
 │   └── integrations/    # 3rd-party channel integrations (xianyu)
 ├── docs/                # design docs
@@ -139,7 +140,7 @@ Environment variables (see `docker-compose.yml`):
 
 ### 📄 Paper MCP — LLM 配置
 
-论文域 MCP（`backend/mcp_servers/paper/`，端口 `:9002`，提供 `search_papers` /
+论文域 MCP（`backend/tool_packages/paper/`，端口 `:9002`，提供 `search_papers` /
 `fetch_paper_text` / `summarize_paper` / `list_papers` 四个工具）总结论文时在
 **工具内部**调用 LLM，需要 OpenAI 兼容网关（`/v1/chat/completions`）。
 
@@ -149,7 +150,7 @@ Environment variables (see `docker-compose.yml`):
 
 ```bash
 # 复制模板为真实配置（模板会提交，真实配置已被 .gitignore 忽略）
-cp backend/mcp_servers/paper/llm.config.example.json backend/mcp_servers/paper/llm.config.json
+cp backend/tool_packages/paper/llm.config.example.json backend/tool_packages/paper/llm.config.json
 
 # 编辑三项（代码 bind-mount 到容器，改完即时生效，无需重启）
 # llm.config.json

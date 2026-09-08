@@ -2,8 +2,8 @@
 import json, traceback, logging, asyncio
 from fastapi import APIRouter, Body, HTTPException
 from backend.core.connection import get_conn
-from backend.mcp_service.client import get_mcp_client, McpClient, MCP_URL
-from backend.mcp_service.registry import get_registry
+from backend.tool_system.adapters.mcp import get_mcp_client, McpClient, MCP_URL
+from backend.tool_system.registry.registry import get_registry
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/mcp", tags=["MCP"])
