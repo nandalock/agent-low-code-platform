@@ -182,7 +182,8 @@ backend/tool_system/sandbox/
 backend/tool_system/runtime/executor.py         # + SandboxExecutor / build_sandbox_argv
 backend/tool_system/runtime/runtime.py          # executors 注册 "sandbox"
 backend/tool_system/registry/descriptor.py      # + SandboxToolConfig / sandbox 字段
-backend/tool_system/registry/registry.py        # + register_native（非 MCP 工具）
+backend/tool_system/registry/registry.py        # Provider 抽象：从所有来源收集工具
+backend/tool_system/registry/providers.py       # ToolProvider / MCPToolProvider / BuiltinToolProvider
 backend/tool_system/context/context.py          # + sandbox_policy（策略下传）
 backend/agents/runtime/agent_loop.py            # 解析策略 + 落地 SessionHeader.cwd
 backend/api/mcp.py                              # 工具列表/详情含原生工具
@@ -382,6 +383,24 @@ assert not any(a in argv for a in _FORBIDDEN), "模型参数不得影响隔离�
 | 无可用后端 / daemon 不可达 | `confine()` 抛 `SandboxUnavailableError`，命令永不 spawn |
 | 工作区在 daemon 侧不可见 | 功能探测失败 → `SandboxUnavailableError` |
 | runner 启动后拒绝 | 结构化 `runner_failure_rules` 匹配 → 归为 `runner_failed`，不当作普通命令失败 |
+
+### 9.4 能力开关（`settings.sandbox.enabled`）
+
+「沙箱开不开」是**沙箱子系统自己的设置**，不归平台层解释：值存在 `settings` 表
+（`namespace='sandbox'`），缺省 `true`。停用时**注销**内建工具（bash / python）——
+模型完全看不到它们，而不是看得到但一调就失败。
+
+| 方面 | 设计 |
+|---|---|
+| 归属 | `sandbox/runtime.py` 提供 `is_enabled()` / `set_enabled()`；`main.py` 只问结果、不解释原因 |
+| 生效 | **live**——`get_schemas_for()` 每请求重算，切换后下一轮对话即生效，无需重启 |
+| 绑定 | 停用期间 `agent_tool_bindings` 不动；重新启用即恢复，不需要重新勾选 |
+| API | `GET/PUT /api/tools/capabilities/sandbox` |
+| UI | 工具绑定面板顶部一个开关（与「哪个 agent 能用」是两层） |
+
+**不做通用 settings seam**：当前只有一个可配置项，DeepSeek 那套 namespace 注册 +
+schema 序列化 + 三层解析是 SDK 形态的投入（他们要服务几十个第三方插件）。等出现
+**第二个**需要配置的子系统时再抽象——那时才知道 seam 该长什么样。
 
 ## 10. 消费方：SandboxExecutor
 

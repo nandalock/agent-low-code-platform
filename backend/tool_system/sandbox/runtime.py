@@ -6,9 +6,11 @@ AgentLoop 调用 :func:`session_policy` 拿到本会话的执行策略。
 ``tool_system`` 不依赖 ``agents`` 层，因此这里只吃原始值（session_id / cwd），
 不接收 Session 对象。
 """
+import json
 import logging
 import os
 
+from backend.core.connection import get_conn
 from backend.tool_system.registry.descriptor import SandboxToolConfig, ToolDescriptor
 from backend.tool_system.sandbox.backends.docker import DEFAULT_SANDBOX_IMAGE, DockerProvider
 from backend.tool_system.sandbox.policy import DEFAULT_MODE_ENV, resolve_policy, validate_mode
@@ -23,6 +25,14 @@ from backend.tool_system.sandbox.workspace import (
 logger = logging.getLogger(__name__)
 
 _provider: SandboxProvider | None = None
+
+#: 设置 namespace —— 沙箱开关的值归本子系统所有（平台层只问结果，不解释原因）
+SETTINGS_NS = "sandbox"
+
+#: 内建沙箱工具名（停用时注销它们）
+BUILTIN_SANDBOX_TOOLS = ("bash", "python")
+
+_enabled: bool | None = None
 
 
 # ── provider 单例 ──
@@ -134,7 +144,7 @@ def register_builtin_sandbox_tools(
     """把内置沙箱工具（bash / python）注册进 Registry。
 
     工具本身始终注册；能否执行取决于沙箱是否装配（未装配时执行 fail-closed）。
-    绑定仍走 ``agent_mcp_bindings``（按 tool_name），API / UI 无需改动。
+    绑定仍走 ``agent_tool_bindings``（按 tool_name），API / UI 无需改动。
 
     Returns:
         注册的工具名列表。
@@ -158,3 +168,71 @@ def register_builtin_sandbox_tools(
         names.append(name)
     logger.info(f"已注册沙箱工具: {names}")
     return names
+
+
+# ── 能力开关（settings.sandbox.enabled） ──
+#
+# 「沙箱开不开」是沙箱子系统自己的设置，不归平台层解释。停用时**注销**内建工具，
+# 于是模型完全看不到它们（而不是看得到但一调就失败）。绑定记录保留——重新启用
+# 即恢复，不需要重新勾选。
+
+
+def _load_enabled() -> bool:
+    """从 settings 读开关；缺省 true。
+
+    读失败也按启用处理：开关是「能力可见性」，不是约束本身——沙箱执行侧无论
+    如何都 fail-closed，所以这里放宽不会导致裸跑。
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM settings WHERE namespace = %s", (SETTINGS_NS,))
+                row = cur.fetchone()
+        raw = (row or {}).get("value")
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        return bool((raw or {}).get("enabled", True))
+    except Exception as e:
+        logger.warning(f"读取沙箱开关失败，按启用处理: {e}")
+        return True
+
+
+def _save_enabled(enabled: bool) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO settings (namespace, value, updated_at) VALUES (%s, %s::jsonb, now()) "
+                "ON CONFLICT (namespace) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+                (SETTINGS_NS, json.dumps({"enabled": enabled})),
+            )
+        conn.commit()
+
+
+def is_enabled() -> bool:
+    """沙箱能力当前是否启用（进程内缓存，写入侧同步刷新）。"""
+    global _enabled
+    if _enabled is None:
+        _enabled = _load_enabled()
+    return _enabled
+
+
+def set_enabled(enabled: bool) -> None:
+    """启停沙箱能力：写 settings + 立即重注册工具（下一轮对话即生效，无需重启）。"""
+    global _enabled
+    _enabled = enabled
+    _save_enabled(enabled)
+    apply_enabled(enabled)
+    logger.info(f"沙箱能力已{'启用' if enabled else '停用'}")
+
+
+def apply_enabled(enabled: bool) -> None:
+    """按开关调整内建工具的注册状态（模型可见性随之变化）。"""
+    try:
+        from backend.tool_system.registry.registry import get_registry
+        registry = get_registry()
+    except RuntimeError:
+        return  # Registry 未装配（未启动 / 单测）
+    if enabled:
+        register_builtin_sandbox_tools(registry)
+    else:
+        registry.unregister_builtin(BUILTIN_SANDBOX_TOOLS)

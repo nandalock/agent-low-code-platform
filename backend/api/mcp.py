@@ -1,13 +1,23 @@
 """MCP API — 服务管理 + 代理 + 热拔插绑定"""
 import json, traceback, logging, asyncio
 from fastapi import APIRouter, Body, HTTPException
+from backend.api.tools import api_list_bindings, api_save_bindings
 from backend.core.connection import get_conn
 from backend.tool_system.adapters.mcp import get_mcp_client, McpClient, MCP_URL
+from backend.tool_system.registry.providers import MCPToolProvider
 from backend.tool_system.registry.registry import get_registry
 from backend.tool_system.runtime.runtime import get_tool_runtime
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/mcp", tags=["MCP"])
+
+
+def _mcp_provider() -> MCPToolProvider:
+    """MCP 工具来源。Provider 抽象后 Registry 不再暴露 MCP 内部，MCP 专属管理走这里。"""
+    provider = get_registry().provider_of(MCPToolProvider)
+    if provider is None:
+        raise HTTPException(503, "MCP 工具来源未装配")
+    return provider  # type: ignore[return-value]
 
 
 # ━━ MCP 服务 CRUD ━━
@@ -103,8 +113,7 @@ async def api_import_servers(payload: dict = Body(...)):
         # 尝试连接并索引工具
         tools_count = 0
         try:
-            registry = get_registry()
-            tools_count = await registry.connect_server(dict(
+            tools_count = await _mcp_provider().connect(dict(
                 id=sid, name=name, transport=transport,
                 url=cfg.get("url"), command=cfg.get("command"),
                 args=cfg.get("args", []),
@@ -152,13 +161,13 @@ async def api_server_tools(sid: int):
             client = await _get_client_for(sid)
             return client.tools
         else:
-            # stdio: 用 registry 查已索引的工具，不重复连接（避免触发 npx 下载）
-            registry = get_registry()
-            tools = [v["schema"] for v in registry._index.values() if v["server_id"] == sid]
+            # stdio: 查已索引的工具，不重复连接（避免触发 npx 下载）
+            provider = _mcp_provider()
+            tools = [d.schema for d in provider.descriptors_of_server(sid)]
             if tools:
                 return tools
             # 还没索引，尝试连一次
-            tools_count = await registry.connect_server(srv)
+            tools_count = await provider.connect(srv)
             if tools_count > 0:
                 return api_server_tools(sid)
             raise HTTPException(502, "stdio 服务无可用工具")
@@ -250,36 +259,25 @@ async def api_list_tools():
 async def api_list_all_tools():
     """列出所有已注册 MCP 工具（含来源 server 信息），尝试连接未索引的 server"""
     registry = get_registry()
-    servers = registry._list_servers()
-    name_map = {s["id"]: s["name"] for s in servers}
+    provider = registry.provider_of(MCPToolProvider)
+    if provider is not None:
+        # 尝试索引尚未连接的 server（本地立即成功，远程/stdio 失败则跳过）
+        for srv in provider.list_servers():
+            try:
+                await provider.connect(srv)
+            except Exception:
+                continue
 
-    # 尝试索引尚未连接的 server（本地立即成功，远程/stdio 失败则跳过）
-    for srv in servers:
-        try:
-            await registry.connect_server(srv)
-        except Exception:
-            continue
-
+    # 所有来源合并后的统一列表：内建工具与 MCP 工具平级，只是来源标签不同
     tools = []
-    for name, entry in registry._index.items():
-        schema = entry.get("schema") or {}
-        tools.append({
-            "name": name,
-            "description": schema.get("description", ""),
-            "inputSchema": schema.get("inputSchema", {}),
-            "server_id": entry.get("server_id"),
-            "server_name": name_map.get(entry.get("server_id"), f"server-{entry.get('server_id')}"),
-            "transport": entry.get("transport", "http"),
-        })
-    # 原生工具（如沙箱 bash / python）：无 MCP server，归到 "builtin" 分组
-    for d in registry.native_descriptors():
+    for d in registry.descriptors():
         schema = d.schema or {}
         tools.append({
             "name": d.name,
             "description": schema.get("description", ""),
             "inputSchema": schema.get("inputSchema", {}),
             "server_id": d.server_id,
-            "server_name": "builtin",
+            "server_name": registry.source_label(d),
             "transport": d.transport or "native",
         })
     tools.sort(key=lambda t: (t["server_name"], t["name"]))
@@ -290,32 +288,17 @@ async def api_list_all_tools():
 async def api_get_tool(name: str):
     """查询单个工具信息（未索引则懒加载）"""
     registry = get_registry()
-    native = next((d for d in registry.native_descriptors() if d.name == name), None)
-    if native is not None:
-        schema = native.schema or {}
-        return {
-            "name": native.name,
-            "description": schema.get("description", ""),
-            "inputSchema": schema.get("inputSchema", {}),
-            "server_id": native.server_id,
-            "server_name": "builtin",
-            "transport": native.transport or "native",
-        }
-    entry = registry._index.get(name)
-    if not entry:
-        entry = await registry._lazy_load_tool(name)
-    if not entry:
+    d = await registry.resolve(name)
+    if d is None:
         raise HTTPException(404, f"工具不存在: {name}")
-    schema = entry.get("schema") or {}
-    servers = registry._list_servers()
-    name_map = {s["id"]: s["name"] for s in servers}
+    schema = d.schema or {}
     return {
-        "name": name,
+        "name": d.name,
         "description": schema.get("description", ""),
         "inputSchema": schema.get("inputSchema", {}),
-        "server_id": entry.get("server_id"),
-        "server_name": name_map.get(entry.get("server_id"), f"server-{entry.get('server_id')}"),
-        "transport": entry.get("transport", "http"),
+        "server_id": d.server_id,
+        "server_name": registry.source_label(d),
+        "transport": d.transport or "native",
     }
 
 
@@ -331,26 +314,9 @@ async def api_call_tool(name: str, args: dict = Body(...)):
     return result
 
 
-# ━━ 热拔插绑定 ━━
+# ━━ 热拔插绑定（兼容别名）━━
+# 绑定与工具来源正交，已迁到 /api/tools/bindings（api/tools.py）；
+# 这里保留旧路径，旧客户端与既有文档不受影响。
 
-@router.get("/bindings")
-def api_list_bindings():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT agent_key, tool_name FROM agent_mcp_bindings ORDER BY agent_key")
-            rows = cur.fetchall()
-    result: dict[str, list[str]] = {}
-    for r in rows:
-        result.setdefault(r["agent_key"], []).append(r["tool_name"])
-    return result
-
-
-@router.put("/bindings/{agent_key}")
-def api_save_bindings(agent_key: str, tools: list[str] = Body(...)):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM agent_mcp_bindings WHERE agent_key = %s", (agent_key,))
-            for tn in tools:
-                cur.execute("INSERT INTO agent_mcp_bindings (agent_key, tool_name) VALUES (%s, %s)", (agent_key, tn))
-        conn.commit()
-    return {"ok": True, "agent_key": agent_key, "tools": tools}
+router.add_api_route("/bindings", api_list_bindings, methods=["GET"])
+router.add_api_route("/bindings/{agent_key}", api_save_bindings, methods=["PUT"])

@@ -4,7 +4,7 @@ import { useState, useRef, useEffect } from 'react';
 import { useParams } from 'next/navigation';
 import { T, S, inputField, labelField, btnPrimary } from '@/app/theme';
 import { PanelLeftClose, PanelLeftOpen, Brain, ChevronDown, ChevronRight } from 'lucide-react';
-import McpToolBinding from '../_components/McpToolBinding';
+import ToolBinding from '../_components/ToolBinding';
 import CachePolicyEditor, { type CachePolicyData } from '../_components/CachePolicyEditor';
 import TrajectoryTimeline from '../_components/TrajectoryTimeline';
 import TraceSummaryRow from '../_components/TraceSummaryRow';
@@ -458,7 +458,7 @@ export default function AgentDetailPage() {
           </label>
 
           <div style={{ paddingTop:S.sm }}>
-            <McpToolBinding agentKey={agentKey} />
+            <ToolBinding agentKey={agentKey} />
           </div>
 
           <div style={{ fontSize:11, fontWeight:600, color:T.secondary, letterSpacing:'0.04em', textTransform:'uppercase', marginTop:S.sm }}>回复设置</div>

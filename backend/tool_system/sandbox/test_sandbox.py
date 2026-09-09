@@ -557,6 +557,28 @@ def test_trajectory_projection_tool_node_has_sandbox_key():
     assert "sandbox" in node and node["sandbox"] is None
 
 
+def test_registry_hot_registered_builtin_is_listed():
+    """内建工具注册后必须同时进统一索引（回归：曾在 init() 后注册而列表里看不到）。"""
+    from backend.tool_system.registry.registry import ToolRegistry
+
+    r = ToolRegistry()
+    r.register_builtin(_descriptor())
+    assert [d.name for d in r.descriptors()] == ["bash"]
+    assert r.source_label(r.descriptors()[0]) == "builtin"
+
+
+def test_registry_unregister_builtin():
+    """能力停用：注销后工具从统一索引消失（模型看不到，而不是调用才失败）。"""
+    from backend.tool_system.registry.registry import ToolRegistry
+
+    r = ToolRegistry()
+    r.register_builtin(_descriptor())
+    assert [d.name for d in r.descriptors()] == ["bash"]
+    r.unregister_builtin(["bash"])
+    assert r.descriptors() == []
+    r.unregister_builtin(["bash", "nonexistent"])  # 幂等
+
+
 # ── 运行器 ──
 
 
