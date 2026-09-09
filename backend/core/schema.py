@@ -142,11 +142,20 @@ TABLES_DDL = {
             PRIMARY KEY (tenant_id, user_id)
         )
     """,
-    "agent_mcp_bindings": """
-        CREATE TABLE IF NOT EXISTS agent_mcp_bindings (
+    "agent_tool_bindings": """
+        CREATE TABLE IF NOT EXISTS agent_tool_bindings (
             agent_key  TEXT NOT NULL,
             tool_name  TEXT NOT NULL,
             PRIMARY KEY (agent_key, tool_name)
+        )
+    """,
+    # 运维可调参数的归属表：按 namespace 分节（值归子系统所有，见 sandbox/runtime.py）。
+    # 不是通用 settings seam——只在出现「需要 UI 切换且立即生效」的参数时才用。
+    "settings": """
+        CREATE TABLE IF NOT EXISTS settings (
+            namespace   TEXT PRIMARY KEY,
+            value       JSONB NOT NULL DEFAULT '{}',
+            updated_at  TIMESTAMPTZ DEFAULT now()
         )
     """,
     "mcp_servers": """
@@ -293,6 +302,17 @@ MIGRATIONS = [
       IF EXISTS (SELECT 1 FROM information_schema.columns
                  WHERE table_name='agent_definitions' AND column_name='desc') THEN
         ALTER TABLE agent_definitions RENAME COLUMN "desc" TO description;
+      END IF;
+    END $$;""",
+    # 绑定与工具来源正交（内建工具也走同一张表）→ 表名去掉 MCP 前缀。
+    # TABLES_DDL 先建好新表（空），这里把旧表数据搬过去再删旧表；幂等。
+    """DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='agent_mcp_bindings') THEN
+        INSERT INTO agent_tool_bindings (agent_key, tool_name)
+          SELECT agent_key, tool_name FROM agent_mcp_bindings
+          ON CONFLICT DO NOTHING;
+        DROP TABLE agent_mcp_bindings;
       END IF;
     END $$;""",
     "ALTER TABLE agent_definitions ADD COLUMN IF NOT EXISTS agent_type VARCHAR(20) NOT NULL DEFAULT 'agent'",

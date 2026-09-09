@@ -11,6 +11,7 @@ from backend.api.agents import router as agents_router
 from backend.api.chat import router as chat_router
 from backend.api.memory import router as memory_router
 from backend.api.mcp import router as mcp_router
+from backend.api.tools import router as tools_router
 from backend.api.workflow import router as workflow_router
 
 app = FastAPI(title="agent-low-code-platform")
@@ -29,6 +30,7 @@ app.include_router(agents_router)
 app.include_router(chat_router)
 app.include_router(memory_router)
 app.include_router(mcp_router)
+app.include_router(tools_router)
 app.include_router(workflow_router)
 
 @app.on_event("startup")
@@ -111,12 +113,15 @@ async def startup():
         import logging
         logging.getLogger(__name__).warning(f"沙箱未装配（沙箱工具将拒绝执行）: {e}")
 
-    # 注册内置沙箱工具（bash / python）。注册始终进行：能否执行取决于 provider，
-    # 而绑定仍走 agent_mcp_bindings——只有显式绑定的 agent 才会看到它们。
+    # 按能力开关注册内建沙箱工具（bash / python）：停用时不注册 → 模型完全看不到。
+    # 开关值归沙箱子系统所有（settings.sandbox.enabled），这里只问结果、不解释原因。
     try:
-        from backend.tool_system.registry.registry import get_registry
-        from backend.tool_system.sandbox.runtime import register_builtin_sandbox_tools
-        register_builtin_sandbox_tools(get_registry())
+        from backend.tool_system.sandbox.runtime import apply_enabled, is_enabled
+        _sandbox_on = is_enabled()
+        apply_enabled(_sandbox_on)
+        if not _sandbox_on:
+            import logging
+            logging.getLogger(__name__).info("沙箱能力已停用（settings.sandbox.enabled=false）")
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"沙箱工具注册失败: {e}")

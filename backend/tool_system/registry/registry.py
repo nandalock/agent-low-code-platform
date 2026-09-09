@@ -1,56 +1,83 @@
-"""MCP 工具全局注册表 — 启动时连所有 MCP server，建 {tool_name → info} 索引
+"""工具注册表 — 从所有 ToolProvider 收集工具，产出 ToolDescriptor
 
-职责边界（本阶段拆分后）：
-  Registry 只负责 metadata / schema / resolve（产出 ToolDescriptor）；
-  执行 / MCP call / transport 调度全部归 ToolRuntime + Executor（见 tool_system/runtime/）。
-  Registry 用 McpClient 只为了「发现工具列表」，不参与任何工具调用。
+职责边界（Provider 抽象后）：
+  Registry   只做「收集 + 合并 + 解析」：从注册的 ToolProvider 拿到描述，合并成
+             一张 {name → ToolDescriptor} 表。它不再知道工具来自 MCP 还是代码。
+  Provider   一种工具来源（MCPToolProvider / BuiltinToolProvider，见 providers.py）。
+  Runtime    按 descriptor.type 分发到 executor（见 tool_system/runtime/）。
 
-支持两种传输模式（发现阶段）:
-  - HTTP: 长连接，client 缓存复用
-  - STDIO: 按需连接，拉完 schema 即断
+`type` 是「执行器选择键」（"mcp" | "sandbox"）：新增执行器只需产出新的 type
+并在 ToolRuntime 注册，Registry 无需改动。
 """
-import json, logging
-from backend.core.connection import get_conn
-from backend.tool_system.adapters.mcp import McpClient, get_mcp_client, MCP_URL
+import logging
+from dataclasses import replace
+
 from backend.tool_system.registry.descriptor import ToolDescriptor
+from backend.tool_system.registry.providers import (
+    BuiltinToolProvider,
+    MCPToolProvider,
+    ToolProvider,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _parse_stdio_config(srv: dict) -> dict:
-    """解析 DB 里的 stdio 配置（args / env 可能是 JSON 字符串）"""
-    args = srv.get("args") or []
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except (json.JSONDecodeError, TypeError):
-            args = []
-    env = srv.get("env") or {}
-    if isinstance(env, str):
-        try:
-            env = json.loads(env)
-        except (json.JSONDecodeError, TypeError):
-            env = {}
-    return {"command": srv.get("command", ""), "args": args, "env": env}
-
-
 class ToolRegistry:
-    """全局 MCP 工具索引 + Agent 绑定查询 + ToolDescriptor 解析"""
+    """工具来源的收集器 + 统一索引 + Agent 绑定查询"""
 
-    def __init__(self):
-        # tool_name → {server_id, schema, transport}
-        self._index: dict[str, dict] = {}
-        # tool_name → ToolDescriptor：非 MCP 工具（native / sandbox），由装配层注册。
-        # 与 _index 分开存放：它们没有 MCP server，也不参与发现 / 懒加载。
-        self._native: dict[str, ToolDescriptor] = {}
-        # server_id → server config（索引时缓存，resolve 时填进 ToolDescriptor）
-        self._server_configs: dict[int, dict] = {}
+    def __init__(self, providers: list[ToolProvider] | None = None):
+        # name → ToolDescriptor（所有来源合并后的唯一索引）
+        self._by_name: dict[str, ToolDescriptor] = {}
+        # 工具来源；默认装配 MCP（外部）与内建（代码）两种
+        self._providers: list[ToolProvider] = providers or [MCPToolProvider(), BuiltinToolProvider()]
         # 工具进度查询（可选扩展点）：tool_name → fn(args) -> stage_str
-        # 领域 MCP 可在装配层注册，AgentRuntime 执行工具期间轮询 → tool_progress 事件
         self._progress_queries: dict[str, object] = {}
-        # 工具执行超时（可选扩展点）：tool_name → 秒；未声明的 Tool 由 Executor 使用默认值
+        # 工具执行超时（可选扩展点）：tool_name → 秒；未声明的由 Executor 用默认值
         self._tool_timeouts: dict[str, float] = {}
         self._ready = False
+
+    # ── 来源注册 ──
+
+    def register_provider(self, provider: ToolProvider) -> None:
+        """注册一个工具来源；同名来源可并存（收集时按注册序合并）。"""
+        self._providers.append(provider)
+
+    def provider_of(self, cls: type[ToolProvider]) -> ToolProvider | None:
+        """按类型取来源（MCP 专属管理接口用）。"""
+        return next((p for p in self._providers if isinstance(p, cls)), None)
+
+    def _builtin(self) -> BuiltinToolProvider:
+        p = self.provider_of(BuiltinToolProvider)
+        if p is None:
+            p = BuiltinToolProvider()
+            self.register_provider(p)
+        return p  # type: ignore[return-value]
+
+    def register_builtin(self, descriptor: ToolDescriptor) -> None:
+        """注册一个内建工具（代码声明的能力，如沙箱 bash / python）。
+
+        立即写入统一索引：内建工具通常在 ``init()`` 之后注册（装配顺序），
+        只登记到 provider 的话，``descriptors()`` 看不到它（``resolve()`` 尚能
+        靠懒加载兜底，于是出现「单查得到、列表里没有」的割裂）。
+        """
+        self._builtin().register(descriptor)
+        self._by_name[descriptor.name] = self._with_timeout(descriptor)
+
+    def register_native(self, descriptor: ToolDescriptor) -> None:
+        """``register_builtin`` 的旧名（保留兼容）。"""
+        self.register_builtin(descriptor)
+
+    def unregister_builtin(self, names) -> None:
+        """注销内建工具：同时从 provider 与统一索引摘掉。
+
+        这是「能力停用」的落地方式——工具从索引消失后，``get_schemas_for()``
+        就不会再把它发给模型（模型看不到 ≠ 看得到但调用失败）。
+        """
+        builtin = self.provider_of(BuiltinToolProvider)
+        if builtin is not None:
+            builtin.unregister(names)
+        for n in names:
+            self._by_name.pop(n, None)
 
     # ── 工具进度查询（领域扩展点） ──
 
@@ -71,152 +98,79 @@ class ToolRegistry:
     def get_tool_timeout(self, tool_name: str) -> float | None:
         return self._tool_timeouts.get(tool_name)
 
-    # ── 非 MCP 工具注册（native / sandbox） ──
+    # ── 收集 ──
 
-    def register_native(self, descriptor: ToolDescriptor) -> None:
-        """注册一个非 MCP 工具（如沙箱 bash / python）。同名覆盖，不影响 MCP 索引。
-
-        绑定仍走 ``agent_mcp_bindings``（按 tool_name），因此绑定 API / UI 无需改动。
-        """
-        self._native[descriptor.name] = descriptor
-
-    def native_descriptors(self) -> list[ToolDescriptor]:
-        """已注册的原生工具（只读副本，可观测用）"""
-        return list(self._native.values())
-
-    async def init(self):
-        """启动时：遍历所有 server，连上并索引工具。HTTP 远程延迟加载。"""
-        servers = self._list_servers()
-        for srv in servers:
-            transport = srv.get("transport", "http")
-            url = srv.get("url")
-
-            # HTTP 远程 → 延迟加载
-            if transport == "http" and url and not url.startswith("http://localhost") and not url.startswith("http://127.0.0.1"):
-                logger.info(f"MCP 服务 [{srv['id']}] {srv['name']} ({url}) — 远程，延迟加载")
-                continue
-
+    async def init(self) -> None:
+        """从所有来源收集工具，合并成统一索引。单个来源失败不影响其他来源。"""
+        for provider in self._providers:
             try:
-                await self._connect_and_index(srv)
+                for d in await provider.discover():
+                    self._by_name[d.name] = self._with_timeout(d)
             except Exception as e:
-                logger.warning(f"MCP 服务 [{srv['id']}] {srv['name']} 连接失败: {e}")
+                logger.warning(f"工具来源 [{provider.name}] 发现失败: {e}")
         self._ready = True
-        logger.info(f"ToolRegistry 初始化完成，共 {len(self._index)} 个工具")
+        logger.info(f"ToolRegistry 初始化完成，共 {len(self._by_name)} 个工具")
 
-    async def connect_server(self, srv: dict) -> int:
-        """外部 API 调用：连接一个 server 并索引其工具。返回工具数。已连接过则跳过（幂等）。"""
-        sid = srv["id"]
-        # 幂等：该 server 已连接并索引过则直接返回，避免 tools/all 每次全量重连
-        if sid in self._server_configs:
-            return sum(1 for v in self._index.values() if v["server_id"] == sid)
-        try:
-            await self._connect_and_index(srv)
-        except Exception as e:
-            logger.warning(f"connect_server [{srv.get('name')}] 失败: {e}")
-            raise
-        return sum(1 for v in self._index.values() if v["server_id"] == srv["id"])
+    def _with_timeout(self, d: ToolDescriptor) -> ToolDescriptor:
+        """把 Registry 级声明的超时盖到描述上（描述是冻结的，用 replace 派生）。"""
+        t = self._tool_timeouts.get(d.name)
+        return d if t is None or t == d.timeout else replace(d, timeout=t)
 
-    async def _connect_and_index(self, srv: dict):
-        """连接单个 server，拉工具列表写入 _index，并缓存 server 配置供 resolve 出描述"""
-        sid = srv["id"]
-        transport = srv.get("transport", "http")
+    # ── 读取面 ──
 
-        if transport == "http":
-            url = srv.get("url") or MCP_URL
-            client = await get_mcp_client(url)  # adapter 按 URL 缓存连接，executor 复用同一实例
-            self._server_configs[sid] = {"id": sid, "name": srv["name"], "transport": transport, "url": url}
-            for t in client.tools:
-                self._index[t["name"]] = {"server_id": sid, "schema": t, "transport": transport}
-        else:
-            # stdio: 临时连接拉 schema，然后断开
-            cfg = _parse_stdio_config(srv)
-            self._server_configs[sid] = {"id": sid, "name": srv["name"], "transport": transport, **cfg}
-            client = McpClient(transport="stdio", **cfg)
-            try:
-                await client.connect()
-                for t in client.tools:
-                    self._index[t["name"]] = {"server_id": sid, "schema": t, "transport": transport}
-            finally:
-                await client.disconnect()
+    def descriptors(self) -> list[ToolDescriptor]:
+        """全部工具描述（副本，只读）。"""
+        return list(self._by_name.values())
 
-        logger.info(f"MCP 服务 [{sid}] {srv['name']} — 已索引 ({transport})")
+    def source_label(self, descriptor: ToolDescriptor) -> str:
+        """该工具在 UI 中的来源显示名（"builtin" / MCP server 名）。"""
+        mcp = self.provider_of(MCPToolProvider)
+        if descriptor.type == "mcp" and mcp is not None:
+            return mcp.label_of(descriptor)
+        builtin = self.provider_of(BuiltinToolProvider)
+        return builtin.name if builtin is not None else descriptor.type
 
-    @staticmethod
-    def _list_servers() -> list[dict]:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id, name, transport, url, command, args, env FROM mcp_servers ORDER BY id")
-                return [dict(r) for r in cur.fetchall()]
+    async def resolve(self, tool_name: str) -> ToolDescriptor | None:
+        """解析工具 → ToolDescriptor（未索引则依次问各来源懒加载）。
+
+        这是 Registry 对执行侧的唯一出口：产出描述即止，不执行、不碰 transport。
+        """
+        d = self._by_name.get(tool_name)
+        if d is not None:
+            return d
+        for provider in self._providers:
+            d = await provider.lazy_load(tool_name)
+            if d is not None:
+                d = self._with_timeout(d)
+                self._by_name[d.name] = d
+                return d
+        return None
 
     # ── Agent 绑定查询 ──
 
     @staticmethod
     def get_bindings(agent_key: str) -> list[str]:
-        """查 agent_mcp_bindings 表，返回该 agent 绑定的 tool_name 列表"""
+        """查 agent_tool_bindings 表，返回该 agent 绑定的 tool_name 列表。
+
+        绑定与工具来源正交：内建工具（沙箱 bash / python）与 MCP 工具走同一张表。
+        """
+        from backend.core.connection import get_conn
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT tool_name FROM agent_mcp_bindings WHERE agent_key = %s ORDER BY tool_name",
+                    "SELECT tool_name FROM agent_tool_bindings WHERE agent_key = %s ORDER BY tool_name",
                     (agent_key,),
                 )
                 return [r["tool_name"] for r in cur.fetchall()]
 
-    # ── 给 AgentRuntime 用 ──
-
     async def get_schemas_for(self, agent_key: str) -> list[dict]:
         """返回该 agent 绑定工具的 OpenAI function calling 格式 schemas"""
-        tool_names = self.get_bindings(agent_key)
         schemas = []
-        for name in tool_names:
-            native = self._native.get(name)
-            if native is not None:
-                schemas.append(_to_openai_function(native.schema))
-                continue
-            entry = self._index.get(name)
-            if not entry:
-                entry = await self._lazy_load_tool(name)
-            if entry:
-                schemas.append(_to_openai_function(entry["schema"]))
+        for name in self.get_bindings(agent_key):
+            d = await self.resolve(name)
+            if d is not None:
+                schemas.append(_to_openai_function(d.schema))
         return schemas
-
-    async def resolve(self, tool_name: str) -> ToolDescriptor | None:
-        """解析工具 → ToolDescriptor（未索引则懒加载）。
-
-        这是 Registry 对执行侧的唯一出口：产出描述即止，不执行、不碰 transport。
-        显式注册的原生工具优先于 MCP 索引。
-        """
-        native = self._native.get(tool_name)
-        if native is not None:
-            return native
-
-        entry = self._index.get(tool_name)
-        if not entry:
-            entry = await self._lazy_load_tool(tool_name)
-        if not entry:
-            return None
-
-        return ToolDescriptor(
-            name=tool_name,
-            type="mcp",
-            transport=entry.get("transport", "http"),
-            server_id=entry["server_id"],
-            schema=entry["schema"],
-            server=self._server_configs.get(entry["server_id"], {}),
-            timeout=self.get_tool_timeout(tool_name),
-        )
-
-    async def _lazy_load_tool(self, tool_name: str) -> dict | None:
-        """懒加载：遍历所有 MCP server，找到包含该 tool 的 server 并索引"""
-        servers = self._list_servers()
-        for srv in servers:
-            try:
-                await self._connect_and_index(srv)
-                if tool_name in self._index:
-                    logger.info(f"懒加载工具 [{tool_name}] 来自 {srv['name']}")
-                    return self._index[tool_name]
-            except Exception as e:
-                logger.warning(f"懒加载 MCP [{srv['name']}] 失败: {e}")
-        return None
 
 
 def _sanitize_schema(schema: dict) -> dict:
@@ -250,7 +204,7 @@ def _sanitize_schema(schema: dict) -> dict:
 
 
 def _to_openai_function(schema: dict) -> dict:
-    """MCP inputSchema → OpenAI function calling 格式"""
+    """工具 schema（含 name / description / inputSchema）→ OpenAI function 格式"""
     raw = schema.get("inputSchema", {})
     return {
         "type": "function",
