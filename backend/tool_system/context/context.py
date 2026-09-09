@@ -15,6 +15,8 @@ Tool / Executor 必须能在 context 为 None 时照常工作。
 from dataclasses import dataclass
 from typing import Any
 
+from backend.tool_system.sandbox.vocabulary import SandboxExecutionPolicy
+
 
 @dataclass(frozen=True)
 class ToolContext:
@@ -25,3 +27,6 @@ class ToolContext:
     user_id: str | None = None      # 终端用户标识（当前调用链未携带 → None）
     trace_id: str | None = None     # 运行追踪 id（当前调用链未携带 → None）
     event_sink: Any | None = None   # 预留：Tool 事件出口（本阶段不发送任何事件）
+    # 本会话一次调用的沙箱执行策略（AgentLoop 解析后下传）。非沙箱工具忽略；
+    # 沙箱工具缺失该字段时 fail-closed（不执行）。
+    sandbox_policy: SandboxExecutionPolicy | None = None

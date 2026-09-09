@@ -271,6 +271,17 @@ async def api_list_all_tools():
             "server_name": name_map.get(entry.get("server_id"), f"server-{entry.get('server_id')}"),
             "transport": entry.get("transport", "http"),
         })
+    # 原生工具（如沙箱 bash / python）：无 MCP server，归到 "builtin" 分组
+    for d in registry.native_descriptors():
+        schema = d.schema or {}
+        tools.append({
+            "name": d.name,
+            "description": schema.get("description", ""),
+            "inputSchema": schema.get("inputSchema", {}),
+            "server_id": d.server_id,
+            "server_name": "builtin",
+            "transport": d.transport or "native",
+        })
     tools.sort(key=lambda t: (t["server_name"], t["name"]))
     return tools
 
@@ -279,6 +290,17 @@ async def api_list_all_tools():
 async def api_get_tool(name: str):
     """查询单个工具信息（未索引则懒加载）"""
     registry = get_registry()
+    native = next((d for d in registry.native_descriptors() if d.name == name), None)
+    if native is not None:
+        schema = native.schema or {}
+        return {
+            "name": native.name,
+            "description": schema.get("description", ""),
+            "inputSchema": schema.get("inputSchema", {}),
+            "server_id": native.server_id,
+            "server_name": "builtin",
+            "transport": native.transport or "native",
+        }
     entry = registry._index.get(name)
     if not entry:
         entry = await registry._lazy_load_tool(name)

@@ -40,6 +40,9 @@ class ToolRegistry:
     def __init__(self):
         # tool_name → {server_id, schema, transport}
         self._index: dict[str, dict] = {}
+        # tool_name → ToolDescriptor：非 MCP 工具（native / sandbox），由装配层注册。
+        # 与 _index 分开存放：它们没有 MCP server，也不参与发现 / 懒加载。
+        self._native: dict[str, ToolDescriptor] = {}
         # server_id → server config（索引时缓存，resolve 时填进 ToolDescriptor）
         self._server_configs: dict[int, dict] = {}
         # 工具进度查询（可选扩展点）：tool_name → fn(args) -> stage_str
@@ -67,6 +70,19 @@ class ToolRegistry:
 
     def get_tool_timeout(self, tool_name: str) -> float | None:
         return self._tool_timeouts.get(tool_name)
+
+    # ── 非 MCP 工具注册（native / sandbox） ──
+
+    def register_native(self, descriptor: ToolDescriptor) -> None:
+        """注册一个非 MCP 工具（如沙箱 bash / python）。同名覆盖，不影响 MCP 索引。
+
+        绑定仍走 ``agent_mcp_bindings``（按 tool_name），因此绑定 API / UI 无需改动。
+        """
+        self._native[descriptor.name] = descriptor
+
+    def native_descriptors(self) -> list[ToolDescriptor]:
+        """已注册的原生工具（只读副本，可观测用）"""
+        return list(self._native.values())
 
     async def init(self):
         """启动时：遍历所有 server，连上并索引工具。HTTP 远程延迟加载。"""
@@ -152,6 +168,10 @@ class ToolRegistry:
         tool_names = self.get_bindings(agent_key)
         schemas = []
         for name in tool_names:
+            native = self._native.get(name)
+            if native is not None:
+                schemas.append(_to_openai_function(native.schema))
+                continue
             entry = self._index.get(name)
             if not entry:
                 entry = await self._lazy_load_tool(name)
@@ -163,7 +183,12 @@ class ToolRegistry:
         """解析工具 → ToolDescriptor（未索引则懒加载）。
 
         这是 Registry 对执行侧的唯一出口：产出描述即止，不执行、不碰 transport。
+        显式注册的原生工具优先于 MCP 索引。
         """
+        native = self._native.get(tool_name)
+        if native is not None:
+            return native
+
         entry = self._index.get(tool_name)
         if not entry:
             entry = await self._lazy_load_tool(tool_name)

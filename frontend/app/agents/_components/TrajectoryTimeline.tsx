@@ -17,7 +17,7 @@ import {
   Brain, CheckCircle2, XCircle, Clock, ChevronDown, ChevronRight, Loader2,
 } from 'lucide-react';
 import {
-  TrajNode, UsageRow, formatToolArgs, formatUsage,
+  TrajNode, UsageRow, formatToolArgs, formatUsage, formatSandbox,
 } from '@/lib/trajectory';
 
 // ── ThinkRow：每 step 一个思考行（delta 在 node.text 内累积，天然单行）──
@@ -102,6 +102,16 @@ function ToolRow({ node }: { node: Extract<TrajNode, { kind: 'tool' }> }) {
         <span style={{ fontWeight: 600, color: T.text, fontFamily: 'monospace' }}>{tool}</span>
         {node.step > 0 && <span style={{ fontSize: 11, color: T.tertiary }}>· 第 {node.step} 步</span>}
         <span style={{ fontSize: 11, color: statusColor }}>{statusLabel}</span>
+        {/* 沙箱事实：仅在工具确实经过沙箱时出现（非沙箱工具 node.sandbox 为 null） */}
+        {node.sandbox && (
+          <span style={{
+            fontSize: 11, padding: '0 6px', borderRadius: 4, background: T.bg,
+            color: node.sandbox.outcome === 'normal' ? T.tertiary : T.warning,
+            border: `1px solid ${T.border}`, whiteSpace: 'nowrap',
+          }}>
+            {formatSandbox(node.sandbox)}
+          </span>
+        )}
         <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: S.sm }}>
           {running && node.seconds != null && <span style={{ fontSize: 11, color: T.tertiary }}>{node.seconds}s</span>}
           {(node.result || node.summary) && (

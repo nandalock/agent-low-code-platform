@@ -29,6 +29,9 @@ TOOL_PROGRESS = "tool/progress"  # 长耗时 Tool 的阶段进度（data: tool +
                                  # 过程事件（log-only），不进 surface / 不参与 derive_messages
 LLM_USAGE = "llm/usage"   # 每次 LLM 调用的 usage（provider 返回；data: step + prompt/cache token 统计），
                           # log-only 观测事件（Step 1），不进 surface / 不参与 derive_messages
+SANDBOX_MODE = "sandbox/mode"  # 会话级沙箱模式覆盖（data: mode），log-only 配置事件：
+                               # 「日志即存储」——SandboxModeProjection 折叠出当前有效覆盖，
+                               # 生效值 = 覆盖 ?? 部署默认（见 tool_system/sandbox/policy.py）
 
 # 进入 LLM Context 的 surface 事件（其余事件只存在于 Event Log）
 SURFACE_EVENT_TYPES = frozenset({SEED, USER_MESSAGE, ASSISTANT_MESSAGE, TOOL_RESULT})

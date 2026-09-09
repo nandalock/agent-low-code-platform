@@ -18,6 +18,13 @@ export interface TrajThinkNode {
   text: string;
 }
 
+/** 沙箱事实（后端 tool/result 的结构化字段；非沙箱工具为 null） */
+export interface SandboxFacts {
+  mode: string;         // read-only | workspace-write | danger-full-access
+  enforcement: string;  // full | partial
+  outcome: string;      // normal | denied | runner_failed
+}
+
 export interface TrajToolNode {
   id: string;
   kind: 'tool';
@@ -32,6 +39,7 @@ export interface TrajToolNode {
   summary: string | null;
   error: string | null;
   result: string | null; // JSON 字符串（后端截断 ≤4000）
+  sandbox: SandboxFacts | null;
 }
 
 export interface TrajAnswerNode {
@@ -222,6 +230,20 @@ export const STOP_REASON_LABELS: Record<string, string> = {
 export function stopReasonLabel(reason?: string | null): string {
   if (!reason) return '';
   return STOP_REASON_LABELS[reason] ?? reason;
+}
+
+export const SANDBOX_OUTCOME_LABELS: Record<string, string> = {
+  normal: '沙箱内执行',
+  denied: '被沙箱拒绝',
+  runner_failed: '沙箱故障',
+};
+
+/** 沙箱事实单行文案（无事实返回空串）；enforcement=partial 时如实标注 */
+export function formatSandbox(f?: SandboxFacts | null): string {
+  if (!f) return '';
+  const parts = [SANDBOX_OUTCOME_LABELS[f.outcome] ?? f.outcome, f.mode];
+  if (f.enforcement === 'partial') parts.push('部分强制');
+  return parts.join(' · ');
 }
 
 /** 耗时：<1s 显示 ms，否则显示秒 */

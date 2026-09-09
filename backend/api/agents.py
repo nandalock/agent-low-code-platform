@@ -9,7 +9,9 @@ from pydantic import BaseModel
 from backend.agents import list_agents, get_agent, register
 from backend.agents.base import AgentReply
 from backend.agents.runtime import AgentRuntime
-from backend.agents.runtime.session import get_session_persistence, get_session_store
+from backend.agents.runtime.session import Session, get_session_persistence, get_session_store
+from backend.agents.runtime.session.events import SANDBOX_MODE
+from backend.agents.runtime.session.sandbox_projection import project_sandbox_mode
 from backend.agents.runtime.session.trajectory_projection import TrajectoryProjection, project_trajectory
 from backend.agents.router.router_runtime import RouterRuntime, invalidate_desc_cache
 from backend.agents.config_service import get_agent_config, save_agent_config, get_agent_definition
@@ -405,6 +407,21 @@ async def agent_route_test(
     }
 
 
+def _session_or_404(session_id: str) -> Session:
+    """取会话：SessionStore 热区优先，miss → Persistence.load 冷恢复并放回热区。"""
+    store = get_session_store()
+    session = store.get(session_id)
+    if session is not None:
+        return session
+    loaded = get_session_persistence().load(session_id)
+    if loaded is None:
+        raise HTTPException(404, "session not found")
+    header, events = loaded
+    session = Session.from_events(header, events)
+    store.put(session)
+    return session
+
+
 @router.get("/sessions/{session_id}/trajectory")
 async def agent_session_trajectory(session_id: str) -> dict:
     """读取 Session 的 Agent 轨迹快照（Session Event → Conversation Projection）。
@@ -414,17 +431,52 @@ async def agent_session_trajectory(session_id: str) -> dict:
     恢复完整 Think/Tool 轨迹，而非仅有最终消息。
     读路径：SessionStore 热区优先，miss → Persistence.load（冷恢复）；两者皆无 → 404。
     """
-    store = get_session_store()
-    session = store.get(session_id)
-    if session is not None:
-        events = session.events
-    else:
-        loaded = get_session_persistence().load(session_id)
-        if loaded is None:
-            raise HTTPException(404, "session not found")
-        _, events = loaded
-    snap = project_trajectory(events)
+    session = _session_or_404(session_id)
+    snap = project_trajectory(session.events)
     return {"session_id": session_id, **snap}
+
+
+class SandboxModeBody(BaseModel):
+    mode: str
+
+
+@router.get("/sessions/{session_id}/sandbox_mode")
+async def agent_session_sandbox_mode(session_id: str) -> dict:
+    """读取会话的沙箱模式：覆盖 + 部署默认 + 生效值。
+
+    生效值 = 覆盖 ?? 部署默认 ?? workspace-write，与执行侧（sandbox/policy.py）
+    是同一条优先级链；``override`` 来自 sandbox/mode 事件的投影（find-last）。
+    """
+    from backend.tool_system.sandbox.policy import FALLBACK_MODE
+    from backend.tool_system.sandbox.runtime import default_mode
+    events = _session_or_404(session_id).events
+    override = project_sandbox_mode(events)
+    cfg_default = default_mode()
+    return {
+        "session_id": session_id,
+        "override": override,
+        "default": cfg_default,
+        "effective": override or cfg_default or FALLBACK_MODE,
+    }
+
+
+@router.post("/sessions/{session_id}/sandbox_mode")
+async def agent_set_sandbox_mode(session_id: str, body: SandboxModeBody) -> dict:
+    """写入会话级沙箱模式覆盖：追加一条 sandbox/mode 事件（日志即存储）。
+
+    词汇封闭性在写入侧校验（非法值 400）。覆盖不持久化到任何配置存储——
+    它就是日志里的一条事件，冷恢复后由投影重新折叠出同一值。
+    """
+    from backend.agents.runtime.agent_runtime import _flush_session_events
+    from backend.tool_system.sandbox.policy import validate_mode
+    try:
+        mode = validate_mode(body.mode)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    session = _session_or_404(session_id)
+    session.append(SANDBOX_MODE, {"mode": mode})
+    _flush_session_events(get_session_persistence(), session)
+    return {"session_id": session_id, "override": mode}
 
 
 # ── L1 关键字 CRUD ──
