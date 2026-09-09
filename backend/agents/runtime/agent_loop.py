@@ -250,11 +250,17 @@ class AgentLoop:
                         last_tool_timeout_msg = tool_result["error"]
 
                     # tool result 原样 JSON 序列化入事件（Log 保全文，投影端按需还原）
-                    self.session.append(TOOL_RESULT, {
+                    result_data: dict = {
                         "tool": mcp_name,
                         "tool_call_id": tc["id"],
                         "content": json.dumps(tool_result, ensure_ascii=False),
-                    })
+                    }
+                    # 沙箱事实结构化随事件落库（content 里也有一份供模型阅读）：
+                    # 投影端（轨迹 / UI）直接读字段，不必解析 content。
+                    sandbox = tool_result.get("sandbox") if isinstance(tool_result, dict) else None
+                    if isinstance(sandbox, dict):
+                        result_data["sandbox"] = sandbox
+                    self.session.append(TOOL_RESULT, result_data)
 
                 if tool_calls_exhausted or repeat_tool_stopped:
                     self.session.append(STEP_END, {"step": step + 1})
@@ -334,8 +340,33 @@ class AgentLoop:
             session_id=self.session.header.id,
             agent_id=self.key,
             event_sink=SessionToolEventSink(self.session, tool_call_id, forward=self.on_event),
+            sandbox_policy=self._sandbox_policy(),
         )
         return await get_tool_runtime().execute(tool_name, args, context)
+
+    def _sandbox_policy(self):
+        """本会话一次调用的沙箱执行策略；沙箱未装配时 None（MCP 工具不受影响）。
+
+        工作区根来自 SessionHeader.cwd，首次调用时落地——它确定性派生自
+        session_id + 部署配置，因此不需要额外的事件记录（Event Log 保持
+        「只记事实」）。会话覆盖来自 ``sandbox/mode`` 事件的投影（find-last）。
+        沙箱工具在策略缺失时 fail-closed。
+        """
+        try:
+            from backend.agents.runtime.session.sandbox_projection import project_sandbox_mode
+            from backend.tool_system.sandbox.runtime import session_policy
+            header = self.session.header
+            policy = session_policy(
+                header.id,
+                header.cwd,
+                session_override=project_sandbox_mode(self.session.events),
+            )
+            if policy is not None and header.cwd is None:
+                header.cwd = policy.workspace_root
+            return policy
+        except Exception as e:
+            logger.warning(f"沙箱策略解析失败（沙箱工具将拒绝执行）: {e}")
+            return None
 
     async def _call_llm_stream(
         self, session, base_url: str, api_key: str, payload: dict, remaining: float,

@@ -25,6 +25,14 @@ RUN pip install --no-cache-dir \
 
 RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3')"
 
+# docker CLI（沙箱执行器起临时容器用；只装客户端，不装 daemon）。
+# 放在重依赖之后，避免改动它使 torch / 模型下载层缓存失效。
+# 走阿里云镜像：download.docker.com 在墙内常不可达。
+ARG DOCKER_CLI_VERSION=27.3.1
+RUN curl -fsSL "https://mirrors.aliyun.com/docker-ce/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \
+    | tar -xz --strip-components=1 -C /usr/local/bin docker/docker && \
+    docker --version
+
 COPY . .
 
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

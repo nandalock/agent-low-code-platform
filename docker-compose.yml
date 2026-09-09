@@ -19,10 +19,18 @@ services:
       - .:/app
       - npm_cache:/root/.npm
       - uv_cache:/root/.cache/uv
+      # 沙箱：SandboxExecutor 用 docker CLI 起临时容器（docs/sandbox-design.md §7）。
+      # 安全：socket 等价于宿主机 root，只应暴露给后端进程本身；模型参数无法影响
+      # docker 参数（DockerProvider 内部构造，且有注入断言）。
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 沙箱工作区：容器内外**同路径**，使 docker daemon 侧也能解析同一份文件（§8.1）。
+      - /srv/agent/workspaces:/srv/agent/workspaces
     environment:
       DATABASE_URL: postgresql://saas:saas@db:5432/saas
       JWT_SECRET: dev-secret
       OLLAMA_HOST: http://host.docker.internal:11434
+      # 沙箱工作区根（必须是独立目录，不能是仓库根——见 §9.2）
+      SANDBOX_WORKSPACE_ROOT: /srv/agent/workspaces
       # 论文域 MCP 内部总结用 LLM（OpenAI 兼容网关，在 .env 中填写）
       PAPER_LLM_BASE_URL: ${PAPER_LLM_BASE_URL:-}
       PAPER_LLM_API_KEY: ${PAPER_LLM_API_KEY:-}

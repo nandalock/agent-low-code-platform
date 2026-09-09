@@ -102,6 +102,25 @@ async def startup():
         import logging
         logging.getLogger(__name__).warning(f"ToolRuntime 初始化失败（工具调用不可用）: {e}")
 
+    # 沙箱子系统：校验工作区根 → 功能探测 → 装配 provider。
+    # 失败不阻断服务启动——沙箱工具执行时 fail-closed（返回错误而非裸跑）。
+    try:
+        from backend.tool_system.sandbox.runtime import init_sandbox
+        init_sandbox()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"沙箱未装配（沙箱工具将拒绝执行）: {e}")
+
+    # 注册内置沙箱工具（bash / python）。注册始终进行：能否执行取决于 provider，
+    # 而绑定仍走 agent_mcp_bindings——只有显式绑定的 agent 才会看到它们。
+    try:
+        from backend.tool_system.registry.registry import get_registry
+        from backend.tool_system.sandbox.runtime import register_builtin_sandbox_tools
+        register_builtin_sandbox_tools(get_registry())
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"沙箱工具注册失败: {e}")
+
     # 装配：论文域工具内部进度 → registry 进度查询（平台扩展点示例）
     try:
         from backend.tool_packages.paper.server import get_stage

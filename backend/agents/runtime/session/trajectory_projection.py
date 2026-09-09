@@ -53,11 +53,12 @@ def _cap(s: str, n: int) -> str:
     return s[:n] + "…(已截断)"
 
 
-def _classify_result(content: str) -> tuple[str, str | None, str | None]:
-    """tool/result 的 content（JSON 字符串）→ (status, summary, error)
+def _classify_result(content: str, sandbox: dict | None = None) -> tuple[str, str | None, str | None]:
+    """tool/result 的 content（JSON 字符串）+ 结构化 sandbox 事实 → (status, summary, error)
 
-    summary 用于 UI 单行概览（"N 条结果" / 前 120 字符兜底）；
-    error 存在时 status=error。result 全文（截断后）由调用方另存。
+    沙箱工具：状态由 ``sandbox.outcome`` 决定（命令跑了但被挡住 ≠ 工具出错）。
+    其余：error 字段 → error；rows → "N 条结果"；兜底取前 120 字符。
+    result 全文（截断后）由调用方另存。
     """
     try:
         obj = json.loads(content)
@@ -67,10 +68,17 @@ def _classify_result(content: str) -> tuple[str, str | None, str | None]:
         err = obj.get("error")
         if err:
             return ST_ERROR, None, str(err)
+    if isinstance(sandbox, dict):
+        outcome, mode = sandbox.get("outcome"), sandbox.get("mode")
+        if outcome == "denied":
+            return ST_ERROR, None, f"被沙箱拒绝（{mode} 模式）"
+        if outcome == "runner_failed":
+            return ST_ERROR, None, "沙箱基础设施故障（命令未执行）"
+        code = obj.get("exit_code") if isinstance(obj, dict) else None
+        return ST_SUCCESS, (f"exit {code}" if code else "完成"), None
+    if isinstance(obj, dict):
         rows = obj.get("rows")
-        if isinstance(rows, list):
-            return ST_SUCCESS, f"{len(rows)} 条结果", None
-        if rows is not None and isinstance(rows, dict):
+        if isinstance(rows, (list, dict)):
             return ST_SUCCESS, f"{len(rows)} 条结果", None
     # 非结构化 / 未知结构 → 兜底摘要（保证 summary 有值可显示）
     text = content.strip()
@@ -235,6 +243,7 @@ class TrajectoryProjection:
             "tool": d.get("tool"), "args": _cap(json.dumps(d.get("args", {}), ensure_ascii=False), MAX_ARGS_CHARS),
             "call_id": call_id,
             "stage": None, "seconds": None, "summary": None, "error": None, "result": None,
+            "sandbox": None,   # 沙箱事实（mode/enforcement/outcome），tool/result 到达时填充
         }
         return self._open(node, "traj/open")
 
@@ -251,11 +260,16 @@ class TrajectoryProjection:
             logger.debug("tool/result 无对应 tool node（孤儿）: %s", d)
             return []
         content = d.get("content") or ""
-        status, summary, error = _classify_result(content)
-        return self._update(node, {
+        # 沙箱事实来自事件的结构化字段（AgentLoop 从执行结果提取），不是 content 内的文本
+        sandbox = d.get("sandbox") if isinstance(d.get("sandbox"), dict) else None
+        status, summary, error = _classify_result(content, sandbox)
+        patch: dict = {
             "status": status, "summary": summary, "error": error,
             "result": _cap(content, MAX_RESULT_CHARS),
-        })
+        }
+        if sandbox is not None:
+            patch["sandbox"] = sandbox
+        return self._update(node, patch)
 
     def _find_tool(self, d: dict) -> dict | None:
         call_id = d.get("tool_call_id")

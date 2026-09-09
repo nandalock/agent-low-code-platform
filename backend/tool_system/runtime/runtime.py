@@ -24,7 +24,7 @@ from backend.tool_system.events import (
     ToolEvent,
 )
 from backend.tool_system.registry.registry import ToolRegistry, get_registry
-from backend.tool_system.runtime.executor import MCPExecutor, ToolExecutor
+from backend.tool_system.runtime.executor import MCPExecutor, SandboxExecutor, ToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +38,11 @@ class ToolRuntime:
         executors: dict[str, ToolExecutor] | None = None,
     ):
         self._registry = registry or get_registry()
-        # type → executor。后续接入 Native / Sandbox 执行器时在此注册即可（本阶段不实现）。
-        self._executors: dict[str, ToolExecutor] = executors or {"mcp": MCPExecutor()}
+        # type → executor。新增执行器在此注册即可（Registry / API / Event Log 无需改动）。
+        self._executors: dict[str, ToolExecutor] = executors or {
+            "mcp": MCPExecutor(),
+            "sandbox": SandboxExecutor(),
+        }
 
     async def execute(
         self,
