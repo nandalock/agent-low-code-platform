@@ -21,7 +21,7 @@ from abc import ABC, abstractmethod
 
 from backend.core.connection import get_conn
 from backend.tool_system.adapters.mcp import MCP_URL, McpClient, get_mcp_client
-from backend.tool_system.registry.descriptor import ToolDescriptor
+from backend.tool_system.registry.descriptor import PARALLEL, ToolDescriptor
 
 logger = logging.getLogger(__name__)
 
@@ -199,5 +199,10 @@ class MCPToolProvider(ToolProvider):
                 server_id=sid,
                 schema=t,
                 server=server_cfg,
+                # MCP 是外部接入的能力，默认并行：检索 / 查询 / RAG 类工具占了绝大多数，
+                # 串行跑等于白白浪费并发。有副作用的（写库 / 改文件）必须由装配方用
+                # registry.register_execution_mode(name, EXCLUSIVE) 显式声明 ——
+                # 显式优于默认，默认值只负责让没声明的工具可用。
+                execution_mode=PARALLEL,
             )
         logger.info(f"MCP 服务 [{sid}] {srv['name']} — 已索引 ({transport})")

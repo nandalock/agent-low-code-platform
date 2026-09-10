@@ -4,10 +4,15 @@
   Runtime 负责提供运行环境（config / tool schemas / llm params / Session / on_event）
   并装配派生消费者（TraceProjection / session_event_sink）；
   Loop 负责驱动 Agent 执行（derive messages、调用 LLM、消费 stream、判断 tool_calls、
-  经 ToolRuntime 执行 Tool、把 tool_result 写回 Session、生成最终 answer）。
+  产出调用计划交给 ToolScheduler、生成最终 answer）。
   Loop 不认识 MCP / HTTP / STDIO / server_id —— 这些都在 ToolRuntime + Executor 里；
   Loop 也不感知 Tool 生命周期事件（started / progress / completed / failed）——
   只负责每次调用构造 ToolContext（session_id / agent_id / event_sink），事件由 Runtime 层发出。
+
+Tool 调度边界（见 tool_system/runtime/scheduler.py）：
+  Loop 只做「计划」——名字还原、参数解析、tenant 注入、guard 裁决（max_tool_calls /
+  repeat tool），产出一批 PlannedCall；执行顺序、并发/串行、tool/call · tool/result
+  的成对落库与**有序提交**都归 ToolScheduler。
 
 事实记录原则：Session Event Log 是 Agent 执行事实的唯一 Source of Truth ——
   Loop 只 session.append(...) 产生事实，不再维护任何第二套执行 trace
@@ -35,17 +40,24 @@ from backend.agents.runtime.session import (
     LLM_USAGE,
     STEP_END,
     STEP_START,
-    TOOL_CALL,
-    TOOL_RESULT,
     TURN_END,
     TURN_START,
     USER_MESSAGE,
     Session,
 )
+from backend.agents.runtime.session_tool_recorder import SessionToolRecorder
 from backend.agents.runtime.tool_event_sink import SessionToolEventSink
 from backend.core.http import get_http_session
 from backend.tool_system.context import ToolContext
-from backend.tool_system.runtime.runtime import get_tool_runtime
+from backend.tool_system.runtime.scheduler import (
+    DEFAULT_MAX_PARALLEL_TOOLS,
+    DISPATCH,
+    SKIP,
+    SKIP_MAX_TOOL_CALLS,
+    SKIP_REPEAT_TOOL,
+    PlannedCall,
+    ToolScheduler,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +65,8 @@ logger = logging.getLogger(__name__)
 REPEAT_TOOL_THRESHOLD = 3
 
 
-def _safe_name(mcp_name: str) -> str:
-    return mcp_name.replace("/", "_").replace(".", "_")
+def _safe_name(tool_name: str) -> str:
+    return tool_name.replace("/", "_").replace(".", "_")
 
 
 class AgentLoop:
@@ -80,6 +92,12 @@ class AgentLoop:
         # Session（必填）：Event Log 是执行事实来源，LLM 消息由 session.derive_messages()
         # 派生；Loop 只 append 事件，不维护第二套 trace（TraceProjection 负责投影）。
         self.session = session
+        # Tool 调度器：执行的顺序 / 并发 / 成对落库 / 有序提交归它，Loop 只产出调用计划
+        self._scheduler = ToolScheduler(
+            recorder=SessionToolRecorder(session),
+            context_factory=self._tool_context,
+            max_parallel_tools=llm_params.get("max_parallel_tools", DEFAULT_MAX_PARALLEL_TOOLS),
+        )
 
     async def run(self, question: str, context: dict | None = None) -> str:
         """驱动完整 Agent 循环，返回最终 answer（含 guard 安全停止 / fallback 兜底）"""
@@ -108,9 +126,9 @@ class AgentLoop:
         name_map = {}
         tools = []
         for ts in self.tool_schemas:
-            mcp_name = ts["function"]["name"]
-            safe = _safe_name(mcp_name)
-            name_map[safe] = mcp_name
+            tool_name = ts["function"]["name"]
+            safe = _safe_name(tool_name)
+            name_map[safe] = tool_name
             t = json.loads(json.dumps(ts))
             t["function"]["name"] = safe
             tools.append(t)
@@ -209,58 +227,56 @@ class AgentLoop:
                     self.session.append(STEP_END, {"step": step + 1})
                     break
 
+                # 计划阶段：只产出「要不要执行、执行什么」，不执行也不落库。
+                # guard 按 model order 裁决：一旦命中，本 step 剩余调用全部记为 SKIP ——
+                # 它们仍会成对落 tool/call + 合成 tool/result，保证 assistant.tool_calls
+                # 的每一项都有对应结果（否则下一轮 derive_messages 产出的消息序列非法）。
+                plans: list[PlannedCall] = []
                 for tc in tool_calls:
                     safe = tc["function"]["name"]
-                    mcp_name = name_map.get(safe, safe)
+                    tool_name = name_map.get(safe, safe)
                     args = json.loads(tc["function"]["arguments"])
                     args["tenant_id"] = self.tenant_id  # 系统覆盖，不信任 LLM 传入值
 
-                    # max_tool_calls：run 级计数达到上限直接终止，不再执行新 Tool
-                    if tool_call_count >= max_tool_calls:
+                    action, skip_reason = DISPATCH, ""
+                    if tool_calls_exhausted:
+                        # max_tool_calls：run 级计数达到上限，后续调用一律不执行
+                        action, skip_reason = SKIP, SKIP_MAX_TOOL_CALLS
+                    elif repeat_tool_stopped:
+                        action, skip_reason = SKIP, SKIP_REPEAT_TOOL
+                    elif tool_call_count >= max_tool_calls:
                         tool_calls_exhausted = True
-                        break
-
-                    # repeat tool 检测：tool + 标准化 args 完全相同才计数；前两次重复允许，第三次停止
-                    signature = (mcp_name, json.dumps(args, ensure_ascii=False, sort_keys=True))
-                    if signature == last_tool_signature:
-                        repeat_tool_count += 1
+                        action, skip_reason = SKIP, SKIP_MAX_TOOL_CALLS
                     else:
-                        last_tool_signature = signature
-                        repeat_tool_count = 0
-                    if repeat_tool_count >= REPEAT_TOOL_THRESHOLD:
-                        repeat_tool_stopped = True
-                        break
+                        # repeat tool 检测：tool + 标准化 args 完全相同才计数；
+                        # 前两次重复允许，第三次停止
+                        signature = (tool_name, json.dumps(args, ensure_ascii=False, sort_keys=True))
+                        if signature == last_tool_signature:
+                            repeat_tool_count += 1
+                        else:
+                            last_tool_signature = signature
+                            repeat_tool_count = 0
+                        if repeat_tool_count >= REPEAT_TOOL_THRESHOLD:
+                            repeat_tool_stopped = True
+                            action, skip_reason = SKIP, SKIP_REPEAT_TOOL
+                        else:
+                            tool_call_count += 1
 
-                    tool_call_count += 1
+                    plans.append(PlannedCall(
+                        tool_call_id=tc["id"],
+                        tool_name=tool_name,
+                        args=args,
+                        action=action,
+                        skip_reason=skip_reason,
+                    ))
 
-                    self.session.append(TOOL_CALL, {
-                        "tool": mcp_name,
-                        "args": args,
-                        "tool_call_id": tc["id"],
-                    })
-
-                    try:
-                        # 执行统一走 ToolRuntime：timeout / transport / 生命周期事件由 Runtime 层负责
-                        tool_result = await self._execute_tool(mcp_name, args, tc["id"])
-                    except Exception as e:
-                        tool_result = {"error": str(e)}
-
+                # 执行 + 有序提交：顺序 / 生命周期事件 / tool_call 与 tool_result 的成对落库
+                # 都归 ToolScheduler（见 tool_system/runtime/scheduler.py）。
+                outcomes = await self._scheduler.execute_tool_calls(plans)
+                for outcome in outcomes:
                     # tool 超时属于安全停止而非系统异常：已作为 error 结果给 LLM，同时记录供终止兜底
-                    if isinstance(tool_result, dict) and "执行超时" in (tool_result.get("error") or ""):
-                        last_tool_timeout_msg = tool_result["error"]
-
-                    # tool result 原样 JSON 序列化入事件（Log 保全文，投影端按需还原）
-                    result_data: dict = {
-                        "tool": mcp_name,
-                        "tool_call_id": tc["id"],
-                        "content": json.dumps(tool_result, ensure_ascii=False),
-                    }
-                    # 沙箱事实结构化随事件落库（content 里也有一份供模型阅读）：
-                    # 投影端（轨迹 / UI）直接读字段，不必解析 content。
-                    sandbox = tool_result.get("sandbox") if isinstance(tool_result, dict) else None
-                    if isinstance(sandbox, dict):
-                        result_data["sandbox"] = sandbox
-                    self.session.append(TOOL_RESULT, result_data)
+                    if "执行超时" in outcome.error:
+                        last_tool_timeout_msg = outcome.error
 
                 if tool_calls_exhausted or repeat_tool_stopped:
                     self.session.append(STEP_END, {"step": step + 1})
@@ -330,19 +346,19 @@ class AgentLoop:
         }
         self.session.append(LLM_USAGE, data)
 
-    async def _execute_tool(self, tool_name: str, args: dict, tool_call_id: str) -> dict:
-        """执行一次 Tool：只构造 ToolContext（含事件出口）并交给 ToolRuntime。
+    def _tool_context(self, tool_call_id: str) -> ToolContext:
+        """构造一次 Tool 调用的上下文（ToolScheduler 的 context_factory）。
 
         Tool 生命周期事件（started / progress / completed / failed）由 ToolRuntime /
-        Executor 经 context.event_sink 发出，本 Loop 不感知、不拼装。
+        Executor 经 context.event_sink 发出，本 Loop 不感知、不拼装；
+        tool_call_id 在构造时绑定到 sink（一次调用一个 sink）。
         """
-        context = ToolContext(
+        return ToolContext(
             session_id=self.session.header.id,
             agent_id=self.key,
             event_sink=SessionToolEventSink(self.session, tool_call_id, forward=self.on_event),
             sandbox_policy=self._sandbox_policy(),
         )
-        return await get_tool_runtime().execute(tool_name, args, context)
 
     def _sandbox_policy(self):
         """本会话一次调用的沙箱执行策略；沙箱未装配时 None（MCP 工具不受影响）。
