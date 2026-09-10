@@ -23,6 +23,7 @@ from backend.agents.runtime.session import (
 from backend.agents.runtime.session.trace_projection import TraceProjection
 from backend.core.http import get_http_session
 from backend.tool_system.registry.registry import get_registry
+from backend.tool_system.runtime.scheduler import DEFAULT_MAX_PARALLEL_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +211,9 @@ class AgentRuntime(BaseAgent):
             "max_steps": int(config.get("max_steps", 5)),
             "max_tool_calls": int(config.get("max_tool_calls", 30)),
             "max_wall_time": float(config.get("max_wall_time", 300)),
+            # 同批 Tool 调用的并发上限（ToolScheduler 的滚动池大小）；
+            # 1 = 退化为串行，与调度器引入前行为一致
+            "max_parallel_tools": int(config.get("max_parallel_tools", DEFAULT_MAX_PARALLEL_TOOLS)),
             "max_tokens": int(config.get("max_tokens", 1024)),
             "max_tokens_plain": int(config.get("max_tokens_plain", 512)),
             "temperature": float(config.get("temperature", 0.3)),

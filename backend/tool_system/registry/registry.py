@@ -12,7 +12,11 @@
 import logging
 from dataclasses import replace
 
-from backend.tool_system.registry.descriptor import ToolDescriptor
+from backend.tool_system.registry.descriptor import (
+    PARALLEL,
+    ToolDescriptor,
+    validate_execution_mode,
+)
 from backend.tool_system.registry.providers import (
     BuiltinToolProvider,
     MCPToolProvider,
@@ -34,6 +38,9 @@ class ToolRegistry:
         self._progress_queries: dict[str, object] = {}
         # 工具执行超时（可选扩展点）：tool_name → 秒；未声明的由 Executor 用默认值
         self._tool_timeouts: dict[str, float] = {}
+        # 工具执行模式（可选扩展点）：tool_name → "parallel" | "exclusive"；
+        # 未声明的用描述自带值（默认 parallel）
+        self._execution_modes: dict[str, str] = {}
         self._ready = False
 
     # ── 来源注册 ──
@@ -61,7 +68,7 @@ class ToolRegistry:
         靠懒加载兜底，于是出现「单查得到、列表里没有」的割裂）。
         """
         self._builtin().register(descriptor)
-        self._by_name[descriptor.name] = self._with_timeout(descriptor)
+        self._by_name[descriptor.name] = self._with_metadata(descriptor)
 
     def register_native(self, descriptor: ToolDescriptor) -> None:
         """``register_builtin`` 的旧名（保留兼容）。"""
@@ -98,6 +105,38 @@ class ToolRegistry:
     def get_tool_timeout(self, tool_name: str) -> float | None:
         return self._tool_timeouts.get(tool_name)
 
+    # ── 工具执行模式（领域扩展点） ──
+
+    def register_execution_mode(self, tool_name: str, mode: str) -> None:
+        """声明工具的并发约束（``parallel`` / ``exclusive``），**覆盖**描述自带值。
+
+        有共享状态的 MCP 工具（写库 / 改文件）应在装配处显式声明 ``exclusive``
+        —— 模型侧参数无法影响它。与 :meth:`register_tool_timeout` 同模式（存元数据、
+        调度时生效），差别是这里**立即刷新统一索引**：声明晚于注册时不能让
+        ``descriptors()`` 停留在旧值（同 register_builtin 的「单查得到、列表里没有」
+        割裂问题 —— 元数据要么处处可见，要么处处不可见）。
+
+        Raises:
+            ValueError: mode 不在封闭词汇内。
+        """
+        self._execution_modes[tool_name] = validate_execution_mode(mode)
+        d = self._by_name.get(tool_name)
+        if d is not None:
+            self._by_name[tool_name] = replace(d, execution_mode=mode)
+
+    def execution_mode_of(self, tool_name: str) -> str:
+        """工具当前的并发约束（同步读取，调度器在派发前逐次查询）。
+
+        取值优先级：本层声明的覆盖值 → 统一索引里的描述（Provider 侧自带）→
+        默认 ``parallel``。未索引的工具返回声明值/默认值，不触发懒加载
+        —— 调度路径上不能有 I/O。
+        """
+        declared = self._execution_modes.get(tool_name)
+        if declared is not None:
+            return declared
+        d = self._by_name.get(tool_name)
+        return d.execution_mode if d is not None else PARALLEL
+
     # ── 收集 ──
 
     async def init(self) -> None:
@@ -105,16 +144,24 @@ class ToolRegistry:
         for provider in self._providers:
             try:
                 for d in await provider.discover():
-                    self._by_name[d.name] = self._with_timeout(d)
+                    self._by_name[d.name] = self._with_metadata(d)
             except Exception as e:
                 logger.warning(f"工具来源 [{provider.name}] 发现失败: {e}")
         self._ready = True
         logger.info(f"ToolRegistry 初始化完成，共 {len(self._by_name)} 个工具")
 
-    def _with_timeout(self, d: ToolDescriptor) -> ToolDescriptor:
-        """把 Registry 级声明的超时盖到描述上（描述是冻结的，用 replace 派生）。"""
+    def _with_metadata(self, d: ToolDescriptor) -> ToolDescriptor:
+        """把 Registry 级声明的元数据（超时 / 执行模式）盖到描述上。
+
+        描述是冻结的，用 ``replace`` 派生；未声明或与自带值相同则不派生。
+        """
         t = self._tool_timeouts.get(d.name)
-        return d if t is None or t == d.timeout else replace(d, timeout=t)
+        if t is not None and t != d.timeout:
+            d = replace(d, timeout=t)
+        m = self._execution_modes.get(d.name)
+        if m is not None and m != d.execution_mode:
+            d = replace(d, execution_mode=m)
+        return d
 
     # ── 读取面 ──
 
@@ -141,7 +188,7 @@ class ToolRegistry:
         for provider in self._providers:
             d = await provider.lazy_load(tool_name)
             if d is not None:
-                d = self._with_timeout(d)
+                d = self._with_metadata(d)
                 self._by_name[d.name] = d
                 return d
         return None

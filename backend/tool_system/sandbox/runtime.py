@@ -11,7 +11,7 @@ import logging
 import os
 
 from backend.core.connection import get_conn
-from backend.tool_system.registry.descriptor import SandboxToolConfig, ToolDescriptor
+from backend.tool_system.registry.descriptor import EXCLUSIVE, SandboxToolConfig, ToolDescriptor
 from backend.tool_system.sandbox.backends.docker import DEFAULT_SANDBOX_IMAGE, DockerProvider
 from backend.tool_system.sandbox.policy import DEFAULT_MODE_ENV, resolve_policy, validate_mode
 from backend.tool_system.sandbox.provider import SandboxProvider
@@ -164,6 +164,10 @@ def register_builtin_sandbox_tools(
             schema=schema,
             timeout=timeout_s,
             sandbox=SandboxToolConfig(runtime=runtime, image=img, timeout_s=timeout_s),
+            # 独占执行：bash / python 共写同一个会话工作区，并发跑会互相踩文件
+            # （A 建目录 B 删、A 写文件 B 读），且模型无法声明调用间的依赖关系。
+            # 并发收益不值得用工作区一致性换 —— 故沙箱工具恒为 exclusive 屏障。
+            execution_mode=EXCLUSIVE,
         ))
         names.append(name)
     logger.info(f"已注册沙箱工具: {names}")

@@ -266,6 +266,12 @@ class SandboxExecutor(ToolExecutor):
             proc.kill()
             await proc.wait()
             return {"error": f"沙箱执行超时（>{cfg.timeout_s:.0f}s），已取消"}
+        except asyncio.CancelledError:
+            # 取消（客户端断连 / 关停）：不能让命令在后台继续跑。
+            # 注意 docker CLI 被 SIGKILL 时容器可能成为孤儿 —— 需要更强保证
+            # 时改用 cidfile + docker kill（见 docs/sandbox-design.md 的后续项）。
+            proc.kill()
+            raise
 
         stdout_full = stdout_b.decode("utf-8", errors="replace")
         stderr_full = stderr_b.decode("utf-8", errors="replace")
