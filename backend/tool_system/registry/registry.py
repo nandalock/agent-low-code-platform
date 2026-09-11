@@ -244,6 +244,10 @@ def _sanitize_schema(schema: dict) -> dict:
                 prop["description"] = v["title"]
             if "default" in v and v["default"] is not None:
                 prop["default"] = v["default"]
+            # enum 必须透传：它是封闭词汇的**可取值面**，丢了模型只能猜
+            # （沙箱升权的 sandbox_permissions 就是靠它拿到合法目标）。
+            if "enum" in v:
+                prop["enum"] = v["enum"]
             s["properties"][k] = prop
     if "required" in schema:
         s["required"] = schema["required"]

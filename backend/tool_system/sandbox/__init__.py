@@ -9,10 +9,19 @@ from backend.tool_system.sandbox.classify import (
     Outcome,
     classify_outcome,
     classify_runner_failure,
-    denial_marker,
     matches_signature,
 )
 from backend.tool_system.sandbox.errors import SANDBOX_UNAVAILABLE, SandboxUnavailableError
+from backend.tool_system.sandbox.escalation import (
+    ESCALATION_TARGETS,
+    WIDER_MODES,
+    EscalationDenied,
+    EscalationError,
+    EscalationInvalid,
+    approve_escalation,
+    escalation_hint_marker,
+    sandbox_denial_marker,
+)
 from backend.tool_system.sandbox.provider import ConfinedArgv, RunnerFailureRule, SandboxProvider
 from backend.tool_system.sandbox.vocabulary import (
     ALL_MODES,
@@ -30,18 +39,25 @@ __all__ = [
     "CONFINED_MODES",
     "ConfinedArgv",
     "ConfinedSandboxMode",
+    "ESCALATION_TARGETS",
     "Outcome",
     "RunnerFailureRule",
     "SANDBOX_UNAVAILABLE",
+    "WIDER_MODES",
+    "EscalationDenied",
+    "EscalationError",
+    "EscalationInvalid",
     "SandboxEnforcement",
     "SandboxExecutionPolicy",
     "SandboxMode",
     "SandboxPolicy",
     "SandboxProvider",
     "SandboxUnavailableError",
+    "approve_escalation",
     "classify_outcome",
     "classify_runner_failure",
-    "denial_marker",
+    "escalation_hint_marker",
     "is_confined_mode",
     "matches_signature",
+    "sandbox_denial_marker",
 ]

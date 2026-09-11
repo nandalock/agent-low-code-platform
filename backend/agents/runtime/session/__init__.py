@@ -9,9 +9,11 @@
                         由 main.py startup 装配；lazy restore 编排在 AgentRuntime）
 """
 from backend.agents.runtime.session.events import (
+    APPROVAL_REQUEST,
     ASSISTANT_CHUNK,
     ASSISTANT_MESSAGE,
     LLM_USAGE,
+    SANDBOX_ESCALATION,
     SANDBOX_MODE,
     SEED,
     STEP_END,
@@ -58,6 +60,8 @@ __all__ = [
     "ASSISTANT_CHUNK",
     "ASSISTANT_MESSAGE",
     "LLM_USAGE",
+    "APPROVAL_REQUEST",
+    "SANDBOX_ESCALATION",
     "SANDBOX_MODE",
     "TOOL_CALL",
     "TOOL_PROGRESS",

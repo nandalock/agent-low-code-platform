@@ -9,13 +9,25 @@ Docker 后端把工作区根挂到容器内固定点，因此需要**路径映�
 包括 .env 与源码——挂进沙箱，因此 :func:`assert_root_is_safe` 在解析阶段就拒绝。
 """
 import os
+import re
 import subprocess
 from pathlib import Path
+from typing import Sequence
 
 from backend.tool_system.sandbox.errors import SandboxUnavailableError
 
 #: 工作区在沙箱容器内的挂载点。命令看到的路径以它为准。
 CONTAINER_WORKSPACE = "/workspace"
+
+#: 附加**只读**挂载的容器内父目录；每个根挂到 ``<它>/<名字>``。
+#: 这是对 DeepSeek Harness 的**刻意扩展**：dsh 的同世界后端里「读」不受限，
+#: 因而没有读轴（``roots.ts`` 只派生可写根）；Docker 后端的读天然被容器边界
+#: 收窄，要读宿主目录就只能显式挂——故本轴为 Docker 后端专有，不参与
+#: ``SandboxMode`` 词汇（模式仍只描述**写**效果）。
+CONTAINER_READ_ROOT = "/mnt/read"
+
+#: 部署配置的环境变量名（逗号分隔的宿主绝对路径）。
+READ_ROOTS_ENV = "SANDBOX_READ_ROOTS"
 
 #: 功能探测用的最小镜像（只用来证明 daemon 侧能读写该路径）。
 DEFAULT_PROBE_IMAGE = "alpine:3.20"
@@ -126,6 +138,72 @@ def to_container_path(host_path: str, root: str) -> str:
     if str(rel) == ".":
         return CONTAINER_WORKSPACE
     return f"{CONTAINER_WORKSPACE}/{rel.as_posix()}"
+
+
+# ── 只读挂载根（宿主任意目录 → 沙箱内只读）──
+
+#: Windows 盘符绝对路径（``D:/...`` / ``D:\...``）。后端跑在 Linux 上，
+#: 因此不能靠 ``os.path.isabs`` 判断——它会把合法的 ``D:/jk`` 判成相对路径。
+_WINDOWS_ABS = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def normalize_host_path(path: str) -> str:
+    """规范化一个宿主路径：反斜杠转正斜杠 + 绝对性校验。
+
+    Raises:
+        ValueError: 相对路径。**必须拒绝**——docker 收到相对路径会把它当成
+            named volume 的名字，静默创建一个空卷挂上去，表现为「挂载成功但
+            目录是空的」，是最难排查的一种失败。
+    """
+    p = path.strip().replace("\\", "/")
+    if p.startswith("/") or _WINDOWS_ABS.match(p):
+        return p
+    raise ValueError(
+        f"{READ_ROOTS_ENV} 的每一项必须是绝对路径: {path!r}；"
+        "相对路径会被 docker 当成 named volume 静默挂成空卷"
+    )
+
+
+def _mount_name(host_path: str, taken: set[str]) -> str:
+    """给一个宿主路径取容器内的挂载名：basename，重名时追加序号。
+
+    取可读名而不是下标（``/mnt/read/0``），是为了让模型 ``ls /mnt/read``
+    就能自己发现有哪些目录，不依赖外部告知的映射表。
+    """
+    base = host_path.rstrip("/").rsplit("/", 1)[-1] or "root"
+    name, n = base, 1
+    while name in taken:
+        n += 1
+        name = f"{base}-{n}"
+    taken.add(name)
+    return name
+
+
+def build_read_mounts(roots: Sequence[str]) -> list[tuple[str, str]]:
+    """把配置的只读根解析成 ``[(宿主路径, 容器内挂载点), ...]``。
+
+    去重保序：同一个路径配两次会让 docker 因挂载点冲突而启动失败。
+    """
+    mounts: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    names: set[str] = set()
+    for raw in roots:
+        host = normalize_host_path(raw)
+        if host in seen:
+            continue
+        seen.add(host)
+        mounts.append((host, f"{CONTAINER_READ_ROOT}/{_mount_name(host, names)}"))
+    return mounts
+
+
+def parse_read_roots(raw: str | None) -> tuple[str, ...]:
+    """解析 ``SANDBOX_READ_ROOTS``（逗号分隔）；未配置 / 空串返回 ``()``。
+
+    空串与未配置等价（compose 的 ``${VAR:-}`` 会产出空串），都表示「不挂」。
+    """
+    if not raw:
+        return ()
+    return tuple(x for x in (p.strip() for p in raw.split(",")) if x)
 
 
 def probe_workspace_root(

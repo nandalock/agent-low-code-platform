@@ -54,11 +54,15 @@ def resolve_policy(
     explicit_mode: SandboxMode | None = None,
     session_override: SandboxMode | None = None,
     config_default: SandboxMode | None = None,
+    read_roots: tuple[str, ...] = (),
 ) -> SandboxExecutionPolicy:
     """解析一次能力调用的完整策略。
 
     返回 ``SandboxExecutionPolicy``（可能含 ``danger-full-access``）——消费方
     只解析一次，再决定走约束路径还是直接 spawn 原始 argv。
+
+    ``read_roots`` 由调用方提供（本模块保持纯函数，不读环境变量）；它不参与
+    模式优先级链——读轴与写模式正交。
     """
     return SandboxExecutionPolicy(
         mode=resolve_mode(
@@ -68,4 +72,5 @@ def resolve_policy(
         ),
         workspace_root=workspace_root,
         session_id=session_id,
+        read_roots=read_roots,
     )

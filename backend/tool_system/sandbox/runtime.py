@@ -13,10 +13,14 @@ import os
 from backend.core.connection import get_conn
 from backend.tool_system.registry.descriptor import EXCLUSIVE, SandboxToolConfig, ToolDescriptor
 from backend.tool_system.sandbox.backends.docker import DEFAULT_SANDBOX_IMAGE, DockerProvider
+from backend.tool_system.sandbox.escalation import ESCALATION_TARGETS
 from backend.tool_system.sandbox.policy import DEFAULT_MODE_ENV, resolve_policy, validate_mode
 from backend.tool_system.sandbox.provider import SandboxProvider
 from backend.tool_system.sandbox.vocabulary import SandboxExecutionPolicy, SandboxMode
 from backend.tool_system.sandbox.workspace import (
+    READ_ROOTS_ENV,
+    build_read_mounts,
+    parse_read_roots,
     probe_workspace_root,
     resolve_workspace_root,
     session_workspace,
@@ -80,6 +84,15 @@ def default_mode() -> SandboxMode | None:
     return validate_mode(raw)
 
 
+def read_roots() -> tuple[str, ...]:
+    """部署配置的只读挂载根（``SANDBOX_READ_ROOTS``，逗号分隔）；未配置返回 ()。
+
+    这是**部署事实**而非会话策略——哪些宿主目录对沙箱只读可见，跟镜像、内存
+    上限同类，因此不进 settings、不做会话覆盖、不参与模式优先级链。
+    """
+    return parse_read_roots(os.environ.get(READ_ROOTS_ENV))
+
+
 def workspace_for_session(session_id: str) -> str:
     """本会话的工作区目录 ``<SANDBOX_WORKSPACE_ROOT>/<session_id>``（惰性创建）。"""
     return session_workspace(resolve_workspace_root(), session_id)
@@ -103,6 +116,7 @@ def session_policy(
         session_id=session_id,
         session_override=session_override,
         config_default=default_mode(),
+        read_roots=read_roots(),
     )
 
 
@@ -134,6 +148,64 @@ _PYTHON_SCHEMA = {
     },
 }
 
+#: 升权参数的 schema 片段。**静态全量 advertise，不做按会话投影**：
+#: DSH 的坑（全局 advertise + 逐调用模式 → 模型反复填、每次报错）由闸2
+#: 去重解决——那正是上游的官方修法（#4359 ``normalizeEscalationMode``）；
+#: 而按模式投影 schema 会把「当前模式」从 enum 里泄漏给模型，与原则 7
+#: 冲突。故此处的 enum 是**建议面**而非授权面：执行时校验才是权威
+#: （DSH 原话：schema visibility is not an instruction to always populate
+#: the field）。
+_ESCALATION_PROPERTIES = {
+    "sandbox_permissions": {
+        "type": "string",
+        "enum": list(ESCALATION_TARGETS),
+        "description": (
+            "仅在**本条命令被沙箱拒绝之后**重试同一条命令时使用：请求的目标模式，"
+            "必须比当前模式更宽，且取足以放行的最窄者。必须与 justification 同时给出。"
+            "命令之外的一切都不能借它完成——它只让这一条命令再跑一次。"
+        ),
+    },
+    "justification": {
+        "type": "string",
+        "description": (
+            "一句话说明这条命令为什么必须写到工作区之外。与 sandbox_permissions "
+            "成对出现；单独给出会被拒绝。"
+        ),
+    },
+}
+
+
+def _with_escalation(schema: dict) -> dict:
+    """给沙箱工具 schema 副本挂上升权参数（不改动模块级常量）。"""
+    return {
+        **schema,
+        "inputSchema": {
+            **schema["inputSchema"],
+            "properties": {**schema["inputSchema"]["properties"], **_ESCALATION_PROPERTIES},
+        },
+    }
+
+
+def _read_roots_note() -> str:
+    """把只读挂载的映射写进工具描述；没有配置时返回空串。
+
+    与「不把沙箱模式写进系统提示词」（docs/sandbox-design.md §2 原则 7）不冲突：
+    那条针对的是**模式**（说了模型会变保守、不敢尝试），这里给的是**路径事实**
+    ——不说，模型就不知道那些目录存在，只会去猜 ``D:\\...`` 然后撞
+    ``No such file or directory``，并误判成「文件不存在」而不是「路径写法不对」。
+    """
+    mounts = build_read_mounts(read_roots())
+    if not mounts:
+        return ""
+    items = "、".join(f"{c}（宿主 {h}）" for h, c in mounts)
+    return f"\n可读目录（只读，可读不可写）：{items}。"
+
+
+def _schema_with_read_roots(schema: dict) -> dict:
+    """返回带只读目录说明的 schema 副本（不改动模块级常量）。"""
+    note = _read_roots_note()
+    return schema if not note else {**schema, "description": schema["description"] + note}
+
 
 def register_builtin_sandbox_tools(
     registry,
@@ -161,7 +233,7 @@ def register_builtin_sandbox_tools(
             type="sandbox",
             transport="",
             server_id=0,
-            schema=schema,
+            schema=_with_escalation(_schema_with_read_roots(schema)),
             timeout=timeout_s,
             sandbox=SandboxToolConfig(runtime=runtime, image=img, timeout_s=timeout_s),
             # 独占执行：bash / python 共写同一个会话工作区，并发跑会互相踩文件

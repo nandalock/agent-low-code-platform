@@ -32,6 +32,17 @@ LLM_USAGE = "llm/usage"   # 每次 LLM 调用的 usage（provider 返回；data:
 SANDBOX_MODE = "sandbox/mode"  # 会话级沙箱模式覆盖（data: mode），log-only 配置事件：
                                # 「日志即存储」——SandboxModeProjection 折叠出当前有效覆盖，
                                # 生效值 = 覆盖 ?? 部署默认（见 tool_system/sandbox/policy.py）
+APPROVAL_REQUEST = "approval/request"  # 升权申请进入人工裁决（data: approval_id + tool +
+                                       # tool_call_id + from + to + justification）
+                                       # log-only **记录**事件——它让「正在等谁批」这个
+                                       # 状态可查（UI 显示待批准卡片、冷恢复后清陈旧卡片）。
+                                       # 与 sandbox/mode 的区别同 sandbox/escalation：
+                                       # 它是记录，不参与策略解析。
+SANDBOX_ESCALATION = "sandbox/escalation"  # 沙箱升权的批准/拒绝事实（data: from +
+                                           # requested + to + granted + reason + justification）
+                                           # log-only **记录**事件——刻意不被任何投影折叠成配置：
+                                           # 一次性授权只对那次调用有效，若它参与策略解析，
+                                           # 一次性就变成了持久放权。（与 sandbox/mode 的区别）
 
 # 进入 LLM Context 的 surface 事件（其余事件只存在于 Event Log）
 SURFACE_EVENT_TYPES = frozenset({SEED, USER_MESSAGE, ASSISTANT_MESSAGE, TOOL_RESULT})

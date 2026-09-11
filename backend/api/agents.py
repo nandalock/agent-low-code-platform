@@ -540,6 +540,48 @@ def agent_l1_delete(agent_key: str, rule_id: int) -> dict:
 
 # ── Ollama 模型列表 ──
 
+# ── 沙箱升权审批（人工裁决） ──
+#
+# 一次升权申请会在执行器里挂起，直到这里裁决、或超时（超时按拒绝处理）。
+# 申请经 SSE 推给前端（approval.request 事件），前端据此显示待批准卡片。
+
+
+class ApprovalDecisionBody(BaseModel):
+    #: "allow-once" = 一次性放行**本次调用**；"reject" / "cancel" 与未知值分别
+    #: 映射到拒绝 / 取消（未知值一律 fail-closed）。不做 Literal 校验是刻意的：
+    #: 未知值必须当场落地成「不放行」，而不是 400 之后让申请永远悬着。
+    decision: str
+
+
+@router.get("/approvals")
+async def api_list_approvals() -> list[dict]:
+    """当前待裁决的审批申请。
+
+    冷恢复用：进程重启后挂起表清空，前端据此清掉陈旧的待批准卡片。
+    """
+    from backend.interaction.approval import get_approval_service
+    service = get_approval_service()
+    if service is None:
+        return []
+    return [req.to_dict() for req in service.pending()]
+
+
+@router.post("/approvals/{approval_id}")
+async def api_resolve_approval(approval_id: str, body: ApprovalDecisionBody) -> dict:
+    """裁决一个待批准的申请：唤醒挂起的调用方。
+
+    404 表示该申请不存在或已被处理（超时 / 取消 / 重复点击）——不做幂等成功，
+    否则调用方会以为裁决生效而实际没有。
+    """
+    from backend.interaction.approval import get_approval_service
+    service = get_approval_service()
+    if service is None:
+        raise HTTPException(503, "审批服务未装配")
+    if not service.resolve(approval_id, body.decision):
+        raise HTTPException(404, f"审批申请不存在或已处理: {approval_id}")
+    return {"ok": True, "approval_id": approval_id, "decision": body.decision}
+
+
 @router.get("/ollama-models")
 async def list_ollama_models() -> list[dict]:
     """读取 Ollama 本地已安装的 embedding 模型"""

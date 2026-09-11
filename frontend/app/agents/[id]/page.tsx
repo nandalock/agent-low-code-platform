@@ -121,6 +121,19 @@ interface ChatMsg {
   trace?: TraceSummary;              // 执行摘要（TraceProjection 产物；history 来自 metadata.trace，实时来自 done.trace）
 }
 
+// 待人工裁决的审批申请（approval.request 事件 → 卡片 → POST /approvals/{id}）。
+// 后端调用此刻**正挂起等待**，不裁决就一直等到超时（超时按不可用处理）。
+//
+// 审批是通用的（interaction.approval），字段刻意领域中立：reason 是给人看的
+// 一句话，metadata 放领域细节（沙箱的 from/to 模式就在里面）—— 前端只做透传，
+// 不解释 metadata。
+interface PendingApproval {
+  approvalId: string;
+  tool: string;
+  reason: string;       // 给人看的一句话（模型自己写的理由在里面）
+  metadata: Record<string, any>;
+}
+
 // 历史会话项（服务端 conversations 列表，channel=agent:{key}，与 DeepSeek 会话列表同源）
 interface HistConv {
   id: number;
@@ -152,6 +165,8 @@ export default function AgentDetailPage() {
   const { nodes: trajNodes, nodesRef, enqueue, forceFlush, reset } = useTrajectoryBatch();
   const [liveUsage, setLiveUsage] = useState<UsageRow[]>([]);
   const usageRef = useRef<UsageRow[]>([]);
+  // 待裁决的升权申请：后端工具调用挂起中，不裁决 = 一直等到超时（拒绝）
+  const [approvals, setApprovals] = useState<PendingApproval[]>([]);
 
   useEffect(() => {
     // mount：从 localStorage 恢复最近一场对话（重启浏览器 → 自动续聊最近会话）。
@@ -323,6 +338,7 @@ export default function AgentDetailPage() {
     setInput(''); setSending(true);
     setLiveUsage([]); usageRef.current = [];
     reset();  // 清空上个 turn 的 trajectory nodes（flush 尾部滞留 + reducer reset）
+    setApprovals([]);  // 上个 turn 若留下卡片（后端已被取消）不清会一直挂着
     let finalAnswer = '';
     let doneTrace: TraceSummary | undefined;  // done.trace：本轮执行摘要（TraceProjection 产物）
     let legacyThink = '';   // session=None 遗留路径：thinking 降级累积（无轨迹时兜底显示）
@@ -363,6 +379,24 @@ export default function AgentDetailPage() {
               setLiveUsage(usageRef.current);
               break;
             }
+            case 'approval.request': {
+              // 待确认申请：后端此刻已挂起，等这里的裁决（或超时 → 不可用）
+              const d = ev.data || {};
+              if (!d.approval_id) break;
+              setApprovals(prev => [
+                ...prev.filter(p => p.approvalId !== d.approval_id),
+                { approvalId: d.approval_id, tool: ev.tool || '',
+                  reason: d.reason || '', metadata: d.metadata || {} },
+              ]);
+              break;
+            }
+            case 'sandbox.escalation':
+              // 裁决落地（批准 / 拒绝 / 超时）→ 收起对应卡片，approval_id 精确配对
+              if (ev.data?.approval_id) {
+                const done = ev.data.approval_id;
+                setApprovals(prev => prev.filter(p => p.approvalId !== done));
+              }
+              break;
             case 'thinking':  // 遗留路径（session=None）：不做实时展示，仅 done 后折叠兜底
               legacyThink += ev.delta;
               break;
@@ -403,6 +437,18 @@ export default function AgentDetailPage() {
         trace: doneTrace,
       }]);
     }
+  }
+
+  // 裁决一次升权申请：唤醒后端挂起的工具调用。
+  // 先乐观收起卡片（后端也会推 sandbox.escalation 精确收口）；404 = 已超时 / 已处理。
+  async function resolveApproval(approvalId: string, decision: 'allow-once' | 'reject') {
+    setApprovals(prev => prev.filter(p => p.approvalId !== approvalId));
+    try {
+      await fetch(`${API}/api/agents/approvals/${approvalId}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision }),
+      });
+    } catch { /* 后端已超时 / 断连：卡片已收起，不再打扰 */ }
   }
 
   return (
@@ -583,6 +629,30 @@ export default function AgentDetailPage() {
           )}
           <div ref={bottomRef} />
         </div>
+
+        {/* 升权待裁决卡片：后端工具调用正挂起等这个按钮，不裁决就一直等到超时 */}
+        {approvals.length > 0 && (
+          <div style={{ padding:`0 ${S.xl}px ${S.base}px`, display:'flex', flexDirection:'column', gap:S.sm }}>
+            {approvals.map(a => (
+              <div key={a.approvalId} style={{ border:`1px solid ${T.warning}`, borderRadius:8, background:T.surface, padding:`${S.md}px ${S.base}px` }}>
+                <div style={{ fontSize:13, fontWeight:600, color:T.text, marginBottom:6 }}>
+                  模型申请提权：{a.metadata.from ?? '?'} → {a.metadata.to ?? '?'}
+                </div>
+                {/* 理由原文照显：它是模型为自己的请求举证的全部内容 */}
+                <div style={{ fontSize:13, color:T.secondary, lineHeight:1.55, whiteSpace:'pre-wrap', wordBreak:'break-word', marginBottom:S.sm }}>
+                  {a.metadata.justification || a.reason || '（未给理由）'}
+                </div>
+                <div style={{ fontSize:11, color:T.tertiary, marginBottom:S.sm }}>
+                  只放行这一次 {a.tool} 调用；不裁决将等待至超时（超时按不可用处理）
+                </div>
+                <div style={{ display:'flex', gap:S.sm }}>
+                  <button onClick={() => resolveApproval(a.approvalId, 'allow-once')} style={{...btnPrimary, padding:'6px 16px', fontSize:13 }}>允许一次</button>
+                  <button onClick={() => resolveApproval(a.approvalId, 'reject')} style={{ padding:'6px 16px', fontSize:13, background:T.surface, color:T.text, border:`1px solid ${T.border}`, borderRadius:6, cursor:'pointer', fontFamily:'inherit' }}>拒绝</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
 
         <div style={{ padding:`${S.base}px ${S.xl}px ${S.lg}px` }}>
           <div style={{ display:'flex', gap:S.sm }}>
