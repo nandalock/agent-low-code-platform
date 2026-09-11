@@ -75,8 +75,10 @@ from backend.tool_system.sandbox.workspace import (  # noqa: E402
     parse_read_roots,
     probe_workspace_root,
     repo_root,
+    resolve_workspace_member,
     resolve_workspace_root,
     session_workspace,
+    session_workspace_path,
     to_container_path,
 )
 
@@ -386,6 +388,159 @@ def test_session_workspace_and_container_path():
         expect_raises(ValueError, to_container_path, "/etc/passwd", ws)
         expect_raises(ValueError, session_workspace, d, "../escape")
         expect_raises(ValueError, session_workspace, d, "")
+
+
+# ── 工作区读取路径的越界校验（api/workspace.py 的安全地基）──
+#
+# 工作区里的内容是**模型**写的。下面这组测试就是那道「模型能不能读到工作区
+# 之外」的闸门。
+
+
+def test_session_workspace_path_does_not_touch_disk():
+    """读路径用的纯路径函数**不得**建目录。
+
+    `session_workspace` 会 mkdir（沙箱调用侧需要），读侧只能问「沙箱会写到哪」——
+    否则光是打开一次工作区页面，就会给每个会话凭空造出目录来，把「有工作区」
+    这个判据自己污染掉。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        root = os.path.realpath(d)
+        p = session_workspace_path(root, "abc123")
+        assert str(p) == os.path.join(root, "abc123")
+        assert not p.exists(), "读路径不该创建目录"
+        # 校验与 session_workspace 同一处，不能各写一份
+        expect_raises(ValueError, session_workspace_path, root, "../escape")
+        expect_raises(ValueError, session_workspace_path, root, "")
+        expect_raises(ValueError, session_workspace_path, root, "..")
+        # 会创建的那个仍然照常创建
+        assert session_workspace(root, "abc123") == str(p)
+        assert p.is_dir()
+
+
+def test_resolve_workspace_member_accepts_legal_paths():
+    with tempfile.TemporaryDirectory() as d:
+        ws = session_workspace(os.path.realpath(d), "sess1")
+        os.makedirs(os.path.join(ws, "sub", "deeper"))
+        with open(os.path.join(ws, "a.txt"), "w") as f:
+            f.write("hi")
+        assert str(resolve_workspace_member(ws, "")) == ws          # 空串 = 根
+        assert str(resolve_workspace_member(ws, ".")) == ws
+        assert str(resolve_workspace_member(ws, "a.txt")) == os.path.join(ws, "a.txt")
+        assert str(resolve_workspace_member(ws, "sub/deeper")) == os.path.join(ws, "sub", "deeper")
+        # './' 与重复斜杠是正常的相对路径写法，不该被当成越界
+        assert str(resolve_workspace_member(ws, "./sub/deeper")) == os.path.join(ws, "sub", "deeper")
+
+
+def test_resolve_workspace_member_rejects_traversal():
+    with tempfile.TemporaryDirectory() as d:
+        ws = session_workspace(os.path.realpath(d), "sess1")
+        for bad in (
+            "..",                       # 根之上
+            "../outside",               # 逃出会话工作区
+            "a/../../outside",          # 先下钻再逃逸
+            "a//../b/../../c",          # 混着冗余分隔符
+            "/etc/passwd",              # 绝对路径
+            "\\windows\\system32",      # UNC
+            "..\\..\\x",                # Windows 分隔符 + 上跳
+            "D:/jk/Papers",             # 盘符绝对路径（POSIX 上看不出是绝对的）
+        ):
+            expect_raises(ValueError, resolve_workspace_member, ws, bad)
+
+
+def test_resolve_workspace_member_rejects_symlink_escape():
+    """``ln -s /etc/passwd evil`` —— 字符串层毫无破绽的那一类攻击。
+
+    路径里没有 ``..``、不是绝对路径，纯前缀检查会放行；只有 ``resolve()``
+    解开符号链接才暴露真实目标。这是本函数存在的**主要理由**。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        base = os.path.realpath(d)
+        ws = session_workspace(base, "sess1")
+        secret = os.path.join(base, "secret.txt")
+        with open(secret, "w") as f:
+            f.write("secret")
+
+        link = os.path.join(ws, "evil")
+        try:
+            os.symlink(secret, link)
+        except (OSError, NotImplementedError):
+            return  # Windows 无符号链接权限：跳过（容器内为 Linux，必跑）
+
+        assert os.path.exists(link)  # 从字符串上看，这就是个普通文件名
+        expect_raises(ValueError, resolve_workspace_member, ws, "evil")
+
+        # 指向根外**目录**的链接：下钻与下钻后的具体文件都要挡住
+        os.symlink(base, os.path.join(ws, "updir"))
+        expect_raises(ValueError, resolve_workspace_member, ws, "updir")
+        expect_raises(ValueError, resolve_workspace_member, ws, "updir/secret.txt")
+
+        # 悬空链接：resolve(strict=False) 不抛异常，但目标仍在根外 → 必须拒
+        os.symlink("/nonexistent/nope", os.path.join(ws, "dangling"))
+        expect_raises(ValueError, resolve_workspace_member, ws, "dangling")
+
+        # 反例：**根内**的符号链接是合法的 —— 模型自己 ln 出来的捷径不该被拒
+        real = os.path.join(ws, "real.txt")
+        with open(real, "w") as f:
+            f.write("hi")
+        os.symlink(real, os.path.join(ws, "good"))
+        assert str(resolve_workspace_member(ws, "good")) == os.path.realpath(real)
+
+
+def test_resolve_workspace_member_handles_broken_input():
+    with tempfile.TemporaryDirectory() as d:
+        ws = session_workspace(os.path.realpath(d), "sess1")
+        expect_raises(ValueError, resolve_workspace_member, ws, "x" * 5000)  # 病态长度
+        # 符号链接自环：resolve() 抛 OSError，必须翻译成 ValueError 而不是漏出去
+        loop = os.path.join(ws, "loop")
+        try:
+            os.symlink(loop, loop)
+        except (OSError, NotImplementedError):
+            return
+        expect_raises(ValueError, resolve_workspace_member, ws, "loop")
+
+
+def test_api_preview_binary_sniff():
+    """预览的二进制嗅探：内容由模型书写，猜错类型就是把 API 源当 XSS 宿主。"""
+    try:
+        from backend.api.workspace import _content_disposition, _looks_binary, _sniff_image
+    except ImportError:
+        return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
+
+    # 图片按**魔数**判类型，不看文件名 —— 名字是模型起的
+    assert _sniff_image(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20) == "image/png"
+    assert _sniff_image(b"\xff\xd8\xff\xe0" + b"\x00" * 20) == "image/jpeg"
+    assert _sniff_image(b"GIF89a" + b"\x00" * 20) == "image/gif"
+    assert _sniff_image(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == "image/webp"
+    assert _sniff_image(b"BM" + b"\x00" * 20) == "image/bmp"
+    # SVG 是**可携带脚本的 XML**，内联它等于把 API 源当 XSS 宿主 —— 必须不为图片
+    assert _sniff_image(b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>') is None
+    assert _sniff_image(b"<?xml version=\"1.0\"?><svg/>") is None
+    assert _sniff_image(b"plain text") is None
+    # RIFF 但不含 WEBP（如 WAV）不能冒充图片
+    assert _sniff_image(b"RIFF\x00\x00\x00\x00WAVEfmt ") is None
+    assert _sniff_image(b"") is None
+
+
+    assert _looks_binary(b"") is False
+    assert _looks_binary("中文文本\n".encode()) is False
+    assert _looks_binary(b"\x00\x01\x02") is True          # NUL 字节
+    assert _looks_binary(b"\xff\xfe\x00\x00") is True      # UTF-16 BOM
+    assert _looks_binary(b"%PDF-1.7\n\xe2\xe3\xcf\xd3") is True   # 非 UTF-8 的 PDF 头
+    # 窗口尾部切断多字节字符是**误判**，不是二进制：窗口读满时才这么判
+    cutoff = "中" * 3000
+    head = cutoff.encode()[:8192]
+    assert len(head) == 8192
+    assert _looks_binary(head) is False
+
+    # 下载：ASCII 回退 + RFC 5987，中文名靠 filename* 才能落地
+    cd = _content_disposition('总结 "v2".md')
+    assert cd.startswith('attachment; filename="'), cd
+    assert "filename*=UTF-8''" in cd, cd
+    # 文件名里的引号/反斜杠不得逃出 ASCII 回退的引号对（否则能注入 header 参数）
+    ascii_part = cd[len('attachment; filename="'):].split('"')[0]
+    assert '"' not in ascii_part and "\\" not in ascii_part, cd
+    assert "%22" in cd and "%E6%80%BB" in cd, cd  # 原始名走 filename*，含编码后的引号
+    assert _content_disposition("a.txt", inline=True).startswith("inline; ")
 
 
 # ── docker e2e ──

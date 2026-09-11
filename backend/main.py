@@ -13,6 +13,7 @@ from backend.api.memory import router as memory_router
 from backend.api.mcp import router as mcp_router
 from backend.api.tools import router as tools_router
 from backend.api.workflow import router as workflow_router
+from backend.api.workspace import router as workspace_router
 
 app = FastAPI(title="agent-low-code-platform")
 app.add_middleware(
@@ -32,6 +33,7 @@ app.include_router(memory_router)
 app.include_router(mcp_router)
 app.include_router(tools_router)
 app.include_router(workflow_router)
+app.include_router(workspace_router)
 
 @app.on_event("startup")
 async def startup():

@@ -100,8 +100,9 @@ function ToolRow({ node }: { node: Extract<TrajNode, { kind: 'tool' }> }) {
       <div style={{ display: 'flex', alignItems: 'center', gap: S.sm, fontSize: 12 }}>
         <StatusIcon size={13} style={{ color: statusColor, flexShrink: 0, animation: running ? 'spin 0.8s linear infinite' : undefined }} />
         <span style={{ fontWeight: 600, color: T.text, fontFamily: 'monospace' }}>{tool}</span>
-        {node.step > 0 && <span style={{ fontSize: 11, color: T.tertiary }}>· 第 {node.step} 步</span>}
-        <span style={{ fontSize: 11, color: statusColor }}>{statusLabel}</span>
+        {/* nowrap：窄栏（工作区右栏 440px）里这几个短标签会被折成「第 1 / 步」 */}
+        {node.step > 0 && <span style={{ fontSize: 11, color: T.tertiary, whiteSpace: 'nowrap' }}>· 第 {node.step} 步</span>}
+        <span style={{ fontSize: 11, color: statusColor, whiteSpace: 'nowrap' }}>{statusLabel}</span>
         {/* 沙箱事实：仅在工具确实经过沙箱时出现（非沙箱工具 node.sandbox 为 null） */}
         {node.sandbox && (
           <span style={{

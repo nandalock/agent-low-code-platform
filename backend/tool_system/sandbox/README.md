@@ -25,7 +25,7 @@
 | `policy.py` | 模式优先级链（纯函数） | `runtime.py`、executor |
 | `escalation.py` | **完整升权链**：严格序表、参数校验、调用审批、两个模型可见标记。不认识 session / agent / **审批实现** | executor、`runtime.py` |
 | `classify.py` | 结果分类：`denied` / `runner_failed` / `normal` | executor |
-| `workspace.py` | 路径映射、工作区根解析与安全校验、只读挂载构造、功能探测 | 装配层、后端 |
+| `workspace.py` | 路径映射、工作区根解析与安全校验、**工作区内相对路径的越界校验**、只读挂载构造、功能探测 | 装配层、后端、`api/workspace.py` |
 | `errors.py` | `SandboxUnavailableError` —— fail-closed 的唯一出口 | 全层 |
 | `runtime.py` | 装配 + **能力开关** + 内建工具注册（`bash` / `python` 的 schema 在这里） | `main.py`、`api/tools.py` |
 | `test_sandbox.py` | 自检：纯逻辑 + 真实 docker e2e（docker 不可用时自动跳过） | — |
@@ -34,7 +34,7 @@
 
 ## 2. 核心不变量
 
-改这个子系统之前，这八条不能破：
+改这个子系统之前，这九条不能破：
 
 1. **fail-closed 是硬约束**。`confine()` 只有两种结果：返回带约束的 argv，或抛
    `SandboxUnavailableError`。**静默的无约束透传永远不合法** —— 没有后端 ≠ 降级运行。
@@ -54,6 +54,12 @@
 8. **升权必须问人，没有「不问就放」这一档**。没有审批通道时升权恒不可用
    （等价 DSH 的 `approval=never`）—— 没有判定方 ≠ 默认批准。四条 fail-closed
    路径（无通道 / 无 agent / 超时 / 未知裁决值）全部落在「不开门」上。
+9. **工作区只有一个写方（沙箱），读路径必须经 `resolve_workspace_member`**。
+   用户侧的浏览器（`api/workspace.py`）**只读**，不提供写/删/改名 —— 少一个写接口
+   就少一整类「模型正在写、用户正在删」的竞态。读侧的工作区内容是**模型**写的，
+   即不可信输入源：绝对路径、`..`、以及 **`resolve()` 后越界的符号链接**
+   （模型可以 `ln -s /etc/passwd evil`，字符串上毫无破绽）全部拒 400。
+   纯字符串前缀检查**不合法**，必须 resolve 后再判 `is_relative_to`。
 
 依赖方向：`tool_system/` **不依赖** `agents/` 层。会话相关的输入（session_id、cwd、
 覆盖模式）由调用方以原始值传入。
@@ -239,6 +245,10 @@ interaction/approval    怎么问人、怎么等回答      ← Channel / Servic
 7. **镜像无 digest pin**。`python:3.12-slim` 是可变 tag。
 8. **`read_roots` 不进事件**。`tool/result` 的 sandbox 事实只有 `{mode, enforcement,
    outcome}` —— 事后审计无法回答「这次会话读到了哪些宿主目录」。
+9. **读路径有 TOCTOU 窗口**。`resolve_workspace_member` 先 `resolve()` 判越界，
+   `FileResponse` 之后才真正打开文件 —— 中间模型可以在沙箱里把那个已解析的路径
+   换成符号链接。威胁模型是「模型犯错」而非「本地攻击者抢 syscall」，故接受；
+   要收紧得走 `O_NOFOLLOW` / `openat` 逐段打开，不值得现在的复杂度。
 
 ---
 
@@ -249,6 +259,10 @@ interaction/approval    怎么问人、怎么等回答      ← Channel / Servic
 - 新增后端？→ 实现 `SandboxProvider.confine()`，声明自己的 `denial_signatures` 与
   `runner_failure_rules`（**不要**跨后端取并集 —— 并集会声称本后端永远不会产生的拒绝）
 - 改结果格式？→ 更新 `classify.py` 的标记 + `tool/result` 的 sandbox 事实 + 快照测试
+- 动用户侧工作区读接口？→ 路径**只能**经 `resolve_workspace_member`（见不变量 9），
+  别在 `api/workspace.py` 里自己拼路径；租户归属查 `conversations.session_id`，
+  因为 `session_headers` 没有 tenant 列
+- 动 `notice`？→ 记得走一遍「被拒 → 重试 → 再被拒」的时序，回路熔断在 `executor.py`
 - 动升权？→ 三件事必须一起看：**链在 `approve_escalation` 里一次走完**（别拆回
   「先判断后审批」两段）、**`on_request` 回调必须在 await 之前**（否则前端看不到
   等待态）、**事件 schema 是记录不是配置**（进了策略解析就把一次性变成持久放权）
