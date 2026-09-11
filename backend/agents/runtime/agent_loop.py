@@ -355,10 +355,27 @@ class AgentLoop:
         """
         return ToolContext(
             session_id=self.session.header.id,
+            tool_call_id=tool_call_id,
             agent_id=self.key,
             event_sink=SessionToolEventSink(self.session, tool_call_id, forward=self.on_event),
             sandbox_policy=self._sandbox_policy(),
+            approval=self._approval_channel(),
         )
+
+    @staticmethod
+    def _approval_channel():
+        """审批通道；未装配返回 None（需要审批的能力将 fail-closed）。
+
+        与 :meth:`_sandbox_policy` 同模式：装配层的单例在这里惰性取用，
+        Loop 只负责把它挂到 ToolContext 上，不解释它是什么 —— 审批是
+        interaction 层的通用能力，Loop 不认识它的实现。
+        """
+        try:
+            from backend.interaction.approval import get_approval_service
+            return get_approval_service()
+        except Exception as e:
+            logger.warning(f"审批服务取用失败（需要审批的能力将一律被拒）: {e}")
+            return None
 
     def _sandbox_policy(self):
         """本会话一次调用的沙箱执行策略；沙箱未装配时 None（MCP 工具不受影响）。

@@ -9,13 +9,25 @@ Docker 后端把工作区根挂到容器内固定点，因此需要**路径映�
 包括 .env 与源码——挂进沙箱，因此 :func:`assert_root_is_safe` 在解析阶段就拒绝。
 """
 import os
+import re
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Sequence
 
 from backend.tool_system.sandbox.errors import SandboxUnavailableError
 
 #: 工作区在沙箱容器内的挂载点。命令看到的路径以它为准。
 CONTAINER_WORKSPACE = "/workspace"
+
+#: 附加**只读**挂载的容器内父目录；每个根挂到 ``<它>/<名字>``。
+#: 这是对 DeepSeek Harness 的**刻意扩展**：dsh 的同世界后端里「读」不受限，
+#: 因而没有读轴（``roots.ts`` 只派生可写根）；Docker 后端的读天然被容器边界
+#: 收窄，要读宿主目录就只能显式挂——故本轴为 Docker 后端专有，不参与
+#: ``SandboxMode`` 词汇（模式仍只描述**写**效果）。
+CONTAINER_READ_ROOT = "/mnt/read"
+
+#: 部署配置的环境变量名（逗号分隔的宿主绝对路径）。
+READ_ROOTS_ENV = "SANDBOX_READ_ROOTS"
 
 #: 功能探测用的最小镜像（只用来证明 daemon 侧能读写该路径）。
 DEFAULT_PROBE_IMAGE = "alpine:3.20"
@@ -25,6 +37,9 @@ WORKSPACE_ROOT_ENV = "SANDBOX_WORKSPACE_ROOT"
 
 #: 探测文件写在根目录，探测后立即删除。
 _PROBE_NAME = ".sandbox-probe"
+
+#: 工作区内相对路径的长度上限（病态输入早筛，别把超长路径喂给内核）。
+_MAX_REL_LEN = 4096
 
 
 def repo_root() -> Path:
@@ -94,15 +109,23 @@ def resolve_workspace_root(configured: str | None = None) -> str:
     return str(path)
 
 
-def session_workspace(root: str, session_id: str) -> str:
-    """某会话的工作区目录 ``<root>/<session_id>``，惰性创建。
+def session_workspace_path(root: str, session_id: str) -> Path:
+    """某会话的工作区目录 ``<root>/<session_id>`` —— **纯路径，不触盘**。
+
+    读路径（``api/workspace.py``）必须用这个：它只想知道「沙箱会写到哪」，
+    不该因为有人打开了一下工作区页面就凭空造出目录来。
 
     Raises:
         ValueError: session_id 含路径分隔符（防止越出工作区根）。
     """
     if not session_id or "/" in session_id or "\\" in session_id or session_id in (".", ".."):
         raise ValueError(f"非法 session_id: {session_id!r}")
-    path = Path(root).resolve() / session_id
+    return Path(root).resolve() / session_id
+
+
+def session_workspace(root: str, session_id: str) -> str:
+    """``session_workspace_path`` + 惰性创建。**沙箱调用侧**用这个。"""
+    path = session_workspace_path(root, session_id)
     path.mkdir(parents=True, exist_ok=True)
     return str(path)
 
@@ -126,6 +149,126 @@ def to_container_path(host_path: str, root: str) -> str:
     if str(rel) == ".":
         return CONTAINER_WORKSPACE
     return f"{CONTAINER_WORKSPACE}/{rel.as_posix()}"
+
+
+def resolve_workspace_member(root: str, rel: str) -> Path:
+    """把工作区内的**相对路径**解析为宿主绝对路径；越界一律拒绝。
+
+    读工作区的调用方（当前是 ``api/workspace.py``）必须走这里，不能自己
+    ``os.path.join`` —— 工作区里的内容是**模型**写的，模型是不可信输入源。
+    本函数同时收两道口，缺一不可：
+
+      - **字符串层**：拒绝绝对路径、Windows 盘符、``\\``、以及任何 ``..`` 段。
+        便宜的早筛，让绝大多数恶意输入在碰文件系统之前就死掉。
+      - **inode 层**：``resolve()`` 之后再判是否仍在 ``root`` 内。
+        **这一步不可省**：模型可以在工作区里 ``ln -s /etc/passwd evil``，
+        此时 ``evil`` 在字符串上完全干净（没有 ``..``、不是绝对路径），
+        只有解开符号链接才暴露真实目标。纯前缀比较挡不住它。
+
+    ``root`` 自身先 ``resolve()``：工作区根本身可能就是符号链接（宿主挂载
+    常这么干），两侧都归一化才在同一坐标系里比较。
+
+    Args:
+        root: 会话工作区根 ``<SANDBOX_WORKSPACE_ROOT>/<session_id>``。
+        rel: 工作区内的相对路径；``""`` / ``"."`` 表示根自身。
+
+    Returns:
+        已解析的绝对路径，保证在 ``root`` 之内（**不保证存在** ——
+        路径是否存在由调用方判断，因为「不存在」和「越界」要给出不同的响应）。
+
+    Raises:
+        ValueError: 非法相对路径，或解析后越出工作区根。
+    """
+    root_path = Path(root).resolve()
+
+    if len(rel) > _MAX_REL_LEN:
+        raise ValueError(f"路径过长（>{_MAX_REL_LEN}）")
+    if rel in ("", "."):
+        return root_path
+    if rel.startswith("/") or rel.startswith("\\") or _WINDOWS_ABS.match(rel):
+        raise ValueError(f"必须是工作区内的相对路径: {rel!r}")
+    if "\\" in rel:
+        raise ValueError(f"路径分隔符只支持 '/': {rel!r}")
+    # PurePosixPath 不折叠 '..'（与 os.path.normpath 不同），这里正需要它原样可见
+    if ".." in PurePosixPath(rel).parts:
+        raise ValueError(f"路径不得包含 '..': {rel!r}")
+
+    try:
+        target = (root_path / rel).resolve()
+    except (OSError, RuntimeError) as e:
+        # 自环符号链接 / 路径过长。RuntimeError 不是笔误：CPython 3.12 的
+        # resolve() 对符号链接自环抛的就是它（3.13 起才改回 OSError）。
+        # 漏掉它会让一个构造出来的路径变成 500 —— 而这里必须是 400。
+        raise ValueError(f"路径无法解析: {rel!r} ({e})") from e
+    if not _contains(root_path, target):
+        raise ValueError(f"路径越出工作区: {rel!r}")
+    return target
+
+
+# ── 只读挂载根（宿主任意目录 → 沙箱内只读）──
+
+#: Windows 盘符绝对路径（``D:/...`` / ``D:\...``）。后端跑在 Linux 上，
+#: 因此不能靠 ``os.path.isabs`` 判断——它会把合法的 ``D:/jk`` 判成相对路径。
+_WINDOWS_ABS = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def normalize_host_path(path: str) -> str:
+    """规范化一个宿主路径：反斜杠转正斜杠 + 绝对性校验。
+
+    Raises:
+        ValueError: 相对路径。**必须拒绝**——docker 收到相对路径会把它当成
+            named volume 的名字，静默创建一个空卷挂上去，表现为「挂载成功但
+            目录是空的」，是最难排查的一种失败。
+    """
+    p = path.strip().replace("\\", "/")
+    if p.startswith("/") or _WINDOWS_ABS.match(p):
+        return p
+    raise ValueError(
+        f"{READ_ROOTS_ENV} 的每一项必须是绝对路径: {path!r}；"
+        "相对路径会被 docker 当成 named volume 静默挂成空卷"
+    )
+
+
+def _mount_name(host_path: str, taken: set[str]) -> str:
+    """给一个宿主路径取容器内的挂载名：basename，重名时追加序号。
+
+    取可读名而不是下标（``/mnt/read/0``），是为了让模型 ``ls /mnt/read``
+    就能自己发现有哪些目录，不依赖外部告知的映射表。
+    """
+    base = host_path.rstrip("/").rsplit("/", 1)[-1] or "root"
+    name, n = base, 1
+    while name in taken:
+        n += 1
+        name = f"{base}-{n}"
+    taken.add(name)
+    return name
+
+
+def build_read_mounts(roots: Sequence[str]) -> list[tuple[str, str]]:
+    """把配置的只读根解析成 ``[(宿主路径, 容器内挂载点), ...]``。
+
+    去重保序：同一个路径配两次会让 docker 因挂载点冲突而启动失败。
+    """
+    mounts: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    names: set[str] = set()
+    for raw in roots:
+        host = normalize_host_path(raw)
+        if host in seen:
+            continue
+        seen.add(host)
+        mounts.append((host, f"{CONTAINER_READ_ROOT}/{_mount_name(host, names)}"))
+    return mounts
+
+
+def parse_read_roots(raw: str | None) -> tuple[str, ...]:
+    """解析 ``SANDBOX_READ_ROOTS``（逗号分隔）；未配置 / 空串返回 ``()``。
+
+    空串与未配置等价（compose 的 ``${VAR:-}`` 会产出空串），都表示「不挂」。
+    """
+    if not raw:
+        return ()
+    return tuple(x for x in (p.strip() for p in raw.split(",")) if x)
 
 
 def probe_workspace_root(

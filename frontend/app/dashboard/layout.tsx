@@ -29,6 +29,7 @@ export default function DashboardLayout({ children }:{ children:React.ReactNode 
   useEffect(() => { setCollapsed(localStorage.getItem('sidebar_collapsed')==='true'); }, []);
   const isChat = pathname==='/dashboard/chat';
   const isMcp = pathname === '/dashboard/mcp';
+  const isWorkspace = pathname === '/dashboard/workspace';
   const isWorkflowEditor = pathname.startsWith('/dashboard/workflow/') && pathname !== '/dashboard/workflow';
   const [chatMounted, setChatMounted] = useState(false);
   useEffect(()=>{ if(isChat&&!chatMounted) setChatMounted(true); },[isChat,chatMounted]);
@@ -85,9 +86,11 @@ export default function DashboardLayout({ children }:{ children:React.ReactNode 
       </div>
 
       {/* ── Content ── */}
-      {!isChat && !isMcp && !isWorkflowEditor && <div style={{ flex:1, background:T.bg, overflow:'auto', padding:S.xl }}>{children}</div>}
+      {!isChat && !isMcp && !isWorkspace && !isWorkflowEditor && <div style={{ flex:1, background:T.bg, overflow:'auto', padding:S.xl }}>{children}</div>}
       {isMcp && <div style={{ flex:1, overflow:'hidden' }}>{children}</div>}
       {isWorkflowEditor && <div style={{ flex:1, overflow:'hidden' }}>{children}</div>}
+      {/* 工作区是自管滚动的三栏（会话 / 文件树 / 预览），不要外层 padding 与滚动条 */}
+      {isWorkspace && <div style={{ flex:1, minWidth:0, overflow:'hidden' }}>{children}</div>}
       {chatMounted && <div style={{ flex:1, display:isChat?undefined:'none' }}><ChatPageInner /></div>}
     </div>
   );

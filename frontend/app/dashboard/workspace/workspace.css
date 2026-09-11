@@ -1,0 +1,108 @@
+/* 工作区预览面板的样式。
+ *
+ * 全站其余部分都是内联样式；这里破例用一个 CSS 文件，因为 **Markdown 渲染出来的
+ * 元素没法用内联样式命中**（React 组件树的子元素不在我们手里）。
+ *
+ * 颜色不硬编码：由 page.tsx 从 `app/theme.ts` 注入 `--ws-*` 自定义属性，
+ * 主题仍然是唯一真相来源。
+ */
+
+.ws-spin {
+  animation: ws-spin 0.9s linear infinite;
+}
+
+@keyframes ws-spin {
+  to { transform: rotate(360deg); }
+}
+
+.ws-prose {
+  color: var(--ws-text);
+  font-size: 13px;
+  line-height: 1.75;
+  word-break: break-word;
+}
+
+.ws-prose > *:first-child { margin-top: 0; }
+.ws-prose > *:last-child  { margin-bottom: 0; }
+
+.ws-prose h1,
+.ws-prose h2,
+.ws-prose h3,
+.ws-prose h4 {
+  color: var(--ws-text);
+  font-weight: 600;
+  line-height: 1.4;
+  margin: 1.6em 0 0.6em;
+}
+
+.ws-prose h1 { font-size: 20px; padding-bottom: 6px; border-bottom: 1px solid var(--ws-border); }
+.ws-prose h2 { font-size: 17px; padding-bottom: 5px; border-bottom: 1px solid var(--ws-border); }
+.ws-prose h3 { font-size: 15px; }
+.ws-prose h4 { font-size: 14px; }
+
+.ws-prose p { margin: 0.8em 0; }
+
+.ws-prose ul,
+.ws-prose ol { margin: 0.8em 0; padding-left: 1.6em; }
+.ws-prose li { margin: 0.3em 0; }
+.ws-prose li > ul,
+.ws-prose li > ol { margin: 0.3em 0; }
+
+.ws-prose a { color: var(--ws-accent); text-decoration: none; }
+.ws-prose a:hover { text-decoration: underline; }
+
+.ws-prose blockquote {
+  margin: 0.9em 0;
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--ws-border);
+  color: var(--ws-secondary);
+}
+
+.ws-prose code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  background: var(--ws-code-bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.ws-prose pre {
+  margin: 0.9em 0;
+  padding: 12px 14px;
+  border-radius: 6px;
+  background: var(--ws-code-bg);
+  overflow-x: auto;
+}
+
+/* 块级代码不继承行内的背景/内边距，否则会套两层 */
+.ws-prose pre code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.ws-prose table {
+  margin: 0.9em 0;
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12.5px;
+}
+
+.ws-prose th,
+.ws-prose td {
+  border: 1px solid var(--ws-border);
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.ws-prose th { background: var(--ws-hover); font-weight: 600; }
+
+.ws-prose hr {
+  margin: 1.4em 0;
+  border: none;
+  border-top: 1px solid var(--ws-border);
+}
+
+.ws-prose img { max-width: 100%; border-radius: 6px; }

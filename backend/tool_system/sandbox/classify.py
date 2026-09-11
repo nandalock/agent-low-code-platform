@@ -17,14 +17,8 @@ from backend.tool_system.sandbox.provider import ConfinedArgv, RunnerFailureRule
 
 Outcome = Literal["normal", "denied", "runner_failed"]
 
-#: 被拒绝的调用在结果文本里携带的标记。阶段 2 的升权流程依赖它，因此从
-#: 第一阶段起就必须产出（docs/sandbox-design.md §10.2）。
-DENIAL_MARKER_TEMPLATE = "[sandbox: file access denied under {mode} mode]"
-
-
-def denial_marker(mode: str) -> str:
-    """该模式对应的拒绝标记文本。"""
-    return DENIAL_MARKER_TEMPLATE.format(mode=mode)
+# 拒绝标记文本（``sandbox_denial_marker``）住在 :mod:`.escalation`：它要与升权
+# 提示成对出现，两者同属「使用点事实」。本模块只负责**分类**，不负责措辞。
 
 
 @dataclass(frozen=True)

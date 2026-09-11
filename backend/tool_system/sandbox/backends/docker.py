@@ -12,6 +12,11 @@ Landlock 授权 / Seatbelt SBPL，本后端用 ``docker run`` 的参数。
 因此工作区外写入会撞上内核的 ``Read-only file system``（EROFS），与同世界
 后端的拒绝签名同源，分类器形状无需改动。
 
+**只读挂载轴（对 DeepSeek 的刻意扩展）**：``policy.read_roots`` 里每个宿主路径
+额外挂一条 ``-v <root>:/mnt/read/<name>:ro``。dsh 的同世界后端里读不受限，
+故无此轴；Docker 后端的读天然被容器边界收窄，要读宿主目录只能显式挂。
+挂载恒为 ``:ro`` —— 只增加可见性，不增加可写面。
+
 **已知缺口**：``confine(argv, policy)`` 的签名里没有镜像——DeepSeek 的词汇
 也没有。本后端因此在构造时固定一个镜像。将来要按工具切换镜像（bash 用通用
 镜像、python 用带科学栈的镜像），需要扩展 seam（provider 每镜像一个实例，
@@ -23,7 +28,7 @@ from typing import Sequence
 from backend.tool_system.sandbox.errors import SandboxUnavailableError
 from backend.tool_system.sandbox.provider import ConfinedArgv, RunnerFailureRule, SandboxProvider
 from backend.tool_system.sandbox.vocabulary import SandboxPolicy
-from backend.tool_system.sandbox.workspace import CONTAINER_WORKSPACE
+from backend.tool_system.sandbox.workspace import CONTAINER_WORKSPACE, build_read_mounts
 
 #: 默认沙箱镜像。
 DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
@@ -123,7 +128,22 @@ class DockerProvider(SandboxProvider):
             temp_args = ["--tmpfs", f"/tmp:rw,size={self._tmpfs_size},exec"]
         else:
             workspace_mount = f"{root}:{self._container_workspace}:ro"
+            # read-only 刻意不给 /tmp：临时区域是 workspace-write 承诺的一部分
+            # （上游 dsh-bash-sandbox 同样如此），给了就模糊了两档的边界。
+            #
+            # 但 `2>/dev/null` **照常可用**，无需额外处理：Docker 把 /dev 挂成
+            # 独立的可写 tmpfs，写设备节点不经 rootfs，故 --read-only 挡不住它。
+            # （实测：`echo hi > /dev/null` 在 --read-only 下成功。上游 README
+            # 专门声明这一点是因为它的同世界后端没有这层容器默认值——Docker
+            # 后端白送，不要"补"成 tmpfs /dev，那会连设备节点一起换掉。）
             temp_args = []
+
+        # 附加只读挂载：恒为 :ro，与模式无关——它只拓宽「读得到」，不拓宽
+        # 「写得进」。放在工作区挂载之后，使首个 -v 恒为工作区（调用方与
+        # 测试据此定位主挂载）。
+        read_args: list[str] = []
+        for host_path, container_path in build_read_mounts(policy.read_roots):
+            read_args += ["-v", f"{host_path}:{container_path}:ro"]
 
         wrapped = [
             "docker", "run", "--rm", "-i",
@@ -134,6 +154,7 @@ class DockerProvider(SandboxProvider):
             "--read-only",
             *temp_args,
             "-v", workspace_mount,
+            *read_args,
             "-w", self._container_workspace,
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",

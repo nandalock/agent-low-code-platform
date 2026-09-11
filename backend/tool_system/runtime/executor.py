@@ -23,12 +23,22 @@ from abc import ABC, abstractmethod
 
 from backend.tool_system.adapters.mcp import MCP_URL, McpClient, get_mcp_client
 from backend.tool_system.context import ToolContext
-from backend.tool_system.events import TOOL_PROGRESS, ToolEvent
+from backend.tool_system.events import APPROVAL_REQUEST, SANDBOX_ESCALATION, TOOL_PROGRESS, ToolEvent
 from backend.tool_system.registry.descriptor import SandboxToolConfig, ToolDescriptor
-from backend.tool_system.sandbox.classify import classify_outcome, denial_marker
+from backend.interaction.approval import ApprovalRequest, can_ask_human
+from backend.tool_system.sandbox.classify import classify_outcome
 from backend.tool_system.sandbox.errors import SandboxUnavailableError
+from backend.tool_system.sandbox.escalation import (
+    EscalationDenied,
+    EscalationError,
+    EscalationInvalid,
+    approve_escalation,
+    escalation_hint_marker,
+    sandbox_denial_marker,
+)
+from backend.tool_system.sandbox.policy import resolve_policy
 from backend.tool_system.sandbox.provider import SandboxProvider
-from backend.tool_system.sandbox.vocabulary import SandboxPolicy
+from backend.tool_system.sandbox.vocabulary import SandboxExecutionPolicy, SandboxPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +220,136 @@ class SandboxExecutor(ToolExecutor):
         # provider 缺省时在执行时从装配层取（避免装配顺序耦合）
         self._provider = provider
 
+    # ── 升权 ──
+
+    async def _apply_escalation(
+        self,
+        descriptor: ToolDescriptor,
+        args: dict,
+        policy: SandboxExecutionPolicy,
+        context: ToolContext | None,
+    ) -> tuple[SandboxExecutionPolicy, EscalationError | None]:
+        """走完整条升权链（DSH ``approveEscalation`` 同构），把结果落到策略上。
+
+        分工：本方法**只提供外部事实**（当前模式、审批方、agent、工具名、
+        调用 id）并消费结果；链本身归 :func:`approve_escalation`。
+
+        **获批只影响这一次调用**：授权只存在于本次 args 里，调用结束即消失，
+        本方法与 escalation 都不保存任何状态。
+
+        Returns:
+            ``(policy, error)``。``error`` 非 None 表示这次调用确实申请过升权
+            但没批下来 —— 调用方据此**抑制升权提示**（见 :meth:`execute`
+            里 notice 的构造），否则等于请模型重试。
+        """
+        try:
+            target = await approve_escalation(
+                args,
+                current=policy.mode,
+                # 审批能力归 interaction.approval：本层只把 ctx 上的通道与上下文转交
+                approval=context.approval if context is not None else None,
+                agent=context.agent_id if context is not None else None,
+                tool_name=descriptor.name,
+                tool_call_id=context.tool_call_id if context is not None else None,
+                # 挂起**之前**把申请推出去，否则用户在等待期间看不到待批准卡片
+                on_request=lambda req: self._emit_approval_request(context, descriptor.name, req),
+            )
+        except EscalationInvalid as e:
+            # 非法请求：整条调用作废并回一条可修正的错误（DSH 把
+            # validateEscalationArgs 放在 validateBashArgs 顶部，同样是让调用
+            # 直接失败而不是静默降级）。**不打扰人**——这一档根本不该弹审批。
+            await self._emit_escalation(context, descriptor.name, policy.mode, target=None, error=e)
+            raise
+        except EscalationDenied as e:
+            # 合法但没批下来：回退到原策略照常执行——模型该看到的是沙箱自己
+            # 产出的拒绝事实（§10.2 的标记），而不是「升权被拒」这个替代错误。
+            await self._emit_escalation(context, descriptor.name, policy.mode, target=None, error=e)
+            return policy, e
+
+        if target is None:
+            return policy, None  # 没这回事：未请求 / 请求等同当前模式
+
+        await self._emit_escalation(context, descriptor.name, policy.mode, target=target, error=None)
+        # explicit_mode 是优先级链的最高位，故这次解析的结果必然是目标模式、
+        # 其余字段原样携带。走 resolve_policy 而非 dataclasses.replace：
+        # 「策略怎么解析」只有一份实现（sandbox/policy.py）。
+        wider = resolve_policy(
+            workspace_root=policy.workspace_root,
+            session_id=policy.session_id,
+            explicit_mode=target,
+            read_roots=policy.read_roots,
+        )
+        return wider, None
+
+    @staticmethod
+    async def _emit_approval_request(
+        context: ToolContext | None,
+        tool_name: str,
+        req: ApprovalRequest,
+    ) -> None:
+        """待裁决申请 → event_sink（装配层决定落成 Event Log + UI 流）。
+
+        ``reason`` 与 ``metadata`` 原样透出：审批是通用能力，执行器**不解释**
+        metadata 的内容（那里放的是沙箱自己的模式信息）。
+        """
+        sink = context.event_sink if context is not None else None
+        if sink is None:
+            return
+        try:
+            await sink.emit(ToolEvent(
+                type=APPROVAL_REQUEST,
+                tool_name=tool_name,
+                session_id=context.session_id,
+                trace_id=context.trace_id,
+                data={
+                    "approval_id": req.approval_id,
+                    "tool_call_id": req.tool_call_id,
+                    "reason": req.reason,
+                    "metadata": req.metadata,
+                },
+            ))
+        except Exception as e:
+            logger.warning(f"approval.request 发送失败（不影响执行）: {tool_name}: {e}")
+
+    @staticmethod
+    async def _emit_escalation(
+        context: ToolContext | None,
+        tool_name: str,
+        from_mode: str,
+        *,
+        target: str | None,
+        error: EscalationError | None,
+    ) -> None:
+        """升权事实 → event_sink，与 tool.progress 同路径。
+
+        Executor 只 emit，「落到哪里」归装配层（当前：Session Event Log 的
+        sandbox/escalation + UI 事件流）。无 sink 时静默跳过，不影响执行。
+
+        ``target`` 与 ``error`` 至多一个非 None（同为 None 时调用方不会走到这）。
+        """
+        sink = context.event_sink if context is not None else None
+        if sink is None:
+            return
+        try:
+            await sink.emit(ToolEvent(
+                type=SANDBOX_ESCALATION,
+                tool_name=tool_name,
+                session_id=context.session_id,
+                trace_id=context.trace_id,
+                data={
+                    "from": from_mode,
+                    "requested": target or (error.requested if error is not None else None),
+                    "to": target,
+                    "granted": target is not None,
+                    "reason": "granted" if target is not None else (error.reason if error else "denied"),
+                    "justification": error.justification if error is not None else "",
+                    # 与 approval.request 配对，供前端收起对应的待批准卡片
+                    "approval_id": error.approval_id if error is not None else None,
+                },
+            ))
+        except Exception as e:
+            logger.warning(f"sandbox.escalation 发送失败（不影响执行）: {tool_name}: {e}")
+
     async def execute(
         self,
         descriptor: ToolDescriptor,
@@ -225,10 +365,19 @@ class SandboxExecutor(ToolExecutor):
             # fail-closed：没有策略就不执行（沙箱未装配 / 上下文未携带）
             return {"error": f"沙箱策略缺失，拒绝执行 {descriptor.name}（沙箱未装配？）"}
 
+        # argv 先构造（参数校验）：参数非法时命令根本跑不了，不该留下一条
+        # 「已批准升权」的审计记录——事件记的是真实发生过的事实。
         try:
             argv = build_sandbox_argv(cfg, args)
         except ValueError as e:
             return {"error": str(e)}
+
+        try:
+            policy, escalation = await self._apply_escalation(descriptor, args, policy, context)
+        except EscalationInvalid as e:
+            # 升权参数本身非法 → 整条调用作废，把 DSH 的错误文本原样回给模型
+            # （它照着改就行）。**不是**沙箱拒绝，不带 denied 语义。
+            return {"error": str(e), "sandbox": {"mode": policy.mode, "escalation_invalid": e.reason}}
 
         confined = None
         if policy.mode == "danger-full-access":
@@ -244,6 +393,7 @@ class SandboxExecutor(ToolExecutor):
                         mode=policy.mode,
                         workspace_root=policy.workspace_root,
                         session_id=policy.session_id,
+                        read_roots=policy.read_roots,
                     ),
                 )
             except SandboxUnavailableError as e:
@@ -291,7 +441,22 @@ class SandboxExecutor(ToolExecutor):
                 "outcome": outcome,
             }
             if outcome == "denied":
-                result["notice"] = denial_marker(policy.mode)
+                result["notice"] = sandbox_denial_marker(policy.mode)
+                if escalation is not None:
+                    # 本次调用**刚申请过升权且被拒**：绝不能再提示「可以升权」
+                    # ——那等于请模型重试，接下去必然是同一份请求的第二次失败。
+                    result["notice"] += (
+                        f"\n[sandbox: escalation refused ({escalation.reason})"
+                        " — do not retry this command as-is]"
+                    )
+                else:
+                    # 升权提示在使用点出现（与拒绝标记同位置），不进系统提示词：
+                    # 常驻提示词会让模型变保守（原则 7，DSH 实测过）。
+                    # 无审批通道（升权恒不可用，等价 DSH 的 never）与最宽模式下
+                    # 返回空串 —— 提示一个必然失败的动作只是让模型白烧一轮。
+                    hint = escalation_hint_marker(policy.mode, can_ask_human=can_ask_human())
+                    if hint:
+                        result["notice"] = f"{result['notice']}\n{hint}"
             elif outcome == "runner_failed":
                 result["notice"] = "沙箱基础设施故障：命令未执行，请勿重试同一命令。"
         return result

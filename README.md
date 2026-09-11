@@ -65,8 +65,10 @@ open http://localhost:3003
 | ---------- | ---------------------- |
 | Frontend   | http://localhost:3003  |
 | Backend API| http://localhost:8000  |
-| MCP Server | http://localhost:9001  |
 | RedisInsight | http://localhost:5540 |
+
+MCP Server（`:9001` 通用 / `:9002` 论文域）只监听 backend 容器内网，不映射到宿主机。
+要在宿主上调试：`docker compose exec backend curl localhost:9001/mcp`。
 
 ## 🏗️ Architecture
 
@@ -78,7 +80,7 @@ flowchart LR
     E --> M[Memory System]
     E --> C[Semantic Cache]
     E --> K[RAG · FAQ + Embeddings]
-    E --> T[MCP Registry & Server :9001]
+    E --> T[MCP Registry & Server :9001 (backend 容器内)]
     A --> P[(PostgreSQL + pgvector)]
     C --> R[(Redis)]
     K --> P

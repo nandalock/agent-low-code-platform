@@ -24,6 +24,9 @@ from backend.agents.runtime.session.sandbox_projection import (  # noqa: E402
 )
 from backend.agents.runtime.session.trajectory_projection import TrajectoryProjection  # noqa: E402
 from backend.tool_system.context import ToolContext  # noqa: E402
+from backend.tool_system.events import APPROVAL_REQUEST as APPROVAL_REQUEST_EVENT  # noqa: E402
+from backend.tool_system.events import SANDBOX_ESCALATION as SANDBOX_ESCALATION_EVENT  # noqa: E402
+from backend.tool_system.events import ToolEvent  # noqa: E402
 from backend.tool_system.registry.descriptor import SandboxToolConfig, ToolDescriptor  # noqa: E402
 from backend.tool_system.runtime.executor import SandboxExecutor, build_sandbox_argv  # noqa: E402
 from backend.tool_system.sandbox import (  # noqa: E402
@@ -31,14 +34,29 @@ from backend.tool_system.sandbox import (  # noqa: E402
     SandboxUnavailableError,
     classify_outcome,
     classify_runner_failure,
-    denial_marker,
+    escalation_hint_marker,
     is_confined_mode,
     matches_signature,
+    sandbox_denial_marker,
 )
 from backend.tool_system.sandbox.backends.docker import (  # noqa: E402
     DEFAULT_SANDBOX_IMAGE,
     DockerProvider,
     assert_no_isolation_injection,
+)
+from backend.interaction.approval import (  # noqa: E402
+    ApprovalService,
+    InProcessApprovalChannel,
+    set_approval_service,
+)
+from backend.tool_system.sandbox.escalation import (  # noqa: E402
+    ESCALATION_TARGETS,
+    WIDER_MODES,
+    EscalationDenied,
+    EscalationInvalid,
+    approve_escalation,
+    assert_strictly_wider,
+    validate_escalation_args,
 )
 from backend.tool_system.sandbox.policy import resolve_mode, resolve_policy  # noqa: E402
 from backend.tool_system.sandbox.provider import (  # noqa: E402
@@ -48,12 +66,19 @@ from backend.tool_system.sandbox.provider import (  # noqa: E402
 )
 from backend.tool_system.sandbox.vocabulary import SandboxExecutionPolicy  # noqa: E402
 from backend.tool_system.sandbox.workspace import (  # noqa: E402
+    CONTAINER_READ_ROOT,
+    READ_ROOTS_ENV,
     WORKSPACE_ROOT_ENV,
     assert_root_is_safe,
+    build_read_mounts,
+    normalize_host_path,
+    parse_read_roots,
     probe_workspace_root,
     repo_root,
+    resolve_workspace_member,
     resolve_workspace_root,
     session_workspace,
+    session_workspace_path,
     to_container_path,
 )
 
@@ -170,7 +195,8 @@ def test_matches_signature():
 
 
 def test_denial_marker():
-    assert denial_marker("read-only") == "[sandbox: file access denied under read-only mode]"
+    """拒绝标记（已迁到 escalation：要与升权提示成对出现）。"""
+    assert sandbox_denial_marker("read-only") == "[sandbox: file access denied under read-only mode]"
 
 
 # ── DockerProvider ──
@@ -227,6 +253,102 @@ def test_docker_rejects_empty_and_relative_root():
     expect_raises(SandboxUnavailableError, p.confine, ["true"], _policy(root="relative/path"))
 
 
+# ── 只读挂载根（对 DeepSeek 的扩展：Docker 后端的读轴）──
+
+
+def test_normalize_host_path():
+    """绝对性校验。相对路径必须被拒——docker 会把它当成 named volume 静默
+    创建一个空卷挂上去，表现为「挂载成功但目录是空的」，最难排查的一类失败。
+    """
+    assert normalize_host_path("D:/jk/Papers") == "D:/jk/Papers"
+    assert normalize_host_path("D:\\jk\\Papers") == "D:/jk/Papers"
+    assert normalize_host_path("/srv/data") == "/srv/data"
+    assert normalize_host_path("  D:/jk  ") == "D:/jk"
+    for bad in ("relative/path", "jk", "./x", "", "   "):
+        expect_raises(ValueError, normalize_host_path, bad)
+
+
+def test_parse_read_roots():
+    assert parse_read_roots(None) == ()
+    assert parse_read_roots("") == ()
+    assert parse_read_roots("D:/a") == ("D:/a",)
+    assert parse_read_roots("D:/a, D:/b ,") == ("D:/a", "D:/b")
+
+
+def test_build_read_mounts_names_and_dedup():
+    """挂载名取 basename —— 模型 ``ls /mnt/read`` 就能自发现，不依赖外部映射表。
+    重名加序号；同一路径配两次会让 docker 因挂载点冲突启动失败，故去重。
+    """
+    m = build_read_mounts(["D:/jk/Papers", "D:/other/Papers", "D:/jk/Papers"])
+    assert m == [
+        ("D:/jk/Papers", f"{CONTAINER_READ_ROOT}/Papers"),
+        ("D:/other/Papers", f"{CONTAINER_READ_ROOT}/Papers-2"),
+    ]
+    assert build_read_mounts(["D:\\jk\\Docs"])[0][0] == "D:/jk/Docs"
+    assert build_read_mounts([]) == []
+    # 配置错误在解析期就炸，不留到容器启动时才报
+    expect_raises(ValueError, build_read_mounts, ["relative"])
+
+
+def test_docker_mounts_read_roots_ro():
+    """只读挂载恒为 :ro，且两种受限模式下完全一致——它只拓宽「读得到」，
+    不拓宽「写得进」。这是本轴与 danger-full-access 的本质区别。
+    """
+    p = DockerProvider()
+    for mode in ("read-only", "workspace-write"):
+        c = p.confine(
+            ["bash", "-c", "true"],
+            SandboxPolicy(
+                mode=mode, workspace_root="/tmp/ws",
+                read_roots=("D:/jk/Papers", "D:/jk/Docs"),
+            ),
+        )
+        for name in ("Papers", "Docs"):
+            spec = f"D:/jk/{name}:{CONTAINER_READ_ROOT}/{name}:ro"
+            assert spec in c.argv, f"{mode} 下 {name} 未挂载或不是 :ro"
+            assert c.argv[c.argv.index(spec) - 1] == "-v"
+        # 首个 -v 仍是工作区（调用方与既有测试据此定位主挂载）
+        tail = "/workspace" if mode == "workspace-write" else "/workspace:ro"
+        assert c.argv[c.argv.index("-v") + 1] == f"/tmp/ws:{tail}"
+
+
+def test_docker_no_read_roots_leaves_argv_unchanged():
+    """未配置只读根时不产生任何多余参数（扩展对既有部署零影响）。"""
+    c = DockerProvider().confine(["bash", "-c", "true"], _policy())
+    joined = " ".join(c.argv)
+    assert CONTAINER_READ_ROOT not in joined
+    assert READ_ROOTS_ENV not in joined
+
+
+def test_resolve_policy_carries_read_roots():
+    """读轴必须被策略解析带到底——executor 构造 SandboxPolicy 时靠它传递。"""
+    assert resolve_policy(workspace_root="/tmp/ws", read_roots=("D:/jk",)).read_roots == ("D:/jk",)
+    assert resolve_policy(workspace_root="/tmp/ws").read_roots == ()
+
+
+def test_tool_schema_carries_read_roots():
+    """工具描述带上只读目录映射——不说，模型就不知道那些路径存在，会去猜
+    ``D:\\...`` 然后撞 No such file or directory，并误判成「文件不存在」。
+    """
+    from backend.tool_system.sandbox.runtime import _BASH_SCHEMA, _schema_with_read_roots
+    old = os.environ.get(READ_ROOTS_ENV)
+    try:
+        os.environ[READ_ROOTS_ENV] = "D:/jk/Papers"
+        s = _schema_with_read_roots(_BASH_SCHEMA)
+        assert f"{CONTAINER_READ_ROOT}/Papers" in s["description"]
+        assert "D:/jk/Papers" in s["description"]
+        # 必须是副本：不能污染模块级常量（否则开关切换后残留）
+        assert CONTAINER_READ_ROOT not in _BASH_SCHEMA["description"]
+
+        os.environ.pop(READ_ROOTS_ENV, None)
+        assert _schema_with_read_roots(_BASH_SCHEMA) is _BASH_SCHEMA
+    finally:
+        if old is None:
+            os.environ.pop(READ_ROOTS_ENV, None)
+        else:
+            os.environ[READ_ROOTS_ENV] = old
+
+
 # ── 工作区 ──
 
 
@@ -266,6 +388,159 @@ def test_session_workspace_and_container_path():
         expect_raises(ValueError, to_container_path, "/etc/passwd", ws)
         expect_raises(ValueError, session_workspace, d, "../escape")
         expect_raises(ValueError, session_workspace, d, "")
+
+
+# ── 工作区读取路径的越界校验（api/workspace.py 的安全地基）──
+#
+# 工作区里的内容是**模型**写的。下面这组测试就是那道「模型能不能读到工作区
+# 之外」的闸门。
+
+
+def test_session_workspace_path_does_not_touch_disk():
+    """读路径用的纯路径函数**不得**建目录。
+
+    `session_workspace` 会 mkdir（沙箱调用侧需要），读侧只能问「沙箱会写到哪」——
+    否则光是打开一次工作区页面，就会给每个会话凭空造出目录来，把「有工作区」
+    这个判据自己污染掉。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        root = os.path.realpath(d)
+        p = session_workspace_path(root, "abc123")
+        assert str(p) == os.path.join(root, "abc123")
+        assert not p.exists(), "读路径不该创建目录"
+        # 校验与 session_workspace 同一处，不能各写一份
+        expect_raises(ValueError, session_workspace_path, root, "../escape")
+        expect_raises(ValueError, session_workspace_path, root, "")
+        expect_raises(ValueError, session_workspace_path, root, "..")
+        # 会创建的那个仍然照常创建
+        assert session_workspace(root, "abc123") == str(p)
+        assert p.is_dir()
+
+
+def test_resolve_workspace_member_accepts_legal_paths():
+    with tempfile.TemporaryDirectory() as d:
+        ws = session_workspace(os.path.realpath(d), "sess1")
+        os.makedirs(os.path.join(ws, "sub", "deeper"))
+        with open(os.path.join(ws, "a.txt"), "w") as f:
+            f.write("hi")
+        assert str(resolve_workspace_member(ws, "")) == ws          # 空串 = 根
+        assert str(resolve_workspace_member(ws, ".")) == ws
+        assert str(resolve_workspace_member(ws, "a.txt")) == os.path.join(ws, "a.txt")
+        assert str(resolve_workspace_member(ws, "sub/deeper")) == os.path.join(ws, "sub", "deeper")
+        # './' 与重复斜杠是正常的相对路径写法，不该被当成越界
+        assert str(resolve_workspace_member(ws, "./sub/deeper")) == os.path.join(ws, "sub", "deeper")
+
+
+def test_resolve_workspace_member_rejects_traversal():
+    with tempfile.TemporaryDirectory() as d:
+        ws = session_workspace(os.path.realpath(d), "sess1")
+        for bad in (
+            "..",                       # 根之上
+            "../outside",               # 逃出会话工作区
+            "a/../../outside",          # 先下钻再逃逸
+            "a//../b/../../c",          # 混着冗余分隔符
+            "/etc/passwd",              # 绝对路径
+            "\\windows\\system32",      # UNC
+            "..\\..\\x",                # Windows 分隔符 + 上跳
+            "D:/jk/Papers",             # 盘符绝对路径（POSIX 上看不出是绝对的）
+        ):
+            expect_raises(ValueError, resolve_workspace_member, ws, bad)
+
+
+def test_resolve_workspace_member_rejects_symlink_escape():
+    """``ln -s /etc/passwd evil`` —— 字符串层毫无破绽的那一类攻击。
+
+    路径里没有 ``..``、不是绝对路径，纯前缀检查会放行；只有 ``resolve()``
+    解开符号链接才暴露真实目标。这是本函数存在的**主要理由**。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        base = os.path.realpath(d)
+        ws = session_workspace(base, "sess1")
+        secret = os.path.join(base, "secret.txt")
+        with open(secret, "w") as f:
+            f.write("secret")
+
+        link = os.path.join(ws, "evil")
+        try:
+            os.symlink(secret, link)
+        except (OSError, NotImplementedError):
+            return  # Windows 无符号链接权限：跳过（容器内为 Linux，必跑）
+
+        assert os.path.exists(link)  # 从字符串上看，这就是个普通文件名
+        expect_raises(ValueError, resolve_workspace_member, ws, "evil")
+
+        # 指向根外**目录**的链接：下钻与下钻后的具体文件都要挡住
+        os.symlink(base, os.path.join(ws, "updir"))
+        expect_raises(ValueError, resolve_workspace_member, ws, "updir")
+        expect_raises(ValueError, resolve_workspace_member, ws, "updir/secret.txt")
+
+        # 悬空链接：resolve(strict=False) 不抛异常，但目标仍在根外 → 必须拒
+        os.symlink("/nonexistent/nope", os.path.join(ws, "dangling"))
+        expect_raises(ValueError, resolve_workspace_member, ws, "dangling")
+
+        # 反例：**根内**的符号链接是合法的 —— 模型自己 ln 出来的捷径不该被拒
+        real = os.path.join(ws, "real.txt")
+        with open(real, "w") as f:
+            f.write("hi")
+        os.symlink(real, os.path.join(ws, "good"))
+        assert str(resolve_workspace_member(ws, "good")) == os.path.realpath(real)
+
+
+def test_resolve_workspace_member_handles_broken_input():
+    with tempfile.TemporaryDirectory() as d:
+        ws = session_workspace(os.path.realpath(d), "sess1")
+        expect_raises(ValueError, resolve_workspace_member, ws, "x" * 5000)  # 病态长度
+        # 符号链接自环：resolve() 抛 OSError，必须翻译成 ValueError 而不是漏出去
+        loop = os.path.join(ws, "loop")
+        try:
+            os.symlink(loop, loop)
+        except (OSError, NotImplementedError):
+            return
+        expect_raises(ValueError, resolve_workspace_member, ws, "loop")
+
+
+def test_api_preview_binary_sniff():
+    """预览的二进制嗅探：内容由模型书写，猜错类型就是把 API 源当 XSS 宿主。"""
+    try:
+        from backend.api.workspace import _content_disposition, _looks_binary, _sniff_image
+    except ImportError:
+        return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
+
+    # 图片按**魔数**判类型，不看文件名 —— 名字是模型起的
+    assert _sniff_image(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20) == "image/png"
+    assert _sniff_image(b"\xff\xd8\xff\xe0" + b"\x00" * 20) == "image/jpeg"
+    assert _sniff_image(b"GIF89a" + b"\x00" * 20) == "image/gif"
+    assert _sniff_image(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == "image/webp"
+    assert _sniff_image(b"BM" + b"\x00" * 20) == "image/bmp"
+    # SVG 是**可携带脚本的 XML**，内联它等于把 API 源当 XSS 宿主 —— 必须不为图片
+    assert _sniff_image(b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>') is None
+    assert _sniff_image(b"<?xml version=\"1.0\"?><svg/>") is None
+    assert _sniff_image(b"plain text") is None
+    # RIFF 但不含 WEBP（如 WAV）不能冒充图片
+    assert _sniff_image(b"RIFF\x00\x00\x00\x00WAVEfmt ") is None
+    assert _sniff_image(b"") is None
+
+
+    assert _looks_binary(b"") is False
+    assert _looks_binary("中文文本\n".encode()) is False
+    assert _looks_binary(b"\x00\x01\x02") is True          # NUL 字节
+    assert _looks_binary(b"\xff\xfe\x00\x00") is True      # UTF-16 BOM
+    assert _looks_binary(b"%PDF-1.7\n\xe2\xe3\xcf\xd3") is True   # 非 UTF-8 的 PDF 头
+    # 窗口尾部切断多字节字符是**误判**，不是二进制：窗口读满时才这么判
+    cutoff = "中" * 3000
+    head = cutoff.encode()[:8192]
+    assert len(head) == 8192
+    assert _looks_binary(head) is False
+
+    # 下载：ASCII 回退 + RFC 5987，中文名靠 filename* 才能落地
+    cd = _content_disposition('总结 "v2".md')
+    assert cd.startswith('attachment; filename="'), cd
+    assert "filename*=UTF-8''" in cd, cd
+    # 文件名里的引号/反斜杠不得逃出 ASCII 回退的引号对（否则能注入 header 参数）
+    ascii_part = cd[len('attachment; filename="'):].split('"')[0]
+    assert '"' not in ascii_part and "\\" not in ascii_part, cd
+    assert "%22" in cd and "%E6%80%BB" in cd, cd  # 原始名走 filename*，含编码后的引号
+    assert _content_disposition("a.txt", inline=True).startswith("inline; ")
 
 
 # ── docker e2e ──
@@ -423,7 +698,8 @@ def test_executor_denied_carries_marker():
         _descriptor(), {"command": "echo 'Read-only file system' >&2; exit 1"}, _ctx(_policy())
     ))
     assert res["sandbox"]["outcome"] == "denied"
-    assert res["notice"] == denial_marker("workspace-write")
+    # notice = 拒绝标记（首行）+ 升权提示（存在更宽模式时追加）
+    assert res["notice"].splitlines()[0] == sandbox_denial_marker("workspace-write")
 
 
 def test_executor_runner_failed():
@@ -579,6 +855,394 @@ def test_registry_unregister_builtin():
     r.unregister_builtin(["bash", "nonexistent"])  # 幂等
 
 
+# ── 升权：完整升权链（approve_escalation）；审批通道本身的用例在
+#    backend/interaction/approval/test_approval.py ──
+
+
+class _FakeApprover:
+    """替身审批方：记录收到的申请，返回预设结果（实现 EscalationApprover 协议）。"""
+
+    def __init__(self, outcome: str = "allowed-once"):
+        self.outcome = outcome
+        self.requests = []
+
+    async def request(self, req):
+        self.requests.append(req)
+        return self.outcome
+
+
+class _RecordingSink:
+    """记录 emit 到的事件（替身：只验证 Executor 发了什么，不做持久化决策）。"""
+
+    def __init__(self):
+        self.events = []
+
+    async def emit(self, event):
+        self.events.append(event)
+
+
+_ESCALATION_KW = dict(agent="agent-a", tool_name="bash", tool_call_id="c1")
+
+
+def _esc_error(coro, exc_type):
+    """跑一次升权并返回指定异常（断言它一定抛）。"""
+    try:
+        asyncio.run(coro)
+    except exc_type as e:
+        return e
+    raise AssertionError(f"预期 {exc_type.__name__}，但没有抛")
+
+
+def test_escalation_wider_modes_is_a_strict_ladder():
+    assert WIDER_MODES["read-only"] == ("workspace-write", "danger-full-access")
+    assert WIDER_MODES["workspace-write"] == ("danger-full-access",)
+    # 最宽模式无条目：没有可升的目标（DSH 的 WIDER_MODES 同构）
+    assert "danger-full-access" not in WIDER_MODES
+    # 升权目标不含 read-only —— 升权只往宽走
+    assert "read-only" not in ESCALATION_TARGETS
+
+
+def test_validate_escalation_args_pairing():
+    # 两个都不给 = 普通调用，不是错误
+    assert validate_escalation_args({}) == (None, "")
+    # 理由去除首尾空白
+    assert validate_escalation_args(
+        {"sandbox_permissions": "workspace-write", "justification": "  要写工作区  "}
+    ) == ("workspace-write", "要写工作区")
+
+    e = _esc_error(
+        _returning(validate_escalation_args, {"sandbox_permissions": "workspace-write"}),
+        EscalationInvalid,
+    )
+    assert e.reason == "missing-justification"
+    assert "sandbox_permissions requires a justification" in str(e)
+
+    e = _esc_error(_returning(validate_escalation_args, {"justification": "孤立的理由"}), EscalationInvalid)
+    assert e.reason == "invalid-pairing"
+    assert "only valid together with sandbox_permissions" in str(e)
+    assert e.justification == "孤立的理由"       # 原文留痕，供审计
+
+    e = _esc_error(_returning(
+        validate_escalation_args,
+        {"sandbox_permissions": "workspace-write", "justification": "   "},
+    ), EscalationInvalid)
+    assert e.reason == "empty-justification"
+    assert "expected a non-empty sentence" in str(e)
+
+
+async def _returning(fn, *args):
+    """把同步函数包成 awaitable，走同一条 _esc_error 断言路径。"""
+    return fn(*args)
+
+
+def test_assert_strictly_wider():
+    assert_strictly_wider("workspace-write", "read-only")            # 合法
+    assert_strictly_wider("danger-full-access", "workspace-write")    # 合法
+
+    e = _esc_error(_returning(assert_strictly_wider, "read-only", "workspace-write"), EscalationInvalid)
+    assert e.reason == "not-strictly-wider"
+    assert 'to "read-only" is not strictly wider than' in str(e)
+
+    # 同级 / 最宽同级 / 词汇外 —— 一律 fail-closed
+    _esc_error(_returning(assert_strictly_wider, "workspace-write", "workspace-write"), EscalationInvalid)
+    _esc_error(_returning(assert_strictly_wider, "danger-full-access", "danger-full-access"), EscalationInvalid)
+    _esc_error(_returning(assert_strictly_wider, "bogus", "read-only"), EscalationInvalid)
+
+
+def test_approve_escalation_returns_none_when_nothing_requested():
+    """未请求 / 请求等同当前模式 → **没这回事**（None），不是错误、不是拒绝。
+
+    归一化是 DSH #4359 的补丁：会话已在最宽模式时模型仍会反射性地填字段，
+    不归一化就会每次被打回、烧 token 甚至死循环。审批方一次都不该被调用。
+    """
+    approver = _FakeApprover()
+    kw = dict(approval=approver, **_ESCALATION_KW)
+
+    assert asyncio.run(approve_escalation({"command": "ls"}, current="read-only", **kw)) is None
+    assert asyncio.run(approve_escalation(
+        {"sandbox_permissions": "read-only", "justification": "x"}, current="read-only", **kw,
+    )) is None
+    assert asyncio.run(approve_escalation(
+        {"sandbox_permissions": "workspace-write", "justification": "x"}, current="workspace-write", **kw,
+    )) is None
+    assert approver.requests == []   # 没这回事 → 不打扰审批方
+
+
+def test_approve_escalation_requires_channel_and_agent():
+    """两种「没法问」：没有审批通道、没有 agent —— 都 fail-closed 到拒绝。"""
+    args = {"sandbox_permissions": "workspace-write", "justification": "要写工作区"}
+
+    e = _esc_error(
+        approve_escalation(args, current="read-only", approval=None, **_ESCALATION_KW),
+        EscalationDenied,
+    )
+    assert e.reason == "no-approval-channel"
+    assert e.requested == "workspace-write" and e.justification == "要写工作区"
+
+    e = _esc_error(
+        approve_escalation(
+            args, current="read-only", approval=_FakeApprover(), agent=None,
+            tool_name="bash", tool_call_id="c1",
+        ),
+        EscalationDenied,
+    )
+    assert e.reason == "no-agent"
+
+
+def test_approve_escalation_allowed_once_returns_target_mode():
+    approver = _FakeApprover("allowed-once")
+    mode = asyncio.run(approve_escalation(
+        {"sandbox_permissions": "danger-full-access", "justification": "要装包"},
+        current="workspace-write", approval=approver, **_ESCALATION_KW,
+    ))
+    assert mode == "danger-full-access"
+
+    # 发给审批方的申请：DSH 的 reason 拼法 + 全部上下文
+    req = approver.requests[0]
+    assert req.reason == "escalate sandbox to danger-full-access: 要装包"
+    # 沙箱的模式信息住在 metadata（审批侧不解释它，只透传给 UI）
+    assert req.metadata == {
+        "kind": "sandbox-escalation", "from": "workspace-write",
+        "to": "danger-full-access", "justification": "要装包",
+    }
+    assert req.agent == "agent-a" and req.tool_name == "bash" and req.tool_call_id == "c1"
+    assert req.approval_id           # 与审批结果配对用
+
+
+def test_approve_escalation_maps_denied_outcomes():
+    """三种失败各自映射到机器可读原因 —— 不混成一个「失败」。"""
+    for outcome, reason in (("rejected", "human-refused"), ("cancelled", "cancelled"),
+                            ("unavailable", "unavailable")):
+        e = _esc_error(
+            approve_escalation(
+                {"sandbox_permissions": "workspace-write", "justification": "要写"},
+                current="read-only", approval=_FakeApprover(outcome), **_ESCALATION_KW,
+            ),
+            EscalationDenied,
+        )
+        assert e.reason == reason, outcome
+        assert e.requested == "workspace-write" and e.approval_id
+
+
+def test_approve_escalation_calls_on_request_before_awaiting():
+    """申请回调必须在**挂起之前**触发，否则前端看不到「正在等谁批」。"""
+    order = []
+
+    class _Ordered(_FakeApprover):
+        async def request(self, req):
+            order.append("approver")
+            return await super().request(req)
+
+    async def on_request(req):
+        order.append(("on_request", req.metadata["to"]))
+
+    mode = asyncio.run(approve_escalation(
+        {"sandbox_permissions": "workspace-write", "justification": "要写"},
+        current="read-only", approval=_Ordered(), **_ESCALATION_KW,
+        on_request=on_request,
+    ))
+    assert mode == "workspace-write"
+    assert order == [("on_request", "workspace-write"), "approver"]
+
+
+def test_escalation_hint_marker_visibility():
+    hint = escalation_hint_marker("read-only", can_ask_human=True)
+    assert "escalation available" in hint and "narrowest wider mode" in hint
+    assert "retry this exact command once" in hint
+    # 与 DSH 一致：每次升权都问人，尾句恒在
+    assert "the approval prompt asks the user" in hint
+    # 没有审批通道 → 不提示（升权恒不可用，等价 DSH 的 never）
+    assert escalation_hint_marker("read-only", can_ask_human=False) == ""
+    # 最宽模式没有可升的目标 → 不提示（提示一个必然失败的动作是误导）
+    assert escalation_hint_marker("danger-full-access", can_ask_human=True) == ""
+
+
+def test_sandbox_denial_marker():
+    assert sandbox_denial_marker("read-only") == "[sandbox: file access denied under read-only mode]"
+
+
+def test_tool_schema_carries_escalation_params():
+    from backend.tool_system.registry.registry import _to_openai_function
+    from backend.tool_system.sandbox.runtime import _BASH_SCHEMA, _with_escalation
+
+    schema = _with_escalation(_BASH_SCHEMA)
+    props = schema["inputSchema"]["properties"]
+    assert set(ESCALATION_TARGETS) == set(props["sandbox_permissions"]["enum"])
+    assert "justification" in props
+    assert schema["inputSchema"]["required"] == ["command"]  # 升权参数是可选，不改 required
+    # 模块级常量不被改动（返回副本）
+    assert "sandbox_permissions" not in _BASH_SCHEMA["inputSchema"]["properties"]
+
+    # enum 必须活到模型手里 —— 它是封闭词汇的可取值面，丢了模型只能猜。
+    wire = _to_openai_function(schema)["function"]["parameters"]["properties"]
+    assert wire["sandbox_permissions"]["enum"] == list(ESCALATION_TARGETS)
+
+
+# ── Executor 接线（策略落地 + 审计 + 提示） ──
+
+
+class _Channel:
+    """临时装配审批服务（测试用）。退出时清空，避免测试间串味。
+
+    返回的是通道本身（供测试直接 resolve/pending）；挂到 ToolContext 上的
+    则是 ApprovalService —— 消费者拿到的是服务，不是裸通道。
+    """
+
+    def __init__(self, timeout_s=5.0):
+        self.channel = InProcessApprovalChannel(timeout_s=timeout_s)
+        self.service = ApprovalService(self.channel)
+
+    def __enter__(self):
+        set_approval_service(self.service)
+        return self.channel
+
+    def __exit__(self, *exc):
+        set_approval_service(None)
+        return False
+
+
+def _exec_ctx(policy, *, approval=None, sink=None):
+    return ToolContext(
+        session_id="s1", tool_call_id="c1", agent_id="agent-a",
+        sandbox_policy=policy, approval=approval, event_sink=sink,
+    )
+
+
+async def _execute_with_decision(ex, args, policy, ch, decision, sink):
+    """跑一次执行；出现待批准申请就按 ``decision`` 裁决（None = 不裁决）。"""
+    from backend.interaction.approval import get_approval_service
+
+    task = asyncio.create_task(ex.execute(
+        _descriptor(), dict(args),
+        _exec_ctx(policy, approval=get_approval_service(), sink=sink),
+    ))
+    if decision is not None:
+        for _ in range(200):
+            await asyncio.sleep(0)
+            pending = ch.pending()
+            if pending:
+                ch.resolve(pending[0].approval_id, decision)
+                break
+        else:
+            raise AssertionError("升权申请始终没有挂起——它应当等人工裁决")
+    return await task
+
+
+def test_executor_escalation_requires_human_approval():
+    """与 DSH 一致：升权**必须**有人批；批了才按更宽策略执行这一次。"""
+    sink = _RecordingSink()
+    with _Channel() as ch:
+        res = asyncio.run(_execute_with_decision(
+            SandboxExecutor(provider=_IdentityProvider()),
+            {"command": "echo hi", "sandbox_permissions": "workspace-write",
+             "justification": "要写工作区"},
+            _policy("read-only"), ch, "allow-once", sink,
+        ))
+
+    assert res["exit_code"] == 0
+    # sandbox 事实记录的是**实际执行的模式**（获批后），不是请求前的
+    assert res["sandbox"]["mode"] == "workspace-write"
+    types = [e.type for e in sink.events]
+    # 申请事件必须先于结果事件 —— 否则前端在等待期间看不到待批准卡片
+    assert types.index(APPROVAL_REQUEST_EVENT) < types.index(SANDBOX_ESCALATION_EVENT)
+    ev = sink.events[-1]
+    assert ev.data["granted"] is True and ev.data["reason"] == "granted"
+    assert ev.data["from"] == "read-only" and ev.data["to"] == "workspace-write"
+
+
+def test_executor_escalation_refused_keeps_policy():
+    """人工拒绝 → 策略不变、照常执行、事实入事件（**不是执行失败**）。"""
+    sink = _RecordingSink()
+    with _Channel() as ch:
+        res = asyncio.run(_execute_with_decision(
+            SandboxExecutor(provider=_IdentityProvider()),
+            {"command": "echo hi", "sandbox_permissions": "danger-full-access",
+             "justification": "要装包"},
+            _policy("workspace-write"), ch, "reject", sink,
+        ))
+
+    assert res["exit_code"] == 0                         # 不是执行失败
+    assert res["sandbox"]["mode"] == "workspace-write"   # 回退到原策略
+    ev = sink.events[-1]
+    assert ev.data["granted"] is False and ev.data["reason"] == "human-refused"
+    assert ev.data["requested"] == "danger-full-access"  # 请求与理由留痕
+
+
+def test_executor_invalid_escalation_fails_the_call():
+    """升权参数非法 → 整条调用作废，错误文本原样回给模型（与 DSH 同：让调用失败而不是静默降级）。"""
+    sink = _RecordingSink()
+    with _Channel() as ch:
+        res = asyncio.run(SandboxExecutor(provider=_IdentityProvider()).execute(
+            _descriptor(),
+            {"command": "echo hi", "sandbox_permissions": "read-only"},   # 缺 justification
+            _exec_ctx(_policy("workspace-write"), approval=ApprovalService(ch), sink=sink),
+        ))
+    assert "error" in res
+    assert "stdout" not in res          # 命令根本没跑
+    assert "sandbox_permissions requires a justification" in res["error"]
+    assert res["sandbox"]["escalation_invalid"] == "missing-justification"
+    # 非法请求**不该打扰审批方**
+    assert ch.pending() == []
+    # 但事实要留痕
+    assert sink.events[-1].data["reason"] == "missing-justification"
+
+
+def test_executor_denied_notice_carries_escalation_hint():
+    ex = SandboxExecutor(provider=_IdentityProvider(signatures=("read-only file system",)))
+    with _Channel():
+        res = asyncio.run(ex.execute(
+            _descriptor(), {"command": "echo 'Read-only file system' >&2; exit 1"},
+            _exec_ctx(_policy("read-only")),
+        ))
+    assert res["notice"].startswith(sandbox_denial_marker("read-only"))
+    assert "escalation available" in res["notice"]
+
+    # 没有审批通道时不提示 —— 升权恒不可用，提示只会让模型白烧一轮
+    set_approval_service(None)
+    res = asyncio.run(ex.execute(
+        _descriptor(), {"command": "echo 'Read-only file system' >&2; exit 1"},
+        _exec_ctx(_policy("read-only")),
+    ))
+    assert "escalation available" not in res["notice"]
+
+
+def test_executor_suppresses_hint_after_refused_escalation():
+    """刚被拒的升权请求**不得**再收到「可以升权」提示——那等于请模型重试。"""
+    ex = SandboxExecutor(provider=_IdentityProvider(signatures=("read-only file system",)))
+    args = {
+        "command": "echo 'Read-only file system' >&2; exit 1",
+        "sandbox_permissions": "danger-full-access",
+        "justification": "要装包",
+    }
+    with _Channel() as ch:
+        res = asyncio.run(_execute_with_decision(
+            ex, args, _policy("workspace-write"), ch, "reject", _RecordingSink(),
+        ))
+    assert res["sandbox"]["outcome"] == "denied"
+    assert "escalation available" not in res["notice"]     # ← 熔断点
+    assert "escalation refused (human-refused)" in res["notice"]
+    assert "do not retry" in res["notice"]
+
+
+def test_escalation_event_lands_in_session_log():
+    """装配层出口：sandbox.escalation → Event Log（**记录**，不被任何投影折叠）。"""
+    from backend.agents.runtime.session import SessionStore
+    from backend.agents.runtime.session.events import SANDBOX_ESCALATION
+    from backend.agents.runtime.session.sandbox_projection import project_sandbox_mode
+    from backend.agents.runtime.tool_event_sink import SessionToolEventSink
+
+    session = SessionStore().create()
+    sink = SessionToolEventSink(session, "call_1")
+    asyncio.run(sink.emit(ToolEvent(
+        type=SANDBOX_ESCALATION_EVENT, tool_name="bash", session_id=session.header.id,
+        data={"from": "read-only", "requested": "workspace-write", "to": "workspace-write",
+              "granted": True, "reason": "granted", "justification": "写总结"},
+    )))
+    evs = [e for e in session.events if e.type == SANDBOX_ESCALATION]
+    assert len(evs) == 1
+    assert evs[0].data["tool_call_id"] == "call_1" and evs[0].data["granted"] is True
+    # 关键：升权事件**不**参与策略解析（否则一次性授权会变成持久放权）
+    assert project_sandbox_mode(session.events) is None
 # ── 运行器 ──
 
 
