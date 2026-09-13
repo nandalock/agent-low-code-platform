@@ -26,8 +26,18 @@ CONTAINER_WORKSPACE = "/workspace"
 #: ``SandboxMode`` 词汇（模式仍只描述**写**效果）。
 CONTAINER_READ_ROOT = "/mnt/read"
 
+#: 附加**可写**挂载的容器内父目录；每个根挂到 ``<它>/<名字>``。
+#: 挂在与只读轴不同的父目录下，使模型 ``ls /mnt`` 一眼分清「只能看的」与
+#: 「能改的」——同名根挂在两条轴上也不会互相踩。
+CONTAINER_WRITE_ROOT = "/mnt/write"
+
 #: 部署配置的环境变量名（逗号分隔的宿主绝对路径）。
 READ_ROOTS_ENV = "SANDBOX_READ_ROOTS"
+
+#: 部署配置的环境变量名（逗号分隔的宿主绝对路径）。
+#: 与只读轴不同，这条**参与模式**：只增加写面，故仅在 ``workspace-write``
+#: 落地（见 :class:`~backend.tool_system.sandbox.vocabulary.SandboxPolicy`）。
+WRITE_ROOTS_ENV = "SANDBOX_WRITE_ROOTS"
 
 #: 功能探测用的最小镜像（只用来证明 daemon 侧能读写该路径）。
 DEFAULT_PROBE_IMAGE = "alpine:3.20"
@@ -244,10 +254,14 @@ def _mount_name(host_path: str, taken: set[str]) -> str:
     return name
 
 
-def build_read_mounts(roots: Sequence[str]) -> list[tuple[str, str]]:
-    """把配置的只读根解析成 ``[(宿主路径, 容器内挂载点), ...]``。
+def _build_mounts(roots: Sequence[str], container_root: str) -> list[tuple[str, str]]:
+    """把配置的根解析成 ``[(宿主路径, 容器内挂载点), ...]``。
 
     去重保序：同一个路径配两次会让 docker 因挂载点冲突而启动失败。
+
+    读 / 写两条轴共用本函数 —— 差异只在容器内的父目录（``/mnt/read`` 与
+    ``/mnt/write``），以及由后端按模式决定的挂载标志（``:ro`` 有无），
+    后者**不属于本函数**：路径映射与权限是两件事。
     """
     mounts: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -257,14 +271,29 @@ def build_read_mounts(roots: Sequence[str]) -> list[tuple[str, str]]:
         if host in seen:
             continue
         seen.add(host)
-        mounts.append((host, f"{CONTAINER_READ_ROOT}/{_mount_name(host, names)}"))
+        mounts.append((host, f"{container_root}/{_mount_name(host, names)}"))
     return mounts
 
 
-def parse_read_roots(raw: str | None) -> tuple[str, ...]:
-    """解析 ``SANDBOX_READ_ROOTS``（逗号分隔）；未配置 / 空串返回 ``()``。
+def build_read_mounts(roots: Sequence[str]) -> list[tuple[str, str]]:
+    """把配置的只读根解析成 ``[(宿主路径, 容器内挂载点), ...]``。"""
+    return _build_mounts(roots, CONTAINER_READ_ROOT)
+
+
+def build_write_mounts(roots: Sequence[str]) -> list[tuple[str, str]]:
+    """把配置的可写根解析成 ``[(宿主路径, 容器内挂载点), ...]``。
+
+    只做路径映射 —— **是否真的可写由后端按模式决定**，本函数不表达权限。
+    """
+    return _build_mounts(roots, CONTAINER_WRITE_ROOT)
+
+
+def parse_roots(raw: str | None) -> tuple[str, ...]:
+    """解析逗号分隔的挂载根配置（``SANDBOX_READ_ROOTS`` / ``SANDBOX_WRITE_ROOTS``）；
+    未配置 / 空串返回 ``()``。
 
     空串与未配置等价（compose 的 ``${VAR:-}`` 会产出空串），都表示「不挂」。
+    两条轴共用本函数：取值形状一致，差异只在各自的环境变量名与挂载标志。
     """
     if not raw:
         return ()

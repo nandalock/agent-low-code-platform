@@ -4,9 +4,15 @@
 ``<SANDBOX_WORKSPACE_ROOT>/<session_id>/``，用户看不见也取不走。本模块是那扇
 观察窗 —— 让人能看见、预览、下载沙箱的产出。
 
-边界（第一原则）：**工作区是沙箱的地盘，唯一写方是容器里的模型**。浏览器只读，
-所以这里不提供任何写 / 删 / 改名接口 —— 少一个写接口，就少一整类
-「模型正在写、用户正在删」的竞态。
+边界（第一原则）：**工作区是沙箱的地盘**。浏览器只读，不提供任何写 / 删 / 改名
+接口 —— 少一个写接口，就少一整类「模型正在写、用户正在删」的竞态。
+
+唯一的例外是**用户上传**：``.dsh-drops/`` 是给用户拖文件进会话的专属子目录
+（对齐 DeepSeek Harness 的 drop 区）。它不破坏上面的原则——「浏览器写工作区」
+依然不存在，存在的是「用户上传」这一个窄入口：上传与沙箱都能写它，模型
+（bash 工具）与用户都能读它。上传因此走与读不同的防护链：路径经
+:func:`resolve_workspace_member` 挡「事前种下的」符号链接，落盘经临时文件 +
+``os.replace`` 挡「写入瞬间换上的」。
 
 安全模型：工作区内容是**模型**写的，模型不可信。因此：
 
@@ -23,18 +29,27 @@
 不属于即 404 —— 用 404 而非 403，不泄漏会话是否存在。当前所有 Session 都经
 HTTP chat 创建并回写该映射（见 ``api/agents.py``），因此不会漏掉真实会话。
 """
+import itertools
 import os
 import stat
+import time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
+from backend.agents import get_agent
+from backend.agents.config_service import get_agent_config, get_agent_definition
+from backend.agents.runtime.session import get_session_persistence
+from backend.agents.runtime.session.events import SEED, SessionEvent, SessionHeader, new_session_id
 from backend.core.connection import get_conn
 from backend.tool_system.sandbox.errors import SandboxUnavailableError
 from backend.tool_system.sandbox.workspace import (
+    WRITE_ROOTS_ENV,
+    normalize_host_path,
+    parse_roots,
     resolve_workspace_member,
     resolve_workspace_root,
     session_workspace_path,
@@ -51,8 +66,27 @@ MAX_SESSIONS = 100
 _SESSION_SCAN_LIMIT = 1000
 #: 超过此大小不给预览（只给下载）。
 MAX_PREVIEW_BYTES = 1024 * 1024
+#: 用户上传专属子目录（对齐 DeepSeek Harness 的 ``.dsh-drops`` 拖放区）。
+#: 点开头：目录列表里排前面，人与模型一眼分清「人给的」与「模型产的」。
+UPLOADS_SUBDIR = ".dsh-drops"
+#: 单个上传文件的大小上限。对齐 DSH 拖放插件（dsh-web-preview-panel）的 64 MB。
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+#: 上传流式落盘的块大小（决定超限的检出粒度，不决定内存占用）。
+UPLOAD_CHUNK = 1024 * 1024
+#: PDF 预览的大小上限（FileResponse 流式返回不吃内存，上限只防病态超大文件）。
+#: 与文本/图片的 1 MB 分开 —— 论文 PDF 常态 2~20 MB，套用 1 MB 等于关掉这个预览。
+MAX_PDF_PREVIEW_BYTES = 100 * 1024 * 1024
 #: 二进制嗅探窗口。只看头部 —— 大文件不该为了「判类型」被整个读一遍。
 SNIFF_BYTES = 8192
+
+#: 上传临时文件的全局序号（itertools.count 的 next 在 GIL 下原子）：
+#: 同进程并发上传同名文件时，各自拿到不同的临时名，O_EXCL 不互相踩。
+_UPLOAD_TMP_SEQ = itertools.count()
+
+#: 写根在 backend 容器内的挂载基路径（compose 约定：``- D:/jk/Nexus:/srv/host-write/Nexus``）。
+#: backend 是 Linux 容器，看不见宿主的 ``D:/jk/Nexus``——daemon 挂载只解决
+#: **沙箱容器**的视角，API 进程读宿主目录必须走这条 compose 挂载。
+_BACKEND_WRITE_MOUNT_BASE = "/srv/host-write"
 
 
 # ── 内部工具 ──
@@ -93,6 +127,16 @@ def _sniff_image(head: bytes) -> str | None:
     if head.startswith(b"BM"):
         return "image/bmp"
     return None
+
+
+def _sniff_pdf(head: bytes) -> bool:
+    """按魔数判定 PDF：``%PDF-`` 开头。
+
+    与 :func:`_sniff_image` 同规则 —— 只认内容，不看文件名。``%PDF`` 不带
+    ``-`` 不算：魔数按最小完整前缀收，宁可漏判（头部带垃圾字节的老 PDF 走
+    415 下载）也不把恰巧以 ``%PDF`` 开头的文本当 PDF 送进 viewer。
+    """
+    return head.startswith(b"%PDF-")
 
 
 def _looks_binary(head: bytes) -> bool:
@@ -179,6 +223,12 @@ def _resolve_session_workspace(
     目录**。落在根上 = 跨会话可见；越出根 = 直读宿主。两者都拒。
     """
     if cwd:
+        # 写根优先：cwd 可能是「新建会话选了写根目录」的宿主路径（如
+        # D:/jk/Nexus/proj）——backend 容器看不到 D:/，文件操作走
+        # /srv/host-write/<名> 的 compose 挂载等价路径。
+        backend_ws = _host_cwd_to_backend(_write_roots(), cwd)
+        if backend_ws is not None:
+            return backend_ws
         try:
             ws = Path(cwd).resolve()
         except (OSError, RuntimeError):
@@ -192,11 +242,15 @@ def _resolve_session_workspace(
         return None
 
 
-def _workspace_root_for(session_id: str, tenant_id: int) -> Path:
+def _session_workspace_root(session_id: str, tenant_id: int) -> Path:
     """该会话的工作区根（宿主绝对路径），并确认它属于本租户。
 
+    **只解析、不要求目录存在** —— 创建与否是读写端点的性质（读：不存在即
+    404；写：可以建）。租户归属查 ``conversations.session_id``（session_headers
+    没有 tenant 列），不属于即 404。
+
     Raises:
-        HTTPException: 404 会话不存在 / 无工作区 / 不属于本租户（三者不区分）；
+        HTTPException: 404 会话不存在 / 不属于本租户（不区分，不泄漏存在性）；
             503 沙箱工作区未配置。
     """
     with get_conn() as conn:
@@ -220,8 +274,30 @@ def _workspace_root_for(session_id: str, tenant_id: int) -> Path:
     ws = _resolve_session_workspace(row["cwd"], session_id, deployment_root)
     if ws is None:
         raise HTTPException(404, "会话工作区不可用")
+    return ws
+
+
+def _workspace_root_for(session_id: str, tenant_id: int) -> Path:
+    """读路径的工作区根：目录不存在即 404（读不得凭空建目录）。"""
+    ws = _session_workspace_root(session_id, tenant_id)
     if not ws.is_dir():
         raise HTTPException(404, "会话工作区不存在")
+    return ws
+
+
+def _workspace_root_for_upload(session_id: str, tenant_id: int) -> Path:
+    """写路径的工作区根：目录不存在就建。
+
+    上传是用户自己的写入，把「目录存在才可写」放宽到「不存在就建」——沙箱
+    第一次工具调用之前用户先拖文件进来，建的正是沙箱将来会用的同一目录
+    （执行侧 ``session_policy`` 的 ``cwd or workspace_for_session`` 链，
+    见 :func:`_resolve_session_workspace`），两边不会分家。
+    """
+    ws = _session_workspace_root(session_id, tenant_id)
+    try:
+        ws.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(400, f"无法创建会话工作区: {e}")
     return ws
 
 
@@ -231,6 +307,73 @@ def _member_or_400(root: Path, rel: str) -> Path:
         return resolve_workspace_member(str(root), rel)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+# ── 上传（用户写区）──
+
+
+def _sanitize_upload_name(raw: str | None) -> str:
+    """上传文件名 → 纯 basename。
+
+    文件名来自浏览器，但浏览器可以被改、请求可以被抓包重放，所以同样按
+    不可信输入处理：反斜杠转正斜杠（Windows 客户端的 ``C:\\fakepath\\a.pdf``
+    到此只剩 basename）、按 ``/`` 拆段取最后一段、剥首尾空白。空名 / 点段 /
+    控制字符 / 超长（255 字节，POSIX NAME_MAX）一律拒。扩展名保留但不参与
+    任何类型判定 —— 类型永远由魔数说话（:func:`_sniff_image` / :func:`_sniff_pdf`）。
+    """
+    if not raw:
+        raise HTTPException(400, "文件名为空")
+    name = raw.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if not name or name in (".", ".."):
+        raise HTTPException(400, f"非法文件名: {raw!r}")
+    if len(name.encode("utf-8")) > 255:
+        raise HTTPException(400, f"文件名超过 255 字节: {name[:50]}…")
+    if any(ord(c) < 32 for c in name):
+        raise HTTPException(400, f"文件名含控制字符: {raw!r}")
+    return name
+
+
+async def _save_upload(target: Path, file, *, limit: int) -> tuple[int, bool]:
+    """把上传流写到 ``target``。返回 ``(已写字节数, 是否超限)``；超限时半成品已删。
+
+    落盘 = 同目录临时文件 + ``os.replace``。rename(2) 替换的是**符号链接本身**
+    而不是它指向的目标：模型在 :func:`resolve_workspace_member` 通过之后、
+    写入之前把目标换成指向 ``/etc/passwd`` 的链接（竞态窗口）时，被顶掉的
+    是链接、不是 ``/etc/passwd``。resolve 挡「事前种下的」链接，os.replace
+    挡「写入瞬间换上的」——前者是主力，后者便宜，两道口都收。
+    """
+    tmp = target.with_name(f".{target.name}.upload-{next(_UPLOAD_TMP_SEQ)}")
+    written = 0
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except OSError as e:
+        raise HTTPException(400, f"无法创建上传临时文件: {e}")
+    over = False
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > limit:
+                    over = True
+                    break
+                out.write(chunk)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise HTTPException(400, f"写入失败: {e}")
+    if over:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return written, True
+    os.replace(tmp, target)
+    return written, False
 
 
 # ── 端点 ──
@@ -298,6 +441,230 @@ def api_list_workspace_sessions(x_tenant_id: int = Header(alias="X-Tenant-ID")) 
     return {"items": items[:MAX_SESSIONS], "truncated": truncated}
 
 
+# ── 新建会话（选 agent + 选工作文件夹，对齐 DSH 的「选择工作区」） ──
+
+
+def _write_roots() -> tuple[str, ...]:
+    """部署配置的沙箱写根（``SANDBOX_WRITE_ROOTS``，逗号分隔宿主绝对路径）。"""
+    return parse_roots(os.environ.get(WRITE_ROOTS_ENV))
+
+
+def _write_root_by_name(roots: tuple[str, ...], name: str) -> str:
+    """按目录名找写根（纯函数，ValueError）。重名取第一个——映射表按名索引，
+    两个同名写根无法区分，这是本约定的诚实限制。"""
+    for host_root in roots:
+        base = normalize_host_path(host_root)
+        if base.rstrip("/").rsplit("/", 1)[-1] == name:
+            return base
+    raise ValueError(f"写根不存在: {name!r}")
+
+
+def _backend_visible(host_root: str) -> Path:
+    """写根在 backend 容器内的挂载路径（compose 约定 ``/srv/host-write/<目录名>``）。"""
+    name = host_root.rstrip("/").rsplit("/", 1)[-1]
+    return Path(_BACKEND_WRITE_MOUNT_BASE) / name
+
+
+def _host_cwd_to_backend(roots: tuple[str, ...], cwd: str) -> Path | None:
+    """把写根内的宿主 cwd 映射为 backend 容器内等价路径；不在任何写根内返回 None。
+
+    backend 容器（Linux）看不见 ``D:/jk/Nexus``，文件操作必须走 compose 挂进来
+    的 ``/srv/host-write/<名>``。cwd 是后端自己写进 session_headers 的，仍按
+    不可信处理（纵深防御）：rest 拒绝 ``..`` 段；映射后不 resolve——文件端点
+    每次访问都会再走 :func:`resolve_workspace_member` 的 inode 层校验。
+    """
+    if not cwd or not roots:
+        return None
+    norm = normalize_host_path(cwd)
+    for host_root in roots:
+        base = normalize_host_path(host_root)
+        if norm == base:
+            return _backend_visible(base)
+        if norm.startswith(base + "/"):
+            rest = norm[len(base) + 1:]
+            if ".." in PurePosixPath(rest).parts:
+                return None
+            return _backend_visible(base) / rest
+    return None
+
+
+@router.get("/folders")
+def api_list_workspace_folders(
+    path: str = Query(default=""),
+    x_tenant_id: int = Header(alias="X-Tenant-ID"),
+) -> dict:
+    """列出「新会话工作文件夹」的候选目录（文件夹选择器用）。
+
+    写根优先（``SANDBOX_WRITE_ROOTS``，如 ``D:/jk/Nexus``）：``path`` 第一段
+    是写根目录名（空串 = 列写根本身），其后是该根下的相对路径。未配置写根时
+    回落为浏览部署工作区根（原行为）。只列**目录**——选择器挑的是工作区
+    位置，不是文件。越界 / 符号链接逃逸与文件端点同一套校验。
+    """
+    write_roots = _write_roots()
+    if not write_roots:
+        try:
+            base = Path(resolve_workspace_root()).resolve()
+        except (SandboxUnavailableError, ValueError) as e:
+            raise HTTPException(503, f"沙箱工作区未配置: {e}")
+        target = _member_or_400(base, path)
+    else:
+        parts = path.split("/") if path else []
+        if not parts:
+            # 根层：列出配置的写根本身（伪条目，点击进入该根）
+            entries = []
+            for host_root in write_roots:
+                base = normalize_host_path(host_root)
+                entries.append({
+                    "name": base.rstrip("/").rsplit("/", 1)[-1],
+                    "is_dir": True, "size": 0, "mtime": None,
+                    "is_link": False, "outside": False,
+                })
+            return {"path": "", "entries": entries, "truncated": False}
+        try:
+            host_root = _write_root_by_name(write_roots, parts[0])
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        base = _backend_visible(host_root)
+        target = _member_or_400(base, "/".join(parts[1:]))
+
+    if not target.exists():
+        raise HTTPException(404, f"路径不存在: {path or '/'}")
+    if not target.is_dir():
+        raise HTTPException(400, f"不是目录: {path}")
+
+    entries: list[dict] = []
+    truncated = False
+    try:
+        with os.scandir(target) as it:
+            for i, de in enumerate(it):
+                if i >= MAX_LIST_ENTRIES:
+                    truncated = True
+                    break
+                e = _entry(base, Path(de.path))
+                if e["is_dir"]:
+                    entries.append(e)
+    except OSError as e:
+        raise HTTPException(400, f"无法读取目录: {e}")
+
+    entries.sort(key=lambda e: e["name"].lower())
+    return {"path": path, "entries": entries, "truncated": truncated}
+
+
+@router.post("/sessions", status_code=201)
+def api_create_workspace_session(
+    body: dict,
+    x_tenant_id: int = Header(alias="X-Tenant-ID"),
+) -> dict:
+    """新建一个**绑定了工作文件夹**的会话（DSH「选择工作区 → 新建会话」）。
+
+    落地方式：预创建 session_headers 行（``cwd`` = 所选文件夹）+ seed 事件，
+    再建 conversation 并回写 session 映射。首次 chat 前端带上这个 session_id，
+    AgentRuntime 走冷恢复路径（persistence.load 命中 → replay seed）——
+    沙箱执行侧 ``session_policy`` 的 ``cwd or workspace_for_session`` 链与
+    读侧 ``_resolve_session_workspace`` 都会解析到同一个文件夹，两边不分家。
+
+    seed 内容镜像 ``AgentRuntime._cfg()`` 的 ``_build_init_messages()``
+    （system_prompt 来自定义 + 配置覆盖的合并；HTTP 通道无上游 context）——
+    镜像必须与执行侧逐字一致，否则「恢复出的 Session」与「runtime 自建的
+    Session」初始上下文不同。
+
+    folder 缺省 / 空串 = 不设 cwd（会话工作区自动落在 ``<root>/<session_id>``，
+    即原有行为）。
+    """
+    agent_key = (body.get("agent_key") or "").strip()
+    folder = (body.get("folder") or "").strip()
+    if not agent_key:
+        raise HTTPException(400, "agent_key 不能为空")
+    try:
+        agent = get_agent(agent_key)
+    except KeyError:
+        raise HTTPException(400, f"Agent 不存在: {agent_key}")
+
+    # 文件夹校验（写路径：目录不存在就建）
+    # 写根优先：folder 第一段是写根目录名（如 "Nexus/proj" → D:/jk/Nexus/proj），
+    # cwd 存**宿主路径**（沙箱容器由 daemon 挂载它）；未配写根时回落为部署根
+    # 相对路径（原行为）。
+    cwd: str | None = None
+    if folder:
+        write_roots = _write_roots()
+        if write_roots:
+            name, _, rest = folder.partition("/")
+            try:
+                host_root = _write_root_by_name(write_roots, name)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            try:
+                target = resolve_workspace_member(str(_backend_visible(host_root)), rest)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise HTTPException(400, f"无法创建工作区文件夹: {e}")
+            cwd = host_root + (f"/{rest}" if rest else "")
+        else:
+            try:
+                root = Path(resolve_workspace_root()).resolve()
+            except (SandboxUnavailableError, ValueError) as e:
+                raise HTTPException(503, f"沙箱工作区未配置: {e}")
+            try:
+                target = resolve_workspace_member(str(root), folder)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            if target == root:
+                raise HTTPException(400, "不能直接把部署根作为工作区文件夹（会跨会话可见）")
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise HTTPException(400, f"无法创建工作区文件夹: {e}")
+            cwd = str(target)
+
+    # conversation（channel=agent:<key>，会话归属与列表端点的解析约定一致）
+    label = folder.rsplit('/', 1)[-1] if folder else "新会话"
+    from backend.services.chat import service as chat_service
+    conv = chat_service.create_conversation(
+        x_tenant_id,
+        chat_service.ConversationCreate(
+            channel=f"agent:{agent_key}",
+            customer_name=label,
+        ),
+    )
+
+    # 预创建 Session header + seed（runtime 首次 chat 冷恢复走这条）
+    definition = get_agent_definition(agent_key) or {}
+    cfg = {**(definition.get("config") or {}), **(get_agent_config(agent_key) or {})}
+    seed_messages = [{"role": "system", "content": cfg.get("system_prompt", "")}]
+
+    sid = new_session_id()
+    header = SessionHeader(version=1, id=sid, created_at=time.time(), seed_length=len(seed_messages))
+    header.cwd = cwd
+    events = [
+        SessionEvent(
+            type=SEED, seq=i, time=time.time(),
+            data={"role": m.get("role", "system"), "content": m.get("content", "")},
+        )
+        for i, m in enumerate(seed_messages, start=1)
+    ]
+    persistence = get_session_persistence()
+    persistence.create(sid, header)
+    persistence.append_events(sid, events)
+    persistence.flush(sid)
+
+    chat_service.save_conversation_session_id(x_tenant_id, conv.id, sid)
+
+    return {
+        "ok": True,
+        "session": {
+            "session_id": sid,
+            "conversation_id": conv.id,
+            "agent_key": agent_key,
+            "agent_name": getattr(agent, "name", agent_key),
+            "label": label,
+            "folder": folder or None,
+        },
+    }
+
+
 @router.get("/{session_id}/files")
 def api_list_files(
     session_id: str,
@@ -361,10 +728,6 @@ def api_get_file(
         size = target.stat().st_size
     except OSError as e:
         raise HTTPException(400, f"无法读取文件: {e}")
-    if size > MAX_PREVIEW_BYTES:
-        raise HTTPException(
-            413, f"文件 {size} 字节，超过预览上限 {MAX_PREVIEW_BYTES} 字节；请下载查看",
-        )
     try:
         with open(target, "rb") as f:
             head = f.read(SNIFF_BYTES)
@@ -376,7 +739,27 @@ def api_get_file(
     # 图片先判：它的 MIME 由魔数给出（见 _sniff_image），能安全内联
     image_mime = _sniff_image(head)
     if image_mime is not None:
+        if size > MAX_PREVIEW_BYTES:
+            raise HTTPException(
+                413, f"文件 {size} 字节，超过预览上限 {MAX_PREVIEW_BYTES} 字节；请下载查看",
+            )
         return FileResponse(target, media_type=image_mime, headers=headers)
+
+    # PDF 次判：由浏览器内置 viewer 原生渲染（插件上下文，不进 DOM）。
+    # 必须排在 _looks_binary 之前——PDF 正文常含 NUL 字节，按二进制判就永远
+    # 预览不了。不加页面级 sandbox CSP：它会在部分浏览器阻断 viewer 自身；
+    # PDF 内嵌脚本的风险由 viewer 沙箱承担，本 API 只保证不把 PDF 当文本内联。
+    if _sniff_pdf(head):
+        if size > MAX_PDF_PREVIEW_BYTES:
+            raise HTTPException(
+                413, f"文件 {size} 字节，超过 PDF 预览上限 {MAX_PDF_PREVIEW_BYTES} 字节；请下载查看",
+            )
+        return FileResponse(target, media_type="application/pdf", headers=headers)
+
+    if size > MAX_PREVIEW_BYTES:
+        raise HTTPException(
+            413, f"文件 {size} 字节，超过预览上限 {MAX_PREVIEW_BYTES} 字节；请下载查看",
+        )
 
     if _looks_binary(head):
         raise HTTPException(415, "二进制文件不支持预览；请下载")
@@ -385,3 +768,50 @@ def api_get_file(
     # CSP sandbox 是纵深防御 —— 万一有人直接开这个 URL，也跑不了脚本。
     headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
     return FileResponse(target, media_type="text/plain; charset=utf-8", headers=headers)
+
+
+@router.post("/{session_id}/upload")
+async def api_upload_files(
+    session_id: str,
+    files: list[UploadFile] = File(...),
+    x_tenant_id: int = Header(alias="X-Tenant-ID"),
+) -> dict:
+    """把用户拖进会话的文件落到工作区的 ``.dsh-drops/`` 专属子目录。
+
+    这是工作区**唯一**的用户写入口（边界见模块 docstring）。上传后文件立刻
+    出现在文件树里；模型经 bash 工具在 ``/workspace/.dsh-drops`` 下直接读到
+    它——这正是 DSH 拖放区的语义：人给料，模型取料。
+
+    先验后写：全部文件名先过清洗与越界校验，任何一条非法就整批 400、一个字节
+    都不落盘（不产生半批）。逐文件流式落盘，单文件超过
+    :data:`MAX_UPLOAD_BYTES` 时删掉半成品并 413；该请求**已落盘的保留**，
+    响应里列出来，前端据此刷新文件树。
+    """
+    ws = _workspace_root_for_upload(session_id, x_tenant_id)
+
+    cleaned: list[tuple[UploadFile, str, str]] = []
+    for f in files:
+        name = _sanitize_upload_name(f.filename)
+        cleaned.append((f, name, f"{UPLOADS_SUBDIR}/{name}"))
+
+    # 逐条先过 inode 层校验（含符号链接逃逸），任何一条越界都整批 400
+    targets = [_member_or_400(ws, rel) for _, _, rel in cleaned]
+
+    drops = _member_or_400(ws, UPLOADS_SUBDIR)
+    try:
+        drops.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(400, f"无法创建上传目录: {e}")
+
+    uploaded: list[dict] = []
+    for (f, name, rel), target in zip(cleaned, targets):
+        size, over = await _save_upload(target, f, limit=MAX_UPLOAD_BYTES)
+        if over:
+            raise HTTPException(
+                413,
+                f"文件 {name} 超过上传上限 {MAX_UPLOAD_BYTES} 字节；"
+                f"已上传的 {len(uploaded)} 个文件保留",
+            )
+        uploaded.append({"name": name, "path": rel, "size": size})
+
+    return {"session_id": session_id, "uploaded": uploaded}

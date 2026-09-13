@@ -18,9 +18,12 @@ from backend.tool_system.sandbox.policy import DEFAULT_MODE_ENV, resolve_policy,
 from backend.tool_system.sandbox.provider import SandboxProvider
 from backend.tool_system.sandbox.vocabulary import SandboxExecutionPolicy, SandboxMode
 from backend.tool_system.sandbox.workspace import (
+    CONTAINER_WORKSPACE,
     READ_ROOTS_ENV,
+    WRITE_ROOTS_ENV,
     build_read_mounts,
-    parse_read_roots,
+    build_write_mounts,
+    parse_roots,
     probe_workspace_root,
     resolve_workspace_root,
     session_workspace,
@@ -90,7 +93,17 @@ def read_roots() -> tuple[str, ...]:
     这是**部署事实**而非会话策略——哪些宿主目录对沙箱只读可见，跟镜像、内存
     上限同类，因此不进 settings、不做会话覆盖、不参与模式优先级链。
     """
-    return parse_read_roots(os.environ.get(READ_ROOTS_ENV))
+    return parse_roots(os.environ.get(READ_ROOTS_ENV))
+
+
+def write_roots() -> tuple[str, ...]:
+    """部署配置的可写挂载根（``SANDBOX_WRITE_ROOTS``，逗号分隔）；未配置返回 ()。
+
+    与只读根同为**部署事实**（不进 settings、不做会话覆盖）：哪些宿主目录可写，
+    跟镜像、内存上限同类。差异只在消费侧 —— 读根恒为 ``:ro``，写根只在
+    ``workspace-write`` 落地（见 ``docker.DockerProvider.confine``）。
+    """
+    return parse_roots(os.environ.get(WRITE_ROOTS_ENV))
 
 
 def workspace_for_session(session_id: str) -> str:
@@ -117,6 +130,7 @@ def session_policy(
         session_override=session_override,
         config_default=default_mode(),
         read_roots=read_roots(),
+        write_roots=write_roots(),
     )
 
 
@@ -125,8 +139,8 @@ def session_policy(
 _BASH_SCHEMA = {
     "name": "bash",
     "description": (
-        "在受限沙箱中执行 shell 命令。工作目录是会话工作区，只有该目录可写"
-        "（写到其他路径会被内核拒绝）。返回 stdout / stderr / exit_code。"
+        "在受限沙箱中执行 shell 命令。工作目录是会话工作区；写到可写位置之外"
+        "会被内核拒绝（可写位置见下方说明）。返回 stdout / stderr / exit_code。"
     ),
     "inputSchema": {
         "type": "object",
@@ -138,8 +152,8 @@ _BASH_SCHEMA = {
 _PYTHON_SCHEMA = {
     "name": "python",
     "description": (
-        "在受限沙箱中执行 Python 代码。工作目录是会话工作区，只有该目录可写"
-        "（写到其他路径会被内核拒绝）。返回 stdout / stderr / exit_code。"
+        "在受限沙箱中执行 Python 代码。工作目录是会话工作区；写到可写位置之外"
+        "会被内核拒绝（可写位置见下方说明）。返回 stdout / stderr / exit_code。"
     ),
     "inputSchema": {
         "type": "object",
@@ -186,25 +200,37 @@ def _with_escalation(schema: dict) -> dict:
     }
 
 
-def _read_roots_note() -> str:
-    """把只读挂载的映射写进工具描述；没有配置时返回空串。
+def _mounts_note() -> str:
+    """把**可写位置**与两条挂载轴的映射写进工具描述。**恒非空。**
 
     与「不把沙箱模式写进系统提示词」（docs/sandbox-design.md §2 原则 7）不冲突：
     那条针对的是**模式**（说了模型会变保守、不敢尝试），这里给的是**路径事实**
     ——不说，模型就不知道那些目录存在，只会去猜 ``D:\\...`` 然后撞
     ``No such file or directory``，并误判成「文件不存在」而不是「路径写法不对」。
+
+    恒非空是因为「哪儿能写」这件事随部署配置变：基础描述只能说「写到可写位置
+    之外会被拒绝」，而可写轴会**打开新的可写面**。这里不说全，模型就按基础描述
+    行动 —— 以为除了工作区哪儿都不能写，于是放着 /mnt/write 里的目录不去改，
+    绕回工作区里造副本再让用户手动搬（实测发生过）。
+
+    **两条轴分开写**，各有各的措辞：只报路径不给权限，模型会默认它和只读根
+    一样只能看；合并成「可用目录」则会把读写差别整个吞掉。
     """
-    mounts = build_read_mounts(read_roots())
-    if not mounts:
-        return ""
-    items = "、".join(f"{c}（宿主 {h}）" for h, c in mounts)
-    return f"\n可读目录（只读，可读不可写）：{items}。"
+    lines = [f"可写位置：会话工作区 {CONTAINER_WORKSPACE}。"]
+    read = build_read_mounts(read_roots())
+    if read:
+        items = "、".join(f"{c}（宿主 {h}）" for h, c in read)
+        lines.append(f"可读目录（只读，可读不可写）：{items}。")
+    write = build_write_mounts(write_roots())
+    if write:
+        items = "、".join(f"{c}（宿主 {h}）" for h, c in write)
+        lines.append(f"可写目录（可直接修改，与工作区同等可写）：{items}。")
+    return "\n" + "".join(lines)
 
 
-def _schema_with_read_roots(schema: dict) -> dict:
-    """返回带只读目录说明的 schema 副本（不改动模块级常量）。"""
-    note = _read_roots_note()
-    return schema if not note else {**schema, "description": schema["description"] + note}
+def _schema_with_mounts(schema: dict) -> dict:
+    """返回带读写目录说明的 schema 副本（**恒为副本**，不改动模块级常量）。"""
+    return {**schema, "description": schema["description"] + _mounts_note()}
 
 
 def register_builtin_sandbox_tools(
@@ -233,7 +259,7 @@ def register_builtin_sandbox_tools(
             type="sandbox",
             transport="",
             server_id=0,
-            schema=_with_escalation(_schema_with_read_roots(schema)),
+            schema=_with_escalation(_schema_with_mounts(schema)),
             timeout=timeout_s,
             sandbox=SandboxToolConfig(runtime=runtime, image=img, timeout_s=timeout_s),
             # 独占执行：bash / python 共写同一个会话工作区，并发跑会互相踩文件
