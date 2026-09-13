@@ -5,8 +5,7 @@
 
 ## 概述
 
-system prompt 不再是一个存在数据库里的字符串，而是**每轮请求从已注册的贡献
-现算出来的产物**：
+system prompt 是每轮请求从已注册的贡献现算出来的产物，而不是一个预先存好的字符串：
 
 ```
 AgentRuntime.reply
@@ -15,19 +14,22 @@ AgentRuntime.reply
   ③ render          ← 严格插值成最终文本
   ↓
 AgentLoop
-  messages[0] = system prompt（组装产物）
-  messages[1..] = session.derive_messages()（对话历史）
+  messages[0]    = system prompt（组装产物）
+  messages[1..]  = session.derive_messages()（对话历史）
   payload["tools"] = assembly.tools（工具 schema）
 ```
 
-改造前的做法是：新建会话时把 `config.system_prompt` 拼成 seed 事件写进
-Event Log，之后每轮从事件里读回来。这样做有三个代价，本模块逐一消除：
+四个设计要点：
 
-| 改造前的问题 | 现在 |
+| 要点 | 含义 |
 |---|---|
-| 工具使用指导不存在，工具只知道「怎么调」（schema），不知道「什么时候用」 | 工具指导作为提示词段，与 schema 同源产出 |
-| 改配置只对新会话生效（老会话的 prompt 已固化在事件里） | 每轮重算，改配置立即生效 |
-| `api/workspace.py` 预创建会话时必须逐字镜像 runtime 的拼装代码（双处同步易漂移） | 预创建只写 header，镜像代码删除 |
+| **四类贡献** | 段（section）、动态上下文（context）、变量（variable）、工具来源（tool provider）各自注册，组装时汇合 |
+| **具名 order** | 位置集中分配：段在前、动态上下文在尾部——尾部变化不断前缀缓存 |
+| **严格渲染** | 未知变量、无值变量、畸形引用一律抛错，绝不把格式错误的提示词发给模型 |
+| **工具双通道** | schema 走 `payload["tools"]` 供 API 解析；使用指导走提示词供模型阅读 |
+
+每轮重算带来三个直接好处：改配置立即生效（不必等新会话）、上游 context 与工具集
+始终反映当前状态、预创建会话与执行侧共用同一份组装逻辑（无镜像代码）。
 
 ## 使用本模块
 
@@ -193,13 +195,13 @@ PromptAssembly（已求值、未插值）
 `{{modle}}` 若被静默替换成空，会带着错误行文发给模型，只有事后翻记录才能
 发现——格式错误的提示词比响亮失败更糟。
 
-### 与 DSH 的差异
+### 设计取舍
 
-| 维度 | DSH | 本项目 |
+| 维度 | DSH（参考实现） | 本项目 |
 |---|---|---|
 | 作用域 | global + agent scope 遮蔽，waterfall 按 scope 分发 | 无 scope 层：agent 差异由 provider 读 `AssembleContext` 自行处理 |
 | 动态上下文去向 | 渲染成独立的 user 角色快照，追加在历史之后 | 并入 system 消息的尾部（本项目消息结构更简单，够用） |
-| 工具指导来源 | 每个工具插件自己调 `section()` 注册 | 内置工具写在 `ToolDescriptor.usage_guidance`；平台自有 MCP 工具在 `platform_sections.PLATFORM_TOOL_GUIDANCE` 兜底 |
+| 工具指导来源 | 每个工具插件自己调 `section()` 注册 | 内置工具写在 `ToolDescriptor.usage_guidance`；平台自有 MCP 工具在 `PLATFORM_TOOL_GUIDANCE` 兜底 |
 | 组装时机 | 每个模型步骤 | 每个 turn（AgentLoop 内多步共用同一份） |
 | complete 段 | 完整逃生阀 | 字段保留，平台层未注册 |
 
@@ -230,7 +232,7 @@ system prompt 每次请求都完整发送，成本随内容增长（固定开销
 
 - 前部段只应引用**跨轮稳定**的信息（部署事实、agent 配置、会话 cwd），
   逐轮变化的内容（上游输出、记忆、用户问题）放尾部 context
-- 引用逐轮变化的变量的段，会让 KV cache 前缀每轮从该点失效
+- 引用逐轮变化变量的段，会让 KV cache 前缀每轮从该点失效
 - `AgentRuntime` 已有命中率观测（`llm_calls` / `cache_hit_ratio`），低于 0.5
   会打 warning —— 提示词或工具集改动会从改动点起断缓存，这是排查入口
 
@@ -249,9 +251,6 @@ system prompt 每次请求都完整发送，成本随内容增长（固定开销
   `MEMORY_CONTEXT`(8900) 槽位已留，接入时注册一个 provider 即可
 - **工具指导的兜底表会漂移**：`PLATFORM_TOOL_GUIDANCE` 按工具名硬编码，MCP
   server 侧改名不会同步。外部 server 建议自带 `usage_guidance`
-- **存量会话的旧 seed 被丢弃**：冷恢复时 `Session.from_events` 跳过 seed 事件
-  —— 旧 persona 不再回放（这正是「每轮重算」的语义），若某会话的答案高度依赖
-  首轮固化的上游 context，刷新后该 context 需由调用方重新提供
 
 ## 开发备注
 
