@@ -51,6 +51,11 @@ from backend.agents.runtime.system_prompt.variable import (
     VariableProvider,
 )
 
+# 平台内容注册（identity / persona / 上游上下文 / 变量 / 工具来源）。
+# 放在文件末尾：平台模块 import 本包的子模块，先让上面的导出就位再触发注册。
+# 幂等——模块只执行一次，重复 import 不会重复注册。
+from backend.agents.runtime.system_prompt import platform_sections  # noqa: E402,F401
+
 __all__ = [
     # 数据结构
     "PromptSection",
