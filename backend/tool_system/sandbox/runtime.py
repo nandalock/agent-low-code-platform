@@ -149,6 +149,24 @@ _BASH_SCHEMA = {
     },
 }
 
+# ── 工具使用指导（进 system prompt，与 schema 分开） ──
+#
+# schema（上面的 *_SCHEMA）走 LLM 的 tools 参数，描述「怎么调」；
+# 这里的指导进 system prompt 的 tool:<name> 段，描述「什么时候用、失败怎么办」。
+# 两者永不合并（理由见 agents/runtime/system_prompt/tool.py）。
+# 仅有「跨调用习惯」值得写在这里——单次调用的参数说明属于 schema 的 description。
+
+_BASH_GUIDANCE = (
+    "优先用 bash 完成文件与进程操作。执行前先确认当前目录与目标路径；"
+    "命令失败时先读输出里的退出码与 stderr，不要原样重试。"
+)
+
+_PYTHON_GUIDANCE = (
+    "用 python 做需要计算、解析或数据清洗的任务。脚本写入会话工作区后执行；"
+    "报错带行号时先读对应代码行再修复，不要反复提交未修改的脚本。"
+)
+
+
 _PYTHON_SCHEMA = {
     "name": "python",
     "description": (
@@ -249,11 +267,11 @@ def register_builtin_sandbox_tools(
     """
     img = image or DEFAULT_SANDBOX_IMAGE
     specs = (
-        ("bash", "shell", _BASH_SCHEMA),
-        ("python", "python", _PYTHON_SCHEMA),
+        ("bash", "shell", _BASH_SCHEMA, _BASH_GUIDANCE),
+        ("python", "python", _PYTHON_SCHEMA, _PYTHON_GUIDANCE),
     )
     names: list[str] = []
-    for name, runtime, schema in specs:
+    for name, runtime, schema, guidance in specs:
         registry.register_native(ToolDescriptor(
             name=name,
             type="sandbox",
@@ -262,6 +280,7 @@ def register_builtin_sandbox_tools(
             schema=_with_escalation(_schema_with_mounts(schema)),
             timeout=timeout_s,
             sandbox=SandboxToolConfig(runtime=runtime, image=img, timeout_s=timeout_s),
+            usage_guidance=guidance,
             # 独占执行：bash / python 共写同一个会话工作区，并发跑会互相踩文件
             # （A 建目录 B 删、A 写文件 B 读），且模型无法声明调用间的依赖关系。
             # 并发收益不值得用工作区一致性换 —— 故沙箱工具恒为 exclusive 屏障。

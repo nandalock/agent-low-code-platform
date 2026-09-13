@@ -66,6 +66,11 @@ class ToolDescriptor:
     timeout: float | None = None   # 声明式超时（秒）；None → Executor 用 DEFAULT_TOOL_TIMEOUT
     sandbox: SandboxToolConfig | None = None     # type == "sandbox" 时必填
     execution_mode: str = PARALLEL  # 同批并发约束："parallel" | "exclusive"（见模块头）
+    # 工具的**使用指导**（自然语言，如「检查结果里的 [exit code: N] 标记」）：
+    # 与 schema 是两样东西——schema 走 LLM 的 tools 参数供 API 解析，指导进
+    # system prompt 供模型阅读（见 agents/runtime/system_prompt/tool.py）。
+    # 留空表示由提示词层按工具名提供（平台内置工具的指导在 platform_sections）。
+    usage_guidance: str | None = None
 
     def __post_init__(self) -> None:
         # 执行模式影响调度安全性，拼错不能静默降级 —— 构造即校验
