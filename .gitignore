@@ -9,6 +9,8 @@ venv/
 # Node / Next.js
 node_modules/
 .next/
+# NEXT_DIST_DIR=.next-build 的隔离构建产物（见 frontend/next.config.js）
+.next-build/
 *.tsbuildinfo
 
 # Docker
@@ -20,6 +22,9 @@ backend/tool_packages/paper/llm.config.json
 
 # Temp files
 _temp_*
+
+# 临时截图 / 图片素材（用户随手放根目录的照片）
+images/
 
 # OS
 .DS_Store

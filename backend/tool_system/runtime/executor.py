@@ -389,11 +389,16 @@ class SandboxExecutor(ToolExecutor):
             try:
                 confined = provider.confine(
                     argv,
+                    # 逐字段手工拷贝：SandboxPolicy 是 SandboxExecutionPolicy 的
+                    # 子类，构造期不做继承式搬运。**这里漏一个字段不会报错**，
+                    # 症状是「配置了但沙箱里看不到那个挂载点」——挂载轴新增时
+                    # 务必回来补这一行。
                     SandboxPolicy(
                         mode=policy.mode,
                         workspace_root=policy.workspace_root,
                         session_id=policy.session_id,
                         read_roots=policy.read_roots,
+                        write_roots=policy.write_roots,
                     ),
                 )
             except SandboxUnavailableError as e:

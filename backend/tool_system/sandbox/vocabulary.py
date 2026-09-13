@@ -40,7 +40,8 @@ class SandboxExecutionPolicy:
     mode: SandboxMode
     workspace_root: str            # 宿主绝对路径；workspace-write 的可写边界
     session_id: str | None = None  # 调用会话标识；后端按会话维护状态时使用
-    read_roots: tuple[str, ...] = ()  # 宿主绝对路径；附加**只读**挂载，Docker 后端专有
+    read_roots: tuple[str, ...] = ()   # 宿主绝对路径；附加**只读**挂载，Docker 后端专有
+    write_roots: tuple[str, ...] = ()  # 宿主绝对路径；附加**可写**挂载，Docker 后端专有
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,10 @@ class SandboxPolicy(SandboxExecutionPolicy):
     ``read_roots`` 是**附加只读可见性**，不是更宽的模式：它只增加「读得到」，
     不增加「写得进」（挂载恒为 ``:ro``，且根文件系统仍 ``--read-only``）。
     因此它独立于 :data:`SandboxMode` —— 模式词汇只描述写效果，读轴不进去。
+
+    ``write_roots`` 则**方向相反**：它增加写面，因此必须参与模式 —— 只在
+    ``workspace-write`` 落地，``read-only`` 下不挂（挂了模式名就骗人）。
+    两条轴看着对称，语义上不对称，别把这条也写成「与模式无关」。
     """
 
     mode: ConfinedSandboxMode

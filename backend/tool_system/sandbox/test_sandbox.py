@@ -67,12 +67,15 @@ from backend.tool_system.sandbox.provider import (  # noqa: E402
 from backend.tool_system.sandbox.vocabulary import SandboxExecutionPolicy  # noqa: E402
 from backend.tool_system.sandbox.workspace import (  # noqa: E402
     CONTAINER_READ_ROOT,
+    CONTAINER_WRITE_ROOT,
     READ_ROOTS_ENV,
     WORKSPACE_ROOT_ENV,
+    WRITE_ROOTS_ENV,
     assert_root_is_safe,
     build_read_mounts,
+    build_write_mounts,
     normalize_host_path,
-    parse_read_roots,
+    parse_roots,
     probe_workspace_root,
     repo_root,
     resolve_workspace_member,
@@ -268,11 +271,12 @@ def test_normalize_host_path():
         expect_raises(ValueError, normalize_host_path, bad)
 
 
-def test_parse_read_roots():
-    assert parse_read_roots(None) == ()
-    assert parse_read_roots("") == ()
-    assert parse_read_roots("D:/a") == ("D:/a",)
-    assert parse_read_roots("D:/a, D:/b ,") == ("D:/a", "D:/b")
+def test_parse_roots():
+    """两条轴共用同一个解析器：取值形状一致，差异只在环境变量名与挂载标志。"""
+    assert parse_roots(None) == ()
+    assert parse_roots("") == ()
+    assert parse_roots("D:/a") == ("D:/a",)
+    assert parse_roots("D:/a, D:/b ,") == ("D:/a", "D:/b")
 
 
 def test_build_read_mounts_names_and_dedup():
@@ -288,6 +292,20 @@ def test_build_read_mounts_names_and_dedup():
     assert build_read_mounts([]) == []
     # 配置错误在解析期就炸，不留到容器启动时才报
     expect_raises(ValueError, build_read_mounts, ["relative"])
+
+
+def test_build_write_mounts_names_and_dedup():
+    """可写根与只读根同构，只换容器内父目录 —— 两份挂在 /mnt 下不同子树，
+    各用各的命名空间，同名根（如两条轴都配 D:/jk/Nexus）互不冲突。
+    """
+    m = build_write_mounts(["D:/jk/Nexus", "D:/other/Nexus", "D:/jk/Nexus"])
+    assert m == [
+        ("D:/jk/Nexus", f"{CONTAINER_WRITE_ROOT}/Nexus"),
+        ("D:/other/Nexus", f"{CONTAINER_WRITE_ROOT}/Nexus-2"),
+    ]
+    assert build_write_mounts(["D:\\jk\\Nexus"])[0][0] == "D:/jk/Nexus"
+    assert build_write_mounts([]) == []
+    expect_raises(ValueError, build_write_mounts, ["relative"])
 
 
 def test_docker_mounts_read_roots_ro():
@@ -312,41 +330,93 @@ def test_docker_mounts_read_roots_ro():
         assert c.argv[c.argv.index("-v") + 1] == f"/tmp/ws:{tail}"
 
 
+def test_docker_mounts_write_roots_rw_only_in_workspace_write():
+    """可写根**参与模式** —— 与只读轴方向相反，这是本轴唯一容易搞错的地方。
+
+    ``read-only`` 下必须一个都不挂：挂了模式名就骗人（调用方以为读不到任何
+    东西，实际有个目录能改）。设计文档记过同类教训——早期实现对所有模式都用
+    可写绑定挂载，导致 read-only 下工作区仍可写。
+    """
+    p = DockerProvider()
+    roots = ("D:/jk/Nexus",)
+
+    c = p.confine(
+        ["bash", "-c", "true"],
+        SandboxPolicy(mode="workspace-write", workspace_root="/tmp/ws", write_roots=roots),
+    )
+    spec = f"D:/jk/Nexus:{CONTAINER_WRITE_ROOT}/Nexus"
+    assert spec in c.argv, "workspace-write 下可写根未挂载"
+    assert c.argv[c.argv.index(spec) - 1] == "-v"
+    # 不带 :ro 就是 rw（docker 默认）；带了就变成只读，正是要防的回归
+    assert not spec.endswith(":ro")
+
+    c_ro = p.confine(
+        ["bash", "-c", "true"],
+        SandboxPolicy(mode="read-only", workspace_root="/tmp/ws", write_roots=roots),
+    )
+    assert CONTAINER_WRITE_ROOT not in " ".join(c_ro.argv), "read-only 下不得挂任何可写根"
+
+
 def test_docker_no_read_roots_leaves_argv_unchanged():
-    """未配置只读根时不产生任何多余参数（扩展对既有部署零影响）。"""
+    """未配置读写根时不产生任何多余参数（扩展对既有部署零影响）。"""
     c = DockerProvider().confine(["bash", "-c", "true"], _policy())
     joined = " ".join(c.argv)
     assert CONTAINER_READ_ROOT not in joined
+    assert CONTAINER_WRITE_ROOT not in joined
     assert READ_ROOTS_ENV not in joined
+    assert WRITE_ROOTS_ENV not in joined
 
 
-def test_resolve_policy_carries_read_roots():
-    """读轴必须被策略解析带到底——executor 构造 SandboxPolicy 时靠它传递。"""
-    assert resolve_policy(workspace_root="/tmp/ws", read_roots=("D:/jk",)).read_roots == ("D:/jk",)
-    assert resolve_policy(workspace_root="/tmp/ws").read_roots == ()
+def test_resolve_policy_carries_both_root_axes():
+    """两条轴都必须被策略解析带到底——executor 手工拷贝 SandboxPolicy 时靠它传递。
 
-
-def test_tool_schema_carries_read_roots():
-    """工具描述带上只读目录映射——不说，模型就不知道那些路径存在，会去猜
-    ``D:\\...`` 然后撞 No such file or directory，并误判成「文件不存在」。
+    漏拷不会报错，症状是「配置了但沙箱里看不到那个挂载点」，故这里显式盯住。
     """
-    from backend.tool_system.sandbox.runtime import _BASH_SCHEMA, _schema_with_read_roots
-    old = os.environ.get(READ_ROOTS_ENV)
+    p = resolve_policy(workspace_root="/tmp/ws", read_roots=("D:/jk",), write_roots=("D:/jk/Nexus",))
+    assert p.read_roots == ("D:/jk",)
+    assert p.write_roots == ("D:/jk/Nexus",)
+    bare = resolve_policy(workspace_root="/tmp/ws")
+    assert bare.read_roots == () and bare.write_roots == ()
+
+
+def test_tool_schema_carries_both_root_axes():
+    """工具描述带上两条轴的映射——不说，模型就不知道那些路径存在，会去猜
+    ``D:\\...`` 然后撞 No such file or directory，并误判成「文件不存在」。
+
+    **可写轴必须说清「能写」**：只报路径不给权限，模型会默认它和只读根一样
+    只能看，于是放着能改的目录不去改。
+    """
+    from backend.tool_system.sandbox.runtime import _BASH_SCHEMA, _schema_with_mounts
+
+    saved = {k: os.environ.get(k) for k in (READ_ROOTS_ENV, WRITE_ROOTS_ENV)}
     try:
         os.environ[READ_ROOTS_ENV] = "D:/jk/Papers"
-        s = _schema_with_read_roots(_BASH_SCHEMA)
-        assert f"{CONTAINER_READ_ROOT}/Papers" in s["description"]
-        assert "D:/jk/Papers" in s["description"]
+        os.environ[WRITE_ROOTS_ENV] = "D:/jk/Nexus"
+        s = _schema_with_mounts(_BASH_SCHEMA)
+        desc = s["description"]
+        assert f"{CONTAINER_READ_ROOT}/Papers" in desc and "D:/jk/Papers" in desc
+        assert f"{CONTAINER_WRITE_ROOT}/Nexus" in desc and "D:/jk/Nexus" in desc
+        # 两条轴分开表述：可写的那条不能被读的措辞吞掉
+        assert "可读目录" in desc and "可写目录" in desc
         # 必须是副本：不能污染模块级常量（否则开关切换后残留）
         assert CONTAINER_READ_ROOT not in _BASH_SCHEMA["description"]
+        assert CONTAINER_WRITE_ROOT not in _BASH_SCHEMA["description"]
 
-        os.environ.pop(READ_ROOTS_ENV, None)
-        assert _schema_with_read_roots(_BASH_SCHEMA) is _BASH_SCHEMA
+        # 两条轴都清空后说明**依然在**：「哪儿能写」随配置变，基础描述说不全，
+        # 所以可写位置恒要显式列出（只列工作区）。
+        for k in (READ_ROOTS_ENV, WRITE_ROOTS_ENV):
+            os.environ.pop(k, None)
+        bare = _schema_with_mounts(_BASH_SCHEMA)
+        assert bare is not _BASH_SCHEMA, "必须始终返回副本"
+        assert "可写位置" in bare["description"] and "/workspace" in bare["description"]
+        assert CONTAINER_READ_ROOT not in bare["description"]
+        assert CONTAINER_WRITE_ROOT not in bare["description"]
     finally:
-        if old is None:
-            os.environ.pop(READ_ROOTS_ENV, None)
-        else:
-            os.environ[READ_ROOTS_ENV] = old
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 # ── 工作区 ──
@@ -541,6 +611,119 @@ def test_api_preview_binary_sniff():
     assert '"' not in ascii_part and "\\" not in ascii_part, cd
     assert "%22" in cd and "%E6%80%BB" in cd, cd  # 原始名走 filename*，含编码后的引号
     assert _content_disposition("a.txt", inline=True).startswith("inline; ")
+
+
+def test_api_pdf_sniff():
+    """PDF 魔数判定：只看内容、最小完整前缀、必须贴头部。"""
+    try:
+        from backend.api.workspace import _sniff_pdf
+    except ImportError:
+        return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
+
+    assert _sniff_pdf(b"%PDF-1.7\n\xe2\xe3\xcf\xd3") is True
+    assert _sniff_pdf(b"%PDF-2.0 whatever") is True
+    assert _sniff_pdf(b"%PDF") is False                     # 缺 '-'：魔数按最小完整前缀收
+    assert _sniff_pdf(b"%pdF-1.7") is False                 # 大小写敏感
+    assert _sniff_pdf(b"<html>%PDF-1.7</html>") is False    # 必须贴头部
+    assert _sniff_pdf(b"") is False
+
+
+def test_api_upload_name_sanitize():
+    """上传文件名 → 纯 basename。浏览器可改、请求可重放，按不可信输入处理。"""
+    try:
+        from fastapi import HTTPException
+        from backend.api.workspace import _sanitize_upload_name
+    except ImportError:
+        return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
+
+    assert _sanitize_upload_name("a.pdf") == "a.pdf"
+    assert _sanitize_upload_name(r"C:\fakepath\报告.pdf") == "报告.pdf"
+    assert _sanitize_upload_name("../../etc/passwd") == "passwd"
+    assert _sanitize_upload_name("  spaced.pdf  ") == "spaced.pdf"
+    assert _sanitize_upload_name("dir/sub/deep.md") == "deep.md"
+    for bad in (None, "", "   ", ".", "..", "a\x00.pdf", "x" * 300):
+        expect_raises(HTTPException, _sanitize_upload_name, bad)
+
+
+def test_save_upload_replace_semantics():
+    """落盘 = 临时文件 + os.replace：替换符号链接本身，不跟随其目标。
+
+    模型在 resolve 之后、写入之前把目标换成链接（竞态窗口）时，被顶掉的是
+    链接、链接指向的文件分毫不动——这是 inode 层校验之外的第二道口。
+    """
+    try:
+        from pathlib import Path
+        from backend.api.workspace import _save_upload
+    except ImportError:
+        return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
+
+    class _FakeUpload:
+        def __init__(self, data):
+            self._data = data
+
+        async def read(self, n):
+            out, self._data = self._data[:n], self._data[n:]
+            return out
+
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "out.txt"
+        size, over = asyncio.run(_save_upload(target, _FakeUpload(b"hello"), limit=1000))
+        assert (size, over) == (5, False)
+        assert target.read_bytes() == b"hello"
+
+        # 覆盖写：同目录临时文件 + rename，读到的是新内容
+        asyncio.run(_save_upload(target, _FakeUpload(b"world"), limit=1000))
+        assert target.read_bytes() == b"world"
+
+        # 超限：半成品已删、已落盘的目标不被改写
+        size, over = asyncio.run(_save_upload(target, _FakeUpload(b"x" * 100), limit=50))
+        assert over is True and size > 50
+        assert target.read_bytes() == b"world"
+        assert os.listdir(d) == ["out.txt"]
+
+    # 符号链接竞态：os.replace 顶掉链接本身，不动链接指向的文件
+    with tempfile.TemporaryDirectory() as d:
+        victim = Path(d) / "victim.txt"
+        victim.write_bytes(b"precious")
+        link = Path(d) / "link.pdf"
+        try:
+            os.symlink(victim, link)
+        except (OSError, NotImplementedError):
+            return  # Windows 无符号链接权限：跳过（容器内为 Linux，必跑）
+        size, over = asyncio.run(_save_upload(link, _FakeUpload(b"uploaded"), limit=1000))
+        assert (size, over) == (8, False)
+        assert victim.read_bytes() == b"precious"   # 指向的文件分毫不动
+        assert link.read_bytes() == b"uploaded"     # 链接被替换成普通文件
+        assert not link.is_symlink()
+
+
+def test_write_root_folder_mapping():
+    """写根模式：目录名→宿主路径、宿主 cwd→backend 等价路径的映射与拒绝。
+
+    backend 容器看不见 D:/jk/Nexus，读侧文件操作必须走 compose 挂载的
+    /srv/host-write/<名> 等价路径。前缀攻击（NexusEvil）、'..' 段、不在任何
+    写根内 —— 一律拒（None）。
+    """
+    try:
+        from backend.api.workspace import _backend_visible, _host_cwd_to_backend, _write_root_by_name
+    except ImportError:
+        return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
+
+    roots = ("D:/jk/Nexus",)
+    assert _write_root_by_name(roots, "Nexus") == "D:/jk/Nexus"
+    assert _write_root_by_name(("D:\\a\\Nexus", "D:/b/Nexus"), "Nexus") == "D:/a/Nexus"  # 重名取第一个
+    expect_raises(ValueError, _write_root_by_name, roots, "Other")
+    expect_raises(ValueError, _write_root_by_name, roots, "")
+
+    base = _backend_visible("D:/jk/Nexus")
+    assert _host_cwd_to_backend(roots, "D:/jk/Nexus") == base          # 写根本身
+    assert _host_cwd_to_backend(roots, "D:/jk/Nexus/proj/a") == base / "proj" / "a"
+    assert _host_cwd_to_backend(roots, "D:\\jk\\Nexus\\proj") == base / "proj"  # 反斜杠归一
+    assert _host_cwd_to_backend(roots, "D:/jk/NexusEvil/x") is None    # 前缀攻击
+    assert _host_cwd_to_backend(roots, "D:/other/x") is None           # 不在写根内
+    assert _host_cwd_to_backend(roots, "D:/jk/Nexus/../evil") is None  # '..' 段
+    assert _host_cwd_to_backend(roots, "") is None
+    assert _host_cwd_to_backend((), "D:/jk/Nexus") is None             # 未配写根
 
 
 # ── docker e2e ──

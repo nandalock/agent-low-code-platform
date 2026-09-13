@@ -17,6 +17,11 @@ Landlock 授权 / Seatbelt SBPL，本后端用 ``docker run`` 的参数。
 故无此轴；Docker 后端的读天然被容器边界收窄，要读宿主目录只能显式挂。
 挂载恒为 ``:ro`` —— 只增加可见性，不增加可写面。
 
+**可写挂载轴**：``policy.write_roots`` 里每个宿主路径在 ``workspace-write``
+下额外挂一条 ``-v <root>:/mnt/write/<name>``（rw）。它**参与模式**，与只读轴
+的方向相反 —— 只增加写面，故 ``read-only`` 下一个都不挂。这是显式的「工作台」
+配置：没有它，宿主目录只能看不能改；有了它，模型能改的就只有你点名的那几个。
+
 **已知缺口**：``confine(argv, policy)`` 的签名里没有镜像——DeepSeek 的词汇
 也没有。本后端因此在构造时固定一个镜像。将来要按工具切换镜像（bash 用通用
 镜像、python 用带科学栈的镜像），需要扩展 seam（provider 每镜像一个实例，
@@ -28,7 +33,11 @@ from typing import Sequence
 from backend.tool_system.sandbox.errors import SandboxUnavailableError
 from backend.tool_system.sandbox.provider import ConfinedArgv, RunnerFailureRule, SandboxProvider
 from backend.tool_system.sandbox.vocabulary import SandboxPolicy
-from backend.tool_system.sandbox.workspace import CONTAINER_WORKSPACE, build_read_mounts
+from backend.tool_system.sandbox.workspace import (
+    CONTAINER_WORKSPACE,
+    build_read_mounts,
+    build_write_mounts,
+)
 
 #: 默认沙箱镜像。
 DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
@@ -145,6 +154,15 @@ class DockerProvider(SandboxProvider):
         for host_path, container_path in build_read_mounts(policy.read_roots):
             read_args += ["-v", f"{host_path}:{container_path}:ro"]
 
+        # 附加可写挂载：与只读轴方向相反，它**参与模式** —— 只增加「写得进」，
+        # 故仅在 workspace-write 落地；read-only 下一个都不挂（挂了模式名就
+        # 骗人：调用方以为读不到任何东西，实际有个目录能改）。
+        # docker 的 ``-v a:b`` 默认即 rw，故不加标志——加 ``:rw`` 等价但更啰嗦。
+        write_args: list[str] = []
+        if policy.mode == "workspace-write":
+            for host_path, container_path in build_write_mounts(policy.write_roots):
+                write_args += ["-v", f"{host_path}:{container_path}"]
+
         wrapped = [
             "docker", "run", "--rm", "-i",
             # v1 不限制网络（与 DeepSeek 一致）；显式指定，不依赖 daemon 默认值。
@@ -155,6 +173,7 @@ class DockerProvider(SandboxProvider):
             *temp_args,
             "-v", workspace_mount,
             *read_args,
+            *write_args,
             "-w", self._container_workspace,
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
