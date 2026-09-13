@@ -13,6 +13,11 @@ from backend.agents.runtime.session import Session, get_session_persistence, get
 from backend.agents.runtime.session.events import SANDBOX_MODE
 from backend.agents.runtime.session.sandbox_projection import project_sandbox_mode
 from backend.agents.runtime.session.trajectory_projection import TrajectoryProjection, project_trajectory
+from backend.agents.runtime.system_prompt import (
+    AssembleContext,
+    assemble,
+    render_system_prompt,
+)
 from backend.agents.router.router_runtime import RouterRuntime, invalidate_desc_cache
 from backend.agents.config_service import get_agent_config, save_agent_config, get_agent_definition
 from backend.agents.config_service import list_l1_keywords, create_l1_keyword, update_l1_keyword, delete_l1_keyword
@@ -152,6 +157,70 @@ def agent_get_config(agent_key: str) -> dict:
         "config": config,
         "cache_policy": cache_policy,
     }
+
+
+@router.get("/{agent_key}/prompt-preview")
+async def agent_prompt_preview(
+    agent_key: str,
+    question: str = "",
+    x_tenant_id: int = Header(alias="X-Tenant-ID"),
+) -> dict:
+    """预览该 agent 本轮的 system prompt 组装结果（不调用 LLM）
+
+    调试与自检用：把「模型实际收到什么」显式暴露出来，而不是只能翻日志或猜。
+    返回分段明细（每段来自哪个注册方、排在第几位）+ 完整渲染文本 + 可见工具 +
+    变量取值，便于回答「为什么这轮提示词长这样」。
+
+    用临时 Session（不注册 SessionStore、不落库）：预览不产生任何副作用。
+    """
+    try:
+        agent = get_agent(agent_key)
+    except KeyError:
+        raise HTTPException(404, f"Agent 不存在: {agent_key}")
+    if isinstance(agent, RouterRuntime):
+        # Router 的提示词由 RouterRuntime 的模板拼装（agent 清单 + few-shot + 额外
+        # 指示），未接入 SystemPrompt——这里如实说明，而不是渲染一份它不会用的提示词
+        raise HTTPException(
+            400, f"Agent [{agent_key}] 是 router：其提示词由路由模板拼装，暂未接入 SystemPrompt"
+        )
+
+    runtime = agent if isinstance(agent, AgentRuntime) else AgentRuntime(key=agent_key)
+    config = runtime._cfg()
+    session = Session()
+
+    assembly = await assemble(AssembleContext(
+        tenant_id=x_tenant_id,
+        agent_key=agent_key,
+        agent_name=runtime.name,
+        agent_description=runtime.desc,
+        config=config,
+        question=question,
+        session=session,
+    ))
+    return {
+        "agent_key": agent_key,
+        "system_prompt": render_system_prompt(assembly),
+        "sections": [
+            {"name": s.name, "order": _section_order(s.name), "text": s.text}
+            for s in assembly.sections
+        ],
+        "contexts": [{"name": c.name, "text": c.text} for c in assembly.contexts],
+        "tools": [t.name for t in assembly.tools],
+        "variables": assembly.variables,
+    }
+
+
+def _section_order(name: str) -> int | float | None:
+    """段名 → 排序位（预览用：组装产物已排好序，不再携带 order）
+
+    工具指导段是组装期的合成产物、不在注册表里，按 TOOL_GUIDANCE 的位置给出。
+    """
+    from backend.agents.runtime.system_prompt import SECTION_ORDERS, get_system_prompt
+
+    if name.startswith("tool:"):
+        return SECTION_ORDERS["TOOL_GUIDANCE"]
+    section = get_system_prompt().sections().get(name)
+    return section.order if section else None
 
 
 @router.put("/{agent_key}/config")

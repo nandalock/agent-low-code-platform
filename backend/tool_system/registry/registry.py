@@ -219,6 +219,20 @@ class ToolRegistry:
                 schemas.append(_to_openai_function(d.schema))
         return schemas
 
+    async def get_descriptors_for(self, agent_key: str) -> list[ToolDescriptor]:
+        """返回该 agent 绑定工具的完整描述符（含 usage_guidance）
+
+        与 :meth:`get_schemas_for` 同源（绑定表 → resolve），但保留描述符本体：
+        提示词组装既要 schema（走 tools 参数）也要 usage_guidance（按工具名合成
+        提示词段），拿 OpenAI dict 会丢失后者。
+        """
+        descriptors = []
+        for name in self.get_bindings(agent_key):
+            d = await self.resolve(name)
+            if d is not None:
+                descriptors.append(d)
+        return descriptors
+
 
 def _sanitize_schema(schema: dict) -> dict:
     """清洗 MCP inputSchema 为 OpenAI 兼容格式"""

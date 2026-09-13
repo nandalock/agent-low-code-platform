@@ -41,9 +41,9 @@ from fastapi import APIRouter, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
 from backend.agents import get_agent
-from backend.agents.config_service import get_agent_config, get_agent_definition
+from backend.agents.config_service import get_agent_definition
 from backend.agents.runtime.session import get_session_persistence
-from backend.agents.runtime.session.events import SEED, SessionEvent, SessionHeader, new_session_id
+from backend.agents.runtime.session.events import SessionHeader, new_session_id
 from backend.core.connection import get_conn
 from backend.tool_system.sandbox.errors import SandboxUnavailableError
 from backend.tool_system.sandbox.workspace import (
@@ -557,16 +557,15 @@ def api_create_workspace_session(
 ) -> dict:
     """新建一个**绑定了工作文件夹**的会话（DSH「选择工作区 → 新建会话」）。
 
-    落地方式：预创建 session_headers 行（``cwd`` = 所选文件夹）+ seed 事件，
-    再建 conversation 并回写 session 映射。首次 chat 前端带上这个 session_id，
-    AgentRuntime 走冷恢复路径（persistence.load 命中 → replay seed）——
-    沙箱执行侧 ``session_policy`` 的 ``cwd or workspace_for_session`` 链与
-    读侧 ``_resolve_session_workspace`` 都会解析到同一个文件夹，两边不分家。
+    落地方式：预创建 session_headers 行（``cwd`` = 所选文件夹），再建 conversation
+    并回写 session 映射。首次 chat 前端带上这个 session_id，AgentRuntime 走冷恢复
+    路径（persistence.load 命中 → 重建 Session）——沙箱执行侧 ``session_policy``
+    的 ``cwd or workspace_for_session`` 链与读侧 ``_resolve_session_workspace``
+    都会解析到同一个文件夹，两边不分家。
 
-    seed 内容镜像 ``AgentRuntime._cfg()`` 的 ``_build_init_messages()``
-    （system_prompt 来自定义 + 配置覆盖的合并；HTTP 通道无上游 context）——
-    镜像必须与执行侧逐字一致，否则「恢复出的 Session」与「runtime 自建的
-    Session」初始上下文不同。
+    **不写 seed**：system prompt 由 AgentRuntime 每轮组装（含上游 context 与工具
+    指导），不属于会话历史。预创建因此只负责 header，不存在与执行侧逐字对齐的
+    镜像代码——这正是本次重构消除的双处同步点。
 
     folder 缺省 / 空串 = 不设 cwd（会话工作区自动落在 ``<root>/<session_id>``，
     即原有行为）。
@@ -630,25 +629,16 @@ def api_create_workspace_session(
         ),
     )
 
-    # 预创建 Session header + seed（runtime 首次 chat 冷恢复走这条）
-    definition = get_agent_definition(agent_key) or {}
-    cfg = {**(definition.get("config") or {}), **(get_agent_config(agent_key) or {})}
-    seed_messages = [{"role": "system", "content": cfg.get("system_prompt", "")}]
-
+    # 预创建 Session header（runtime 首次 chat 冷恢复走这条）
+    # 只写 header（含 cwd），不写 seed：system prompt 由 AgentRuntime 每轮组装，
+    # 不再属于会话历史 —— 预创建与执行侧因此没有需要逐字对齐的镜像代码。
     sid = new_session_id()
-    header = SessionHeader(version=1, id=sid, created_at=time.time(), seed_length=len(seed_messages))
+    # seed_length=0：显式声明「无 seed」（该字段是 seed 机制的历史遗留，无读取方；
+    # 0 = 新会话，≥1 = 改造前落库的旧数据，NULL = 更早的未知来源）
+    header = SessionHeader(version=1, id=sid, created_at=time.time(), seed_length=0)
     header.cwd = cwd
-    events = [
-        SessionEvent(
-            type=SEED, seq=i, time=time.time(),
-            data={"role": m.get("role", "system"), "content": m.get("content", "")},
-        )
-        for i, m in enumerate(seed_messages, start=1)
-    ]
     persistence = get_session_persistence()
     persistence.create(sid, header)
-    persistence.append_events(sid, events)
-    persistence.flush(sid)
 
     chat_service.save_conversation_session_id(x_tenant_id, conv.id, sid)
 

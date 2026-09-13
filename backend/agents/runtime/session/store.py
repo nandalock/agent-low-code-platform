@@ -29,8 +29,11 @@ class SessionStore:
         self._sessions: dict[str, Session] = {}
 
     def create(self, *, init_messages: list[dict] | None = None) -> Session:
-        """创建新 Session 并登记。init_messages（system/上游 context）作为
-        seed 事件写入 Event Log（LLM 可见），由 Session 内部转成事件。"""
+        """创建新 Session 并登记。
+
+        ``init_messages``（seed 机制）已退役——system prompt 现由 SystemPrompt
+        每轮组装、AgentLoop 前置为 messages[0]，主链路不再传本参数。
+        """
         session = Session(init_messages=init_messages)
         self._sessions[session.header.id] = session
         return session

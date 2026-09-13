@@ -25,7 +25,11 @@ Tool 调度边界（见 tool_system/runtime/scheduler.py）：
   tool timeout   — 单个 Tool 的最大执行时间（Executor 生效：声明式 timeout 或 DEFAULT_TOOL_TIMEOUT）
   repeat tool    — 连续重复调用相同 Tool + 标准化参数达到 REPEAT_TOOL_THRESHOLD 后停止
   Session        — 执行事实源（AgentRuntime 创建并注入，必填）：Loop append 事件，
-                   LLM 消息由 session.derive_messages() 派生（seed 由 Runtime 注入）
+                   LLM 消息由 session.derive_messages() 派生
+
+system prompt 的位置：不在 Session 里，由 AgentRuntime 每轮组装后经 `system_prompt`
+参数注入，`_get_messages()` 把它前置为 messages[0]（见 agents/runtime/system_prompt/）。
+于是「提示词」与「对话历史」是两条独立来源，在组装 LLM 请求时才汇合。
 """
 import json
 import logging
@@ -80,6 +84,7 @@ class AgentLoop:
         llm_params: dict,
         tool_schemas: list[dict],
         tenant_id: int,
+        system_prompt: str = "",
         on_event: EventSink | None = None,
         session: Session,
     ):
@@ -88,6 +93,9 @@ class AgentLoop:
         self.llm_params = llm_params
         self.tool_schemas = tool_schemas
         self.tenant_id = tenant_id
+        # system prompt：由 Runtime 每轮组装（SystemPrompt.assemble → render），
+        # 本 Loop 只负责在派生消息时前置。空串表示本轮无提示词（不发送空 system）。
+        self.system_prompt = system_prompt
         self.on_event = on_event
         # Session（必填）：Event Log 是执行事实来源，LLM 消息由 session.derive_messages()
         # 派生；Loop 只 append 事件，不维护第二套 trace（TraceProjection 负责投影）。
@@ -142,10 +150,10 @@ class AgentLoop:
             if "tenant_id" not in required:
                 required.append("tenant_id")
 
-        # Session 是唯一执行事实来源：init_messages（system prompt / 上游 context）
-        # 由 AgentRuntime 在 Session 创建时注入为 seed 事件（hot restore 的 seed 已在
-        # Event Log 里），LLM 消息全程由 session.derive_messages() 派生 —— 此处不再
-        # 构造本地 messages（context 参数仅在新会话 seed 注入时被 Runtime 消费）。
+        # Session 是对话历史的唯一来源：LLM 消息由 session.derive_messages() 派生，
+        # system prompt 由 Runtime 组装后经 __init__ 注入、_get_messages() 前置 ——
+        # 此处不再构造本地 messages（run 的 context 参数不参与，上游输出已在
+        # 组装阶段作为动态上下文进入 system prompt）。
         self.session.append(TURN_START, {
             "agent": self.key,
             # run 级运行限制入 turn/start 事件（log-only）：TraceProjection 从中投影
@@ -326,8 +334,18 @@ class AgentLoop:
         return config.get("fallback_reply", "服务暂时不可用")
 
     def _get_messages(self) -> list[dict]:
-        """LLM 消息来源：Session surface 派生（Event Log 是唯一事实源，无本地列表）"""
-        return self.session.derive_messages()
+        """LLM 消息来源：组装的 system prompt + Session surface 派生
+
+        两条来源在汇合：提示词来自 SystemPrompt（每轮组装、不在会话历史里），
+        其余来自 Event Log 派生（唯一事实源，无本地消息列表）。
+
+        system 恒为 messages[0]：前部段的渲染结果跨轮稳定（动态内容排在提示词
+        尾部），因此 KV cache 前缀不受逐轮变化的上游输出影响。
+        """
+        messages = self.session.derive_messages()
+        if not self.system_prompt:
+            return messages
+        return [{"role": "system", "content": self.system_prompt}, *messages]
 
     def _record_usage(self, usage: dict, step: int) -> None:
         """usage 观测（Step 1，纯旁路采集，不影响执行链）：

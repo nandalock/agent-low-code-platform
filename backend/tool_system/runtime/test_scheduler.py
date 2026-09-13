@@ -468,6 +468,45 @@ def test_sandbox_tools_declare_exclusive():
     assert [r.execution_mode_of(n) for n in names] == [EXCLUSIVE, EXCLUSIVE]
 
 
+def test_sandbox_tools_carry_usage_guidance():
+    """内置沙箱工具自带使用指导（进 system prompt 的 tool:<name> 段，与 schema 分开）"""
+    from backend.tool_system.registry.registry import ToolRegistry
+    from backend.tool_system.sandbox.runtime import register_builtin_sandbox_tools
+
+    r = ToolRegistry()
+    register_builtin_sandbox_tools(r)
+    assert all(r._by_name[n].usage_guidance for n in ("bash", "python"))
+
+
+def test_usage_guidance_defaults_to_none():
+    """未声明指导的工具留空（由提示词层按名字兜底，或干脆没有指导）"""
+    d = ToolDescriptor(name="x", type="mcp", transport="", server_id=0, schema={})
+    assert d.usage_guidance is None
+
+
+def test_get_descriptors_for_preserves_guidance():
+    """get_descriptors_for 与 get_schemas_for 同源，但保留 usage_guidance"""
+    from backend.tool_system.registry.registry import ToolRegistry
+
+    r = ToolRegistry()
+    r.register_builtin(ToolDescriptor(
+        name="bash", type="sandbox", transport="", server_id=0,
+        schema={"name": "bash", "description": "执行命令", "inputSchema": {}},
+        usage_guidance="检查退出码",
+    ))
+    original = ToolRegistry.get_bindings
+    ToolRegistry.get_bindings = staticmethod(lambda key: ["bash"])
+    try:
+        descriptors = asyncio.run(r.get_descriptors_for("any"))
+        schemas = asyncio.run(r.get_schemas_for("any"))
+    finally:
+        ToolRegistry.get_bindings = original
+
+    assert [d.name for d in descriptors] == ["bash"]
+    assert descriptors[0].usage_guidance == "检查退出码"   # 描述符保留指导
+    assert "usage_guidance" not in schemas[0]              # OpenAI schema 不含指导
+
+
 def test_registry_execution_mode_override():
     """扩展点：register_execution_mode 覆盖描述自带值，并即时反映到统一索引"""
     from backend.tool_system.registry.registry import ToolRegistry

@@ -6,9 +6,10 @@
   - 由 surface 派生 OpenAI 兼容 Message[]（derive_messages）
   - 同步广播 append 事件给 listener（UI projection / 持久化旁路）
 
-Event Log 是唯一真源：会话创建时的初始消息（system prompt / 上游 context）
-以 session/seed 事件写入 Log 开头（header.seed_length 记录数量），不做第二份存储；
-LLM messages 始终由 derive_messages() 派生，不单独保存。
+LLM messages 始终由 derive_messages() 派生，不单独保存。system prompt 不在
+Event Log 里——它每轮由 SystemPrompt 组装、在 AgentLoop 派生消息时前置为
+messages[0]（见 agents/runtime/system_prompt/）。session/seed 事件类型保留定义
+（兼容签名与内存构造），但主链路已无写入方，冷恢复时也不回放（见 from_events）。
 
 广播（listener）：append() 后同步通知已注册 listener（add_listener）。listener
 是纯同步回调（Session.append 无 await 点，单进程事件循环内天然保序），用于
@@ -52,8 +53,9 @@ class Session:
         self._surface = SurfaceManager()
         self._listeners: list[Callable[[SessionEvent], None]] = []
         self._seq = 0
-        # 初始 LLM 消息（system / 上游 context）→ seed 事件写入 Event Log：
-        # LLM 可见（surface 事件）、随 Log 保存，Event Log 保持唯一真源
+        # init_messages（system / 上游 context）→ seed 事件。
+        # **已退役**：system prompt 改由 SystemPrompt 每轮组装、AgentLoop 前置注入，
+        # 主链路不再传本参数（保留签名供测试与内存构造场景）。
         if init_messages:
             self._header.seed_length = len(init_messages)
             for m in init_messages:
@@ -148,16 +150,31 @@ class Session:
         """从 SessionHeader + SessionEvent[] 重建 Session（纯内存，不涉及存储）。
 
         重建 _log / _surface / _seq（不回放 append()，避免重写 seq/time）。
-        重建后 derive_messages() 结果与原 Session 完全一致（surface 由事件类型
-        重建，seed 事件随 Log 一起恢复）。当前阶段无调用方——后续接入真正
-        Persistence 时由 Persistence.load() → from_events() → SessionStore 使用。
+        调用方：AgentRuntime 冷恢复（Persistence.load → from_events → SessionStore）。
+
+        **seed 事件在重建时被丢弃**：system prompt 已改为每轮由 SystemPrompt 组装、
+        在 AgentLoop 派生消息时前置，不再属于会话历史。存量库里落过的 seed（旧
+        system prompt + 上游 context）若照常回放，会与前置的新 system 形成双 system
+        消息（语义重复，且旧 persona 可能已被改过）——冷恢复是唯一收口点（进程
+        重启后 SessionStore 热区为空，存量会话必走此路径）。
         """
         session = cls(header=header)
         ordered = sorted(events, key=lambda e: e.seq)
+        dropped_seed = 0
         for ev in ordered:
+            if ev.type == SEED:
+                # 不入 log 也不入 surface：system prompt 不再是会话历史的一部分，
+                # 留着只会在每次 flush 时把死事件重新写库（append_events 取 session.events）
+                dropped_seed += 1
+                continue
             session._log.append(ev)
             session._surface.append(ev)
         session._seq = ordered[-1].seq if ordered else 0
+        if dropped_seed:
+            logger.debug(
+                f"Session [{header.id}] 冷恢复丢弃 {dropped_seed} 条 seed 事件"
+                f"（system prompt 现由每轮组装注入）"
+            )
         return session
 
     # ── 派生 LLM Message ──
