@@ -1,9 +1,15 @@
-"""AgentRuntime — 统一 Agent 运行时：配置 + ToolRegistry + LLM 参数 + 执行调度
+"""AgentRuntime — 统一 Agent 运行时：配置 + SystemPrompt + LLM 参数 + 执行调度
 
-职责：加载 agent definition / config，获取 ToolRegistry 与 tool schemas，准备 LLM 参数，
+职责：加载 agent definition / config，组装 system prompt 与工具集，准备 LLM 参数，
 创建并驱动 AgentLoop，返回最终结果。Agent 执行循环（LLM → Tool → LLM）在 AgentLoop 中。
+
+每轮的请求装配顺序：
+  ① 取 Session（热命中 / 冷恢复 / 新建，见下三段式）
+  ② SystemPrompt.assemble —— 一次求值出提示词（段 + 动态上下文）、可见工具与其指导
+  ③ render 成 system prompt 文本；assembly.tools 转 OpenAI tools 数组
+  ④ 交给 AgentLoop：它把 system 前置为 messages[0]，对话历史由 Session 派生
+工具 schema 与工具使用指导由此同源产出（都来自同一次工具求值），不会各自漂移。
 """
-import json
 import logging
 import time
 from collections.abc import Callable
@@ -21,8 +27,12 @@ from backend.agents.runtime.session import (
     get_session_store,
 )
 from backend.agents.runtime.session.trace_projection import TraceProjection
+from backend.agents.runtime.system_prompt import (
+    AssembleContext,
+    assemble,
+    render_system_prompt,
+)
 from backend.core.http import get_http_session
-from backend.tool_system.registry.registry import get_registry
 from backend.tool_system.runtime.scheduler import DEFAULT_MAX_PARALLEL_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -31,7 +41,7 @@ logger = logging.getLogger(__name__)
 def _flush_session_events(persistence, session: Session) -> None:
     """持久化边界（尽力而为）：Session 事件 → append_events(pending) → flush(durable)。
 
-    触发点 = turn 完成（AgentRuntime.reply 收尾 / 新会话 seed 固化）。一次 flush 一个
+    触发点 = turn 完成（AgentRuntime.reply 收尾）。一次 flush 一个
     事务（全部成功或全部失败）；失败仅记 error 不打断对话 —— 答案已生成，不让持久化
     故障影响用户体验；pending 保留在 Persistence 内，下次 flush 幂等重放
     （ON CONFLICT (session_id, seq) DO NOTHING，不产生重复行）。
@@ -74,24 +84,6 @@ class AgentRuntime(BaseAgent):
         t0 = time.perf_counter()
         config = self._cfg()
 
-        try:
-            registry = get_registry()
-            tool_schemas = await registry.get_schemas_for(self.key)
-        except RuntimeError:
-            tool_schemas = []
-
-        def _build_init_messages() -> list[dict]:
-            """seed 注入内容（system prompt / 上游 context）——只对真正新建的 Session 注入；
-            恢复出的 Session 的 seed 已在 Event Log 里（Event Log 是唯一事实来源），不重复注入。"""
-            init_messages = [{"role": "system", "content": config.get("system_prompt", "")}]
-            if context:
-                context_str = json.dumps(context, ensure_ascii=False, indent=2)
-                init_messages.append({
-                    "role": "system",
-                    "content": f"【上游节点输出，供你参考】\n{context_str}",
-                })
-            return init_messages
-
         # Session 开关（默认开）：
         # 开 → Session 生命周期走 SessionStore + Persistence（见下三段式）；
         # 关 → 创建「临时 Session」（不注册 SessionStore / 不落库 / 不返回 session_id）：
@@ -107,7 +99,7 @@ class AgentRuntime(BaseAgent):
         #      日志（可观察），并把新 session_id 随 reply/done 回传，客户端应更新本地 id。
         # AgentRuntime 是无状态执行器：Session 生命周期归 SessionStore，Runtime 只取用不持有。
         # Persistence 是独立 capability（默认 Noop，main.py startup 装配 Postgres）：
-        #   新建后先固化 header + seed（第 0 状态），turn 完成是 flush 持久化边界。
+        #   新建后先固化 header（含 cwd），turn 完成是 flush 持久化边界。
         persistence = get_session_persistence()
         session_enabled = bool(config.get("session_enabled", True))
         session: Session | None = None
@@ -132,24 +124,43 @@ class AgentRuntime(BaseAgent):
                             f"客户端请改用本次返回的新 session_id"
                         )
             if session is None:
-                session = store.create(init_messages=_build_init_messages())
-                # 新会话先固化：header + seed 事件落库（幂等）。进程在 turn 中途崩溃时
-                # DB 至少保有第 0 状态（system prompt / 上游 context），冷恢复不丢初始上下文。
+                session = store.create()
+                # 新会话先固化 header（含 cwd）：沙箱策略链与工作区读取都靠它解析，
+                # 进程中途崩溃时会话仍可被找回。
                 try:
                     persistence.create(session.header.id, session.header)
                 except Exception:
                     logger.exception(f"AgentRuntime [{self.key}] Session header 注册失败: {session.header.id}")
-                _flush_session_events(persistence, session)
         else:
-            session = Session(init_messages=_build_init_messages())
+            session = Session()
 
-        # 准备运行环境，创建并驱动 AgentLoop（执行循环在 Loop 内部；Session 由 Runtime 注入）
+        # 组装 system prompt（每轮一次）：
+        #   ① SystemPrompt.assemble 求值全部贡献（工具 schema + 使用指导、身份、角色、
+        #      上游上下文），段在前、动态上下文在尾部 —— 尾部变化不断前部的前缀缓存
+        #   ② render 严格插值成最终文本（未知/无值变量在此报错，不发坏提示词给模型）
+        #   ③ assembly.tools 即本 agent 可见工具，无需再单独查 Registry
+        assembly = await assemble(AssembleContext(
+            tenant_id=tenant_id,
+            agent_key=self.key,
+            agent_name=self.name,
+            agent_description=self.desc,
+            config=config,
+            question=question,
+            session=session,
+            upstream_context=context,
+        ))
+        system_prompt = render_system_prompt(assembly)
+        tool_schemas = [t.to_openai() for t in assembly.tools]
+
+        # 准备运行环境，创建并驱动 AgentLoop（执行循环在 Loop 内部；Session 与
+        # 组装好的 system prompt 由 Runtime 注入）
         loop = AgentLoop(
             key=self.key,
             config=config,
             llm_params=self._llm_params(config),
             tool_schemas=tool_schemas,
             tenant_id=tenant_id,
+            system_prompt=system_prompt,
             on_event=on_event,
             session=session,
         )
