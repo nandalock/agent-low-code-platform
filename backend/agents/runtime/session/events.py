@@ -1,13 +1,14 @@
 """Session 事件定义（DSH 思想：Session Event Log 是执行事实来源）
 
 事件类型与 LLM messages 的映射由 Surface + derive_event_message 负责：
-  - surface 事件（进入 LLM Context）: session/seed, user/message, assistant/message, tool/result
+  - surface 事件（进入 LLM Context）: user/message, assistant/message, tool/result
+    （session/seed 亦在集合内，但已退役、无写入方——见 SEED 注释）
   - 过程事件（仅 Event Log，不进入 LLM）: turn/start, step/start, assistant/chunk,
     tool/call, tool/progress, step/end, turn/end, llm/usage
 
-session/seed 是会话创建时注入的初始 LLM 消息（system prompt / 上游 context），
-作为事件写入 Event Log 开头（Event Log 是唯一真源），header.seed_length 记录数量；
-持久化与恢复时无需单独保存 OpenAI messages，seed 事件随 Event Log 一起落库。
+system prompt 不进 Event Log：它由 SystemPrompt 每轮组装，在 AgentLoop 派生 LLM
+消息时前置为 messages[0]。session_headers.seed_length 是 seed 机制的历史字段，
+新会话写 0 / NULL，无读取方。
 
 按规格暂不实现：steering/message、todo/write、request/header、compaction、delegation。
 """
@@ -15,7 +16,10 @@ import uuid
 from dataclasses import dataclass
 
 # ── 事件类型常量 ──
-SEED = "session/seed"                    # 初始 LLM 消息（data: role + content），LLM 可见、入 Event Log
+SEED = "session/seed"                    # 初始 LLM 消息（data: role + content）。
+                                         # **已退役**：system prompt 改由 SystemPrompt
+                                         # 每轮组装、AgentLoop 前置注入，主链路无写入方。
+                                         # 类型保留供内存构造（测试/兼容），冷恢复不回放
 TURN_START = "turn/start"
 TURN_END = "turn/end"
 STEP_START = "step/start"
