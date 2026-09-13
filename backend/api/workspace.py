@@ -633,7 +633,9 @@ def api_create_workspace_session(
     # 只写 header（含 cwd），不写 seed：system prompt 由 AgentRuntime 每轮组装，
     # 不再属于会话历史 —— 预创建与执行侧因此没有需要逐字对齐的镜像代码。
     sid = new_session_id()
-    header = SessionHeader(version=1, id=sid, created_at=time.time())
+    # seed_length=0：显式声明「无 seed」（该字段是 seed 机制的历史遗留，无读取方；
+    # 0 = 新会话，≥1 = 改造前落库的旧数据，NULL = 更早的未知来源）
+    header = SessionHeader(version=1, id=sid, created_at=time.time(), seed_length=0)
     header.cwd = cwd
     persistence = get_session_persistence()
     persistence.create(sid, header)
