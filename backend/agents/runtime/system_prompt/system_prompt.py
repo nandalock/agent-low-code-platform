@@ -149,9 +149,9 @@ class SystemPrompt:
 
     # ── 组装 ──
 
-    def assemble(self, ctx: AssembleContext) -> PromptAssembly:
+    async def assemble(self, ctx: AssembleContext) -> PromptAssembly:
         """执行一次组装（委托 assembler，见其流水线说明）"""
-        return _assemble(self, ctx)
+        return await _assemble(self, ctx)
 
 
 def _validate_order(order: int | float, kind: str, name: str) -> None:
@@ -196,6 +196,6 @@ def tools(provider: ToolProvider) -> None:
     _default.tools(provider)
 
 
-def assemble(ctx: AssembleContext) -> PromptAssembly:
+async def assemble(ctx: AssembleContext) -> PromptAssembly:
     """用单例注册表执行一次组装"""
-    return _default.assemble(ctx)
+    return await _default.assemble(ctx)

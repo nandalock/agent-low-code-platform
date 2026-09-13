@@ -20,6 +20,7 @@ assembly 被渲染多次（如 prompt-preview 同时展示分段明细与完整�
   ⑥ 求值 context providers 并按 (order, name) 排序
   ⑦ 求值 variables
 """
+import inspect
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
@@ -100,15 +101,17 @@ class PromptAssembly:
 # ── 组装 ──
 
 
-def assemble(sp: "SystemPrompt", ctx: AssembleContext) -> PromptAssembly:
+async def assemble(sp: "SystemPrompt", ctx: AssembleContext) -> PromptAssembly:
     """执行一次组装（求值 + 排序 + complete 裁决，不插值）
+
+    异步只因为工具来源可能有 I/O（远程 MCP 工具懒加载）；文本 provider 同步。
 
     Raises:
         ValueError: 跨 provider 工具重名 / 段名占用保留前缀 / complete 段多于一个
         TypeError: provider 返回类型不符
     """
     # ① 工具：先求值，section 的条件渲染依赖它
-    schemas, guidance = _resolve_tools(sp, ctx)
+    schemas, guidance = await _resolve_tools(sp, ctx)
 
     # ② 回填可见工具名（派生新 ctx，不改调用方对象）
     ctx = replace(ctx, visible_tool_names=frozenset(t.name for t in schemas))
@@ -128,15 +131,20 @@ def assemble(sp: "SystemPrompt", ctx: AssembleContext) -> PromptAssembly:
     )
 
 
-def _resolve_tools(
+async def _resolve_tools(
     sp: "SystemPrompt", ctx: AssembleContext
 ) -> tuple[list[ToolSchema], dict[str, str]]:
-    """求值全部工具 provider；跨 provider 重名工具抛错"""
+    """求值全部工具 provider；跨 provider 重名工具抛错
+
+    provider 返回 awaitable 时 await（允许同步实现，便于简单来源与测试）。
+    """
     schemas: list[ToolSchema] = []
     guidance: dict[str, str] = {}
     seen: set[str] = set()
     for provider in sp.tool_providers():
         result = provider(ctx)
+        if inspect.isawaitable(result):
+            result = await result
         if not isinstance(result, ToolProviderResult):
             raise TypeError(
                 f"tool provider 必须返回 ToolProviderResult，实际 {type(result).__name__}"

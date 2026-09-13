@@ -3,10 +3,11 @@
 纯内存，不需要 docker / DB / 网络。
 
 Usage:
-    docker compose exec backend pytest backend/agents/runtime/system_prompt/test_system_prompt.py -v
+    docker compose exec backend python backend/agents/runtime/system_prompt/test_system_prompt.py
     # 或本机（仓库根目录下）：
     python backend/agents/runtime/system_prompt/test_system_prompt.py
 """
+import asyncio
 import math
 import os
 import sys
@@ -26,6 +27,11 @@ from backend.agents.runtime.system_prompt import (  # noqa: E402
     render_prompt,
     render_system_prompt,
 )
+
+
+def _assemble(sp: SystemPrompt, ctx: AssembleContext):
+    """同步包装：组装流水线是 async（工具来源可能有 I/O），测试里直接 run"""
+    return asyncio.run(sp.assemble(ctx))
 
 
 def _sp() -> SystemPrompt:
@@ -49,7 +55,7 @@ def test_register_and_order_sections():
     sp.section(PromptSection(name="first", order=-1, text="FIRST"))
     sp.section(PromptSection(name="b", order=100, text="B"))
 
-    result = render_prompt(sp.assemble(AssembleContext()))
+    result = render_prompt(_assemble(sp, AssembleContext()))
     assert result == "FIRST\n\nA\n\nB\n\nC", result
 
 
@@ -101,7 +107,7 @@ def test_reserved_tool_prefix_rejected():
     """V9：注册段不得占用 tool: 保留前缀"""
     sp = _sp()
     sp.section(PromptSection(name="tool:bash", order=1000, text="手写的重复说明书"))
-    _expect_raises(ValueError, lambda: sp.assemble(AssembleContext()))
+    _expect_raises(ValueError, lambda: _assemble(sp, AssembleContext()))
 
 
 def test_duplicate_tool_across_providers_raises():
@@ -109,7 +115,7 @@ def test_duplicate_tool_across_providers_raises():
     sp = _sp()
     sp.tools(lambda ctx: ToolProviderResult(schemas=[_tool("bash")[0]]))
     sp.tools(lambda ctx: ToolProviderResult(schemas=[_tool("bash")[0]]))
-    _expect_raises(ValueError, lambda: sp.assemble(AssembleContext()))
+    _expect_raises(ValueError, lambda: _assemble(sp, AssembleContext()))
 
 
 def test_non_str_provider_result_raises():
@@ -117,14 +123,14 @@ def test_non_str_provider_result_raises():
     sp = _sp()
     sp.section(PromptSection(name="bad", order=0, text=lambda ctx: 42))
     try:
-        sp.assemble(AssembleContext())
+        _assemble(sp, AssembleContext())
     except TypeError as e:
         assert "bad" in str(e), e
     else:
         raise AssertionError("应抛 TypeError")
     sp2 = _sp()
     sp2.tools(lambda ctx: "不是 ToolProviderResult")
-    _expect_raises(TypeError, lambda: sp2.assemble(AssembleContext()))
+    _expect_raises(TypeError, lambda: _assemble(sp2, AssembleContext()))
 
 
 # ── 渲染期校验 ──
@@ -136,7 +142,7 @@ def test_render_variable_interpolation():
     sp.variable("who", lambda ctx: "客服助手")
     sp.variable("nothing", lambda ctx: "")
     sp.section(PromptSection(name="s", order=0, text="你是 {{who}}。{{nothing}}结束"))
-    assert render_prompt(sp.assemble(AssembleContext())) == "你是 客服助手。结束"
+    assert render_prompt(_assemble(sp, AssembleContext())) == "你是 客服助手。结束"
 
 
 def test_render_unknown_variable_raises_with_owner():
@@ -145,8 +151,8 @@ def test_render_unknown_variable_raises_with_owner():
     sp.variable("cwd", lambda ctx: "/tmp")
     sp.section(PromptSection(name="my:section", order=0, text="目录 {{modle}} 无效"))
     try:
-        sp.assemble(AssembleContext())
-        render_prompt(sp.assemble(AssembleContext()))
+        _assemble(sp, AssembleContext())
+        render_prompt(_assemble(sp, AssembleContext()))
     except ValueError as e:
         assert "modle" in str(e) and "my:section" in str(e) and "cwd" in str(e), e
     else:
@@ -159,7 +165,7 @@ def test_render_none_value_raises():
     sp.variable("cwd", lambda ctx: None)
     sp.section(PromptSection(name="s", order=0, text="目录 {{cwd}}"))
     try:
-        render_prompt(sp.assemble(AssembleContext()))
+        render_prompt(_assemble(sp, AssembleContext()))
     except ValueError as e:
         assert "cwd" in str(e), e
     else:
@@ -173,7 +179,7 @@ def test_render_malformed_group_raises():
         sp.variable("a", lambda ctx: "A")
         sp.section(PromptSection(name="s", order=0, text=bad))
         try:
-            render_prompt(sp.assemble(AssembleContext()))
+            render_prompt(_assemble(sp, AssembleContext()))
         except ValueError as e:
             assert "s" in str(e), (bad, e)
         else:
@@ -184,7 +190,7 @@ def test_render_lone_open_brace_is_literal():
     """V13：孤立未闭合的 {{ 当作字面行文"""
     sp = _sp()
     sp.section(PromptSection(name="s", order=0, text="花括号 {{ 是字面量"))
-    assert render_prompt(sp.assemble(AssembleContext())) == "花括号 {{ 是字面量"
+    assert render_prompt(_assemble(sp, AssembleContext())) == "花括号 {{ 是字面量"
 
 
 def test_render_no_rescan_of_substituted_values():
@@ -192,7 +198,7 @@ def test_render_no_rescan_of_substituted_values():
     sp = _sp()
     sp.variable("raw", lambda ctx: "{{who}}")
     sp.section(PromptSection(name="s", order=0, text="值：{{raw}}"))
-    assert render_prompt(sp.assemble(AssembleContext())) == "值：{{who}}"
+    assert render_prompt(_assemble(sp, AssembleContext())) == "值：{{who}}"
 
 
 def test_render_empty_sections_dropped_and_all_empty_returns_empty():
@@ -201,12 +207,12 @@ def test_render_empty_sections_dropped_and_all_empty_returns_empty():
     sp.section(PromptSection(name="empty", order=0, text=""))
     sp.section(PromptSection(name="blank", order=10, text=lambda ctx: ""))
     sp.section(PromptSection(name="real", order=20, text="正文"))
-    assert render_prompt(sp.assemble(AssembleContext())) == "正文"
+    assert render_prompt(_assemble(sp, AssembleContext())) == "正文"
 
     sp_all_empty = _sp()
     sp_all_empty.section(PromptSection(name="empty", order=0, text=""))
-    assert render_prompt(sp_all_empty.assemble(AssembleContext())) == ""
-    assert render_system_prompt(sp_all_empty.assemble(AssembleContext())) == ""
+    assert render_prompt(_assemble(sp_all_empty, AssembleContext())) == ""
+    assert render_system_prompt(_assemble(sp_all_empty, AssembleContext())) == ""
 
 
 def test_complete_section_semantics():
@@ -214,12 +220,12 @@ def test_complete_section_semantics():
     sp = _sp()
     sp.section(PromptSection(name="identity", order=-1000, text="身份"))
     sp.section(PromptSection(name="full", order=0, text="完整提示词", complete=True))
-    assert render_prompt(sp.assemble(AssembleContext())) == "完整提示词"
+    assert render_prompt(_assemble(sp, AssembleContext())) == "完整提示词"
 
     sp2 = _sp()
     sp2.section(PromptSection(name="a", order=0, text="A", complete=True))
     sp2.section(PromptSection(name="b", order=10, text="B", complete=True))
-    _expect_raises(ValueError, lambda: sp2.assemble(AssembleContext()))
+    _expect_raises(ValueError, lambda: _assemble(sp2, AssembleContext()))
 
 
 def test_contexts_ordered_after_sections():
@@ -230,7 +236,7 @@ def test_contexts_ordered_after_sections():
     sp.context(PromptContext(name="up", order=CONTEXT_ORDERS["UPSTREAM_CONTEXT"], text="上游输出"))
     sp.context(PromptContext(name="mem", order=CONTEXT_ORDERS["MEMORY_CONTEXT"], text="记忆"))
 
-    result = render_system_prompt(sp.assemble(AssembleContext()))
+    result = render_system_prompt(_assemble(sp, AssembleContext()))
     assert result == "身份\n\n工具指导\n\n记忆\n\n上游输出", result
 
 
@@ -245,7 +251,7 @@ def test_dynamic_provider_reads_visible_tool_names():
         text=lambda ctx: (seen.__setitem__("section", ctx.visible_tool_names), "有条件段")[1],
     ))
     ctx = AssembleContext()
-    sp.assemble(ctx)
+    _assemble(sp, ctx)
 
     assert seen["tools"] is None, "tool provider 求值时可见集尚未回填"
     assert seen["section"] == frozenset({"bash"}), seen["section"]
@@ -260,7 +266,7 @@ def test_guidance_section_synthesized_only_for_visible_tools():
     search, _ = _tool("search")
     sp.tools(lambda ctx: ToolProviderResult(schemas=[python, bash, search], guidance={**g1, **g2}))
 
-    result = render_system_prompt(sp.assemble(AssembleContext()))
+    result = render_system_prompt(_assemble(sp, AssembleContext()))
     assert result == "检查退出码\n\n先读报错行", result  # bash 在 python 前（码点序）
     assert "search" not in result, "无 guidance 的工具不应产生段"
 
@@ -270,7 +276,7 @@ def test_guidance_absent_when_tool_invisible():
     sp = _sp()
     bash, _ = _tool("bash")
     sp.tools(lambda ctx: ToolProviderResult(schemas=[bash], guidance={"bash": "b", "ghost": "g"}))
-    result = render_system_prompt(sp.assemble(AssembleContext()))
+    result = render_system_prompt(_assemble(sp, AssembleContext()))
     assert result == "b", result
     assert "g" not in result
 
@@ -280,7 +286,7 @@ def test_render_context_snapshot_excludes_sections():
     sp = _sp()
     sp.section(PromptSection(name="s", order=0, text="正文"))
     sp.context(PromptContext(name="c", order=9000, text="上下文"))
-    assembly = sp.assemble(AssembleContext())
+    assembly = _assemble(sp, AssembleContext())
     assert render_context_snapshot(assembly) == "上下文"
     assert render_prompt(assembly) == "正文"
     assert render_system_prompt(assembly) == "正文\n\n上下文"

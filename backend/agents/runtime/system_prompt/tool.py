@@ -18,7 +18,7 @@ schema 解耦后 `ToolSchema.to_openai()` 保持纯净。
 工具被限制（未绑定该 agent）时，其 schema 与 guidance 段同时消失——不存在
 「说明书还在、工具没了」的漂移态。
 """
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -47,5 +47,11 @@ class ToolProviderResult:
     guidance: dict[str, str] = field(default_factory=dict)
 
 
-#: 工具贡献方：每轮组装时求值，返回本次可见的工具集合
-ToolProvider = Callable[["AssembleContext"], ToolProviderResult]
+#: 工具贡献方：每轮组装时求值，返回本次可见的工具集合。
+#:
+#: **允许异步**（返回 awaitable 时会被 await）——工具来源可能触发 I/O：
+#: 远程 MCP server 的工具要按需懒加载（见 registry.resolve 的 lazy_load 路径）。
+#: 与之相对，section/context/variable 的 text provider 是纯文本函数，保持同步。
+ToolProvider = Callable[
+    ["AssembleContext"], "ToolProviderResult | Awaitable[ToolProviderResult]"
+]
