@@ -221,9 +221,13 @@ def resolve_workspace_member(root: str, rel: str) -> Path:
 #: 因此不能靠 ``os.path.isabs`` 判断——它会把合法的 ``D:/jk`` 判成相对路径。
 _WINDOWS_ABS = re.compile(r"^[A-Za-z]:[\\/]")
 
+#: 盘符**根本身**（``D:``，即 ``D:/`` 去掉尾斜杠）。整盘挂载的配置就长这样，
+#: 而它的 basename 是带冒号的 ``D:``——见 :func:`_mount_name`。
+_DRIVE_ONLY = re.compile(r"^[A-Za-z]:$")
+
 
 def normalize_host_path(path: str) -> str:
-    """规范化一个宿主路径：反斜杠转正斜杠 + 绝对性校验。
+    """规范化一个宿主路径：反斜杠转正斜杠 + 绝对性校验 + 盘符大写。
 
     Raises:
         ValueError: 相对路径。**必须拒绝**——docker 收到相对路径会把它当成
@@ -231,7 +235,12 @@ def normalize_host_path(path: str) -> str:
             目录是空的」，是最难排查的一种失败。
     """
     p = path.strip().replace("\\", "/")
-    if p.startswith("/") or _WINDOWS_ABS.match(p):
+    if _WINDOWS_ABS.match(p):
+        # 盘符统一大写。Windows 路径大小写不敏感，``d:/jk`` 与 ``D:/jk`` 是同一个
+        # 目录，但去重是按字面量比较的——不归一，同一条盘会被挂两次（挂载名还会
+        # 一大一小，模型以为看到了两个位置）。
+        return p[0].upper() + p[1:]
+    if p.startswith("/"):
         return p
     raise ValueError(
         f"{READ_ROOTS_ENV} 的每一项必须是绝对路径: {path!r}；"
@@ -244,8 +253,15 @@ def _mount_name(host_path: str, taken: set[str]) -> str:
 
     取可读名而不是下标（``/mnt/read/0``），是为了让模型 ``ls /mnt/read``
     就能自己发现有哪些目录，不依赖外部告知的映射表。
+
+    例外是**盘符根**（``D:/``，整盘挂载）：它的 basename 是 ``D:``，冒号必须
+    去掉——docker 的 ``-v`` 按 ``:`` 分段，``D:/:/mnt/read/D::ro`` 会被判成
+    ``invalid spec: empty section between colons``，整条命令起不来。去掉后
+    留下盘符本身，模型 ``ls /mnt/read`` 一眼认出是哪个盘。
     """
     base = host_path.rstrip("/").rsplit("/", 1)[-1] or "root"
+    if _DRIVE_ONLY.match(base):
+        base = base[0].upper()
     name, n = base, 1
     while name in taken:
         n += 1

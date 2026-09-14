@@ -116,7 +116,8 @@ flowchart LR
 
 **执行链路的单一事实源**：一次对话产生的所有事件（用户消息、助手消息、工具调用与结果、
 运行限制、usage）都写进 `Session` 的 Event Log。对话历史、执行轨迹（trace）、冷恢复
-都从它派生——不存在第二套存储。
+都从它派生——不存在第二套存储。详见
+[`backend/agents/runtime/session/session.md`](backend/agents/runtime/session/session.md)。
 
 **System Prompt 的位置**：它**不在** Event Log 里。每轮请求由 `SystemPrompt` 从已注册的
 贡献现算（身份 · 角色 · 每个工具的使用指导 · 运行时上下文），渲染后作为 `messages[0]`
@@ -131,7 +132,7 @@ agent-low-code-platform/
 ├── backend/
 │   ├── agents/            # Agent implementations + runtime
 │   │   ├── runtime/       #   AgentRuntime · AgentLoop
-│   │   │   ├── session/   #   Event Log · Surface · 持久化 · 各类投影
+│   │   │   ├── session/   #   Event Log · Surface · 持久化 · 各类投影（见模块内 session.md）
 │   │   │   └── system_prompt/  # 分段注册的提示词组装（见模块内 system-prompt.md）
 │   │   ├── router/        #   三级级联意图路由（关键词 → 向量 → LLM FC）
 │   │   ├── faqagent/      #   RAG 检索 + 润色
@@ -201,7 +202,7 @@ Environment variables (see `docker-compose.yml`):
 | `NEXT_PUBLIC_API_URL`   | `http://localhost:8000`                | Frontend → backend base URL          |
 | `SANDBOX_WORKSPACE_ROOT`| `/srv/agent/workspaces`                | Sandbox workspace root (host-visible) |
 | `SANDBOX_DEFAULT_MODE`  | `workspace-write`                      | `read-only` · `workspace-write` · `danger-full-access` |
-| `SANDBOX_READ_ROOTS`    | —                                      | Extra **read-only** host mounts (comma-separated) |
+| `SANDBOX_READ_ROOTS`    | —                                      | Extra **read-only** host mounts (comma-separated). Whole-drive form (`C:/,D:/`) = read the entire host |
 | `SANDBOX_WRITE_ROOTS`   | —                                      | Extra **writable** host mounts (comma-separated) |
 
 **LLM 配置是 per-agent 的**：每个 agent 在自己的 config 里配 `base_url` / `api_key` / `model`

@@ -256,6 +256,26 @@ def test_docker_rejects_empty_and_relative_root():
     expect_raises(SandboxUnavailableError, p.confine, ["true"], _policy(root="relative/path"))
 
 
+def test_docker_accepts_windows_workspace_root():
+    """回归：宿主 Windows 路径的工作区根（文件夹绑定会话的 cwd，如
+    ``D:/jk/Nexus/proj``）必须能挂载为 ``/workspace``。
+
+    backend 跑在 Linux 容器里，``os.path.isabs`` 会把盘符路径判成相对路径，
+    于是整类「选了宿主文件夹」的会话沙箱工具全部 fail-closed —— 症状是模型
+    一调 bash 就报「workspace_root 必须是绝对路径」。判定改用
+    ``normalize_host_path``（与读/写根同一套规则）后修复。
+    """
+    p = DockerProvider()
+    c = p.confine(["bash", "-c", "true"], _policy(root="D:/jk/Nexus/proj"))
+    assert c.argv[c.argv.index("-v") + 1] == "D:/jk/Nexus/proj:/workspace"
+    # 反斜杠归一 —— 与读/写根共用 normalize_host_path，不该有两套规则
+    c2 = p.confine(["bash", "-c", "true"], _policy(root="D:\\jk\\Nexus\\proj"))
+    assert c2.argv[c2.argv.index("-v") + 1] == "D:/jk/Nexus/proj:/workspace"
+    # POSIX 绝对路径行为不变
+    c3 = p.confine(["bash", "-c", "true"], _policy(root="/tmp/ws"))
+    assert c3.argv[c3.argv.index("-v") + 1] == "/tmp/ws:/workspace"
+
+
 # ── 只读挂载根（对 DeepSeek 的扩展：Docker 后端的读轴）──
 
 
@@ -292,6 +312,30 @@ def test_build_read_mounts_names_and_dedup():
     assert build_read_mounts([]) == []
     # 配置错误在解析期就炸，不留到容器启动时才报
     expect_raises(ValueError, build_read_mounts, ["relative"])
+
+
+def test_build_mounts_whole_drive():
+    """整盘挂载（「读全域」）：盘符根 ``D:/`` 的挂载名是盘符本身，**不带冒号**。
+
+    带冒号会让 docker 的 ``-v`` 分段解析炸掉——实测
+    ``-v D:/:/mnt/read/D::ro`` → ``invalid spec: empty section between colons``，
+    命令根本起不来。故这里是「配置能不能用」的硬约束，不是风格问题。
+    """
+    assert build_read_mounts(["C:/", "D:/"]) == [
+        ("C:/", f"{CONTAINER_READ_ROOT}/C"),
+        ("D:/", f"{CONTAINER_READ_ROOT}/D"),
+    ]
+    # 盘符大写归一：Windows 路径大小写不敏感，'d:/' 与 'D:/' 是同一条盘。
+    # 不归一就会挂两次（去重按字面量），挂载名还会一大一小。
+    assert build_read_mounts(["d:/", "D:/"]) == [("D:/", f"{CONTAINER_READ_ROOT}/D")]
+    assert build_read_mounts(["d:/jk"])[0] == ("D:/jk", f"{CONTAINER_READ_ROOT}/jk")
+    # 整盘根与它下面的目录并列时不冲突：挂载名 'D' 与 'jk' 各占一格
+    assert [c for _, c in build_read_mounts(["D:/", "D:/jk"])] == [
+        f"{CONTAINER_READ_ROOT}/D",
+        f"{CONTAINER_READ_ROOT}/jk",
+    ]
+    # 可写轴同构——整盘可写同样走这条命名规则
+    assert build_write_mounts(["D:/"])[0][1] == f"{CONTAINER_WRITE_ROOT}/D"
 
 
 def test_build_write_mounts_names_and_dedup():

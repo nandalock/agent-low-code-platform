@@ -374,6 +374,25 @@ assert not any(a in argv for a in _FORBIDDEN), "模型参数不得影响隔离�
 
 **必须实现校验**：`SANDBOX_WORKSPACE_ROOT` 启动时断言其不等于、也不包含仓库根或 `backend/` 目录。这条把「读侧不设防」从固有风险降级为配置错误。
 
+#### 9.2.1 读侧可以被显式放宽：整盘只读挂载
+
+上面的「看得少」不是本架构的承诺，只是**默认配置的副产品**——默认不配读写根时，沙箱
+里确实只有工作区。`SANDBOX_READ_ROOTS` 一配，读面就按配置展开。
+
+配成整盘（`C:/,D:/`）即 **读全域**，容器内是 `/mnt/read/C` 与 `/mnt/read/D`。这不是
+新增发明，而是**把上游的读语义补齐**：DSH 各后端本就是「全文件系统只读授予 + 写限制」
+——bwrap 的 `--ro-bind / /`、Landlock 的 `landlockGrantArgs({readOnly: ['/']})`、
+Seatbelt 的 `allow default` + `deny file-write*`。它们的 `roots.ts` 只派生可写根，
+读侧**没有轴可配**，因为读本来就不设限。Docker 后端的读被容器边界收窄，整盘只读挂载
+把这个差距补回来，于是两条轴的语义与上游对齐：**读由授予决定，写由模式决定**。
+
+代价必须说清楚：**整盘只读意味着沙箱能读到仓库的 `.env`（`JWT_SECRET`、
+`PAPER_LLM_API_KEY`）以及用户目录下的凭据文件**。沙箱容器有网络，所以「读全域 + 网络」
+= 凭据外泄是可达路径。这是上游同世界后端**本来就有**的暴露面，不是本后端引入的缺陷；
+要收窄就列具体目录（`D:/jk/Papers,D:/Documents`）而不是整盘。
+
+只读轴与模式无关，`read-only` 下整盘也是可读的——模式词汇只描述写效果（见 §3）。
+
 进程内工具（fs 工具的跨族强制）仍不在本阶段范围。
 
 ### 9.3 fail-closed 的三种触发点
@@ -534,7 +553,7 @@ effective(session) = sandbox_projection.stateOf(session) ?? config_default
 | 网络 | 不在词汇内，命令照常联网 | 同 |
 | 策略解析 | `ctx.sandboxPolicy` 服务，直读会话 | 纯函数，由 AgentLoop 喂入 |
 | 升权 | 阶段内交付 | 延后到阶段 2 |
-| 读侧边界 | 不在范围内（用户自己的机器） | 明确不在阶段 1 范围（见 §9.2） |
+| 读侧边界 | 不在范围内（用户自己的机器） | 容器边界给出默认值；`SANDBOX_READ_ROOTS` 可放宽到整盘，补齐上游语义（见 §9.2.1） |
 | 拒绝标记 | `[sandbox: file access denied under <mode> mode]` | 同 |
 | fail-closed | `SANDBOX_UNAVAILABLE` | `SandboxUnavailableError` |
 | 拒绝 vs runner 故障 | 两套 stderr 方言，先查后者 | 同 |

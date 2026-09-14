@@ -1,13 +1,16 @@
 'use client';
 
-// WorkspaceSidebar —— 左栏：新建会话 + 搜索 + 按 agent 分组的会话列表（对齐 DSH）
+// WorkspaceSidebar —— 左栏：新建会话 + 搜索 + 按 agent 分组的会话列表
+//
+// 改造点：会话行不再套一个 emoji 头像方块（那是「丑」的主要来源之一），
+// 改成一行的标题 + 次级元信息，选中靠表面色差、悬浮靠半透明蒙层。
 //
 // 数据源 GET /api/workspace/sessions（后端只列「工作区目录存在」的会话）。
 // 重命名 / 删除为占位（后端 DELETE 待补）：悬停显示「待后端支持」。
 
 import { useState } from 'react';
 import { Plus, Search, MoreHorizontal, RefreshCw } from 'lucide-react';
-import { W, WS } from '../theme';
+import { W, R, WS } from '../theme';
 import { type WorkspaceSession, fmtRelTime } from './useWorkspace';
 
 interface Props {
@@ -35,71 +38,80 @@ export default function WorkspaceSidebar({ sessions, selectedId, onSelect, onNew
   }
 
   return (
-    <div style={{ width: 280, flexShrink: 0, background: W.panel, display: 'flex', flexDirection: 'column', minHeight: 0, fontFamily: W.font }}>
+    <div style={{
+      width: 280, flexShrink: 0, background: W.panel,
+      display: 'flex', flexDirection: 'column', minHeight: 0, fontFamily: W.font,
+    }}>
       {/* 新建会话 */}
-      <div style={{ padding: `${WS.md}px ${WS.base}px ${WS.sm}px` }}>
-        <button onClick={onNew} style={{
-          width: '100%', display: 'flex', alignItems: 'center', gap: WS.sm, padding: '8px 14px',
-          borderRadius: 8, border: `1px dashed ${W.border}`, background: 'transparent',
-          color: W.text, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit',
-        }}>
-          <Plus size={15} /> 新建会话
+      <div style={{ padding: `${WS.md}px ${WS.md}px ${WS.sm}px` }}>
+        <button onClick={onNew} className="ws-btn"
+          style={{
+            width: '100%', display: 'flex', alignItems: 'center', gap: WS.sm,
+            height: 34, padding: '0 10px', borderRadius: R.sm,
+            color: W.text, fontSize: 13, fontFamily: 'inherit', textAlign: 'left',
+          }}>
+          <Plus size={15} color={W.secondary} />
+          新建会话
         </button>
       </div>
 
       {/* 搜索 */}
-      <div style={{ padding: `0 ${WS.base}px ${WS.sm}px` }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: WS.sm, padding: '6px 10px', borderRadius: 8, background: W.surface }}>
-          <Search size={14} color={W.tertiary} />
+      <div style={{ padding: `0 ${WS.md}px ${WS.sm}px` }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: WS.sm, height: 30, padding: '0 8px',
+          borderRadius: R.sm, background: W.surface, boxShadow: `inset 0 0 0 0.5px ${W.borderSoft}`,
+        }}>
+          <Search size={13} color={W.dimmed} />
           <input value={q} onChange={e => setQ(e.target.value)} placeholder="搜索会话"
             style={{ flex: 1, minWidth: 0, background: 'transparent', border: 'none', outline: 'none', color: W.text, fontSize: 13, fontFamily: 'inherit' }} />
-          <button onClick={onRefresh} title="刷新会话列表" style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 2, color: W.tertiary }}>
+          <button onClick={onRefresh} title="刷新会话列表"
+            className="ws-btn ws-round"
+            style={{ padding: 2, color: W.dimmed, display: 'flex' }}>
             <RefreshCw size={13} className={loading ? 'ws-spin' : ''} />
           </button>
         </div>
-        <style>{`@keyframes wsSpin{to{transform:rotate(360deg)}} .ws-spin{animation:wsSpin 1s linear infinite}`}</style>
       </div>
 
       {/* 会话列表 */}
       <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: `0 ${WS.sm}px ${WS.sm}px` }}>
         {!loading && filtered.length === 0 && (
-          <div style={{ padding: `${WS.xxl}px ${WS.base}px`, textAlign: 'center', color: W.tertiary, fontSize: 13 }}>
+          <div style={{ padding: `${WS.xxl}px ${WS.base}px`, textAlign: 'center', color: W.dimmed, fontSize: 13, lineHeight: '20px', whiteSpace: 'pre-line' }}>
             {q.trim() ? '没有匹配的会话' : '还没有会话\n开始一次对话后，模型用工具落下的文件会出现在这里'}
           </div>
         )}
         {groups.map(g => (
-          <div key={g.key} style={{ marginBottom: WS.xs }}>
-            <div style={{ padding: `${WS.sm}px ${WS.sm}px ${WS.xs}px`, fontSize: 11, fontWeight: 600, color: W.tertiary, letterSpacing: '0.05em' }}>
+          <div key={g.key} style={{ marginBottom: WS.md }}>
+            <div style={{
+              padding: `${WS.sm}px ${WS.sm}px ${WS.xs}px`, fontSize: 11, lineHeight: '16px',
+              fontWeight: 500, color: W.dimmed, letterSpacing: '0.04em',
+            }}>
               {g.key}
             </div>
             {g.items.map(s => {
               const active = s.session_id === selectedId;
               return (
                 <div key={s.session_id} onClick={() => onSelect(s)} title={s.label || s.session_id}
+                  className="ws-item ws-hover-host" data-active={active}
                   style={{
-                    display: 'flex', alignItems: 'center', gap: WS.sm, padding: '8px 10px', borderRadius: 8,
-                    cursor: 'pointer', background: active ? W.active : 'transparent',
-                    marginBottom: 2,
-                  }}
-                  onMouseEnter={e => (e.currentTarget.style.background = active ? W.active : W.hover)}
-                  onMouseLeave={e => (e.currentTarget.style.background = active ? W.active : 'transparent')}>
-                  <div style={{
-                    width: 26, height: 26, borderRadius: 7, flexShrink: 0, fontSize: 14,
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    background: 'rgba(77,107,254,0.16)',
-                  }}>💬</div>
+                    position: 'relative', display: 'flex', alignItems: 'center', gap: WS.sm,
+                    padding: '7px 10px', borderRadius: R.sm, marginBottom: 1,
+                  }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13, color: active ? W.text : W.secondary, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    <div style={{
+                      fontSize: 13, lineHeight: '20px', color: active ? W.text : W.secondary,
+                      whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                    }}>
                       {s.label || s.session_id.slice(0, 8)}
                     </div>
-                    <div style={{ fontSize: 11, color: W.tertiary, marginTop: 1 }}>
+                    <div style={{ fontSize: 11, lineHeight: '16px', color: W.dimmed, marginTop: 1 }}>
                       {fmtRelTime(s.updated_at)}{s.entries > 0 ? ` · ${s.entries} 个文件` : ''}
                     </div>
                   </div>
-                  <div title="重命名 / 删除（后端待支持）" style={{ color: W.tertiary, opacity: 0, cursor: 'not-allowed' }} className="ws-more">
+                  <div title="重命名 / 删除（后端待支持）"
+                    className="ws-on-hover"
+                    style={{ color: W.dimmed, cursor: 'not-allowed', display: 'flex', flexShrink: 0 }}>
                     <MoreHorizontal size={14} />
                   </div>
-                  <style>{`.ws-more{transition:opacity .12s} div:hover > .ws-more{opacity:.7}`}</style>
                 </div>
               );
             })}

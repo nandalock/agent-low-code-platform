@@ -8,7 +8,7 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { ChevronRight, ChevronDown, FileText, FileCode, FileImage, Folder, FolderOpen, FilePlus, FolderPlus, RefreshCw, Search, File } from 'lucide-react';
-import { W, WS } from '../theme';
+import { W, R, WS } from '../theme';
 import { type FileEntry, fetchDir } from './useWorkspace';
 
 interface Props {
@@ -21,12 +21,12 @@ interface Props {
 const joinPath = (dir: string, name: string) => (dir ? `${dir}/${name}` : name);
 
 function fileIcon(entry: FileEntry, open: boolean) {
-  if (entry.is_dir) return open ? <FolderOpen size={15} color="#6B7688" /> : <Folder size={15} color="#6B7688" />;
+  if (entry.is_dir) return open ? <FolderOpen size={15} color={W.dimmed} /> : <Folder size={15} color={W.dimmed} />;
   const ext = entry.name.split('.').pop()?.toLowerCase() || '';
-  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'].includes(ext)) return <FileImage size={14} color="#8B93A5" />;
-  if (['js', 'ts', 'tsx', 'jsx', 'py', 'java', 'go', 'rs', 'c', 'cpp', 'css', 'html', 'sh', 'sql', 'json', 'yaml', 'yml', 'toml'].includes(ext)) return <FileCode size={14} color="#8B93A5" />;
-  if (['md', 'txt', 'log', 'csv'].includes(ext)) return <FileText size={14} color="#8B93A5" />;
-  return <File size={14} color="#8B93A5" />;
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'].includes(ext)) return <FileImage size={14} color={W.tertiary} />;
+  if (['js', 'ts', 'tsx', 'jsx', 'py', 'java', 'go', 'rs', 'c', 'cpp', 'css', 'html', 'sh', 'sql', 'json', 'yaml', 'yml', 'toml'].includes(ext)) return <FileCode size={14} color={W.tertiary} />;
+  if (['md', 'txt', 'log', 'csv'].includes(ext)) return <FileText size={14} color={W.tertiary} />;
+  return <File size={14} color={W.tertiary} />;
 }
 
 export default function FileTreePanel({ sessionId, refreshSignal, selectedPath, onSelectFile }: Props) {
@@ -133,10 +133,11 @@ export default function FileTreePanel({ sessionId, refreshSignal, selectedPath, 
     return (
       <div onClick={() => (e.is_dir ? (!e.outside && toggleDir(path)) : onSelectFile(path, e))}
         title={e.outside ? '符号链接指向工作区外（不可下钻）' : path}
+        className="ws-item" data-active={active}
         style={{
           display: 'flex', alignItems: 'center', gap: 6, padding: `4px ${WS.sm}px 4px ${8 + depth * 14}px`,
-          borderRadius: 6, cursor: e.is_dir && e.outside ? 'not-allowed' : 'pointer',
-          background: active ? W.active : 'transparent', color: W.text, fontSize: 13,
+          borderRadius: R.xs, cursor: e.is_dir && e.outside ? 'not-allowed' : 'pointer',
+          color: W.text, fontSize: 13,
           whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
           opacity: e.outside ? 0.45 : 1,
         }}>
@@ -150,7 +151,7 @@ export default function FileTreePanel({ sessionId, refreshSignal, selectedPath, 
 
   if (!sessionId) {
     return (
-      <div style={{ padding: WS.xl, textAlign: 'center', color: W.tertiary, fontSize: 13, fontFamily: W.font }}>
+      <div style={{ padding: WS.xl, textAlign: 'center', color: W.dimmed, fontSize: 13, fontFamily: W.font }}>
         选择左侧会话后查看它的工作区文件
       </div>
     );
@@ -159,18 +160,20 @@ export default function FileTreePanel({ sessionId, refreshSignal, selectedPath, 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, fontFamily: W.font }}>
       {/* 工具栏：过滤 + 占位写操作 + 刷新 + 折叠 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: WS.xs, padding: `${WS.sm}px ${WS.base}px`, borderBottom: `1px solid ${W.border}` }}>
-        <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: WS.xs, padding: '4px 8px', borderRadius: 6, background: W.surface, minWidth: 0 }}>
-          <Search size={12} color={W.tertiary} />
+      <div style={{ display: 'flex', alignItems: 'center', gap: WS.xs, padding: `${WS.sm}px ${WS.md}px`, borderBottom: `0.5px solid ${W.borderSoft}` }}>
+        <div style={{
+          flex: 1, display: 'flex', alignItems: 'center', gap: WS.xs, height: 28, padding: '0 8px',
+          borderRadius: R.sm, background: W.bg, boxShadow: `inset 0 0 0 0.5px ${W.borderSoft}`, minWidth: 0,
+        }}>
+          <Search size={12} color={W.dimmed} />
           <input value={q} onChange={e => setQ(e.target.value)} placeholder="过滤文件" style={{
             flex: 1, minWidth: 0, background: 'transparent', border: 'none', outline: 'none', color: W.text, fontSize: 12, fontFamily: 'inherit',
           }} />
         </div>
-        <button title="新建文件（后端待支持）" disabled style={{ ...iconBtn, cursor: 'not-allowed', opacity: 0.4 }}><FilePlus size={14} /></button>
-        <button title="新建文件夹（后端待支持）" disabled style={{ ...iconBtn, cursor: 'not-allowed', opacity: 0.4 }}><FolderPlus size={14} /></button>
-        <button title="刷新" onClick={refreshTree} style={iconBtn}><RefreshCw size={14} className={loading ? 'ws-spin' : ''} /></button>
-        <button title="全部折叠" onClick={collapseAll} style={iconBtn}><ChevronDown size={14} /></button>
-        <style>{`@keyframes wsSpin{to{transform:rotate(360deg)}} .ws-spin{animation:wsSpin 1s linear infinite}`}</style>
+        <button title="新建文件（后端待支持）" disabled className="ws-btn ws-round" style={{ ...iconBtn, opacity: 0.4 }}><FilePlus size={14} /></button>
+        <button title="新建文件夹（后端待支持）" disabled className="ws-btn ws-round" style={{ ...iconBtn, opacity: 0.4 }}><FolderPlus size={14} /></button>
+        <button title="刷新" onClick={refreshTree} className="ws-btn ws-round" style={iconBtn}><RefreshCw size={14} className={loading ? 'ws-spin' : ''} /></button>
+        <button title="全部折叠" onClick={collapseAll} className="ws-btn ws-round" style={iconBtn}><ChevronDown size={14} /></button>
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: `${WS.sm}px ${WS.sm}px ${WS.base}px` }}>
@@ -189,6 +192,6 @@ export default function FileTreePanel({ sessionId, refreshSignal, selectedPath, 
 }
 
 const iconBtn: React.CSSProperties = {
-  width: 26, height: 26, borderRadius: 6, border: 'none', cursor: 'pointer',
-  background: 'transparent', color: W.secondary, display: 'flex', alignItems: 'center', justifyContent: 'center',
+  width: 26, height: 26, borderRadius: 999, flexShrink: 0,
+  color: W.secondary, display: 'flex', alignItems: 'center', justifyContent: 'center',
 };
