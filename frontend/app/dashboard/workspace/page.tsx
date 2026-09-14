@@ -11,14 +11,15 @@
 // 「新建会话」是本地草稿（无 conversation/session id），首问 done 后升级为正式会话。
 
 import { useCallback, useEffect, useState } from 'react';
-import { W, WS } from './theme';
+import { W, WS, wsThemeCss } from './theme';
+import './workspace.css';
 import WorkspaceSidebar from './_components/WorkspaceSidebar';
 import WorkspaceChat, { type ActiveSession } from './_components/WorkspaceChat';
 import FileTreePanel from './_components/FileTreePanel';
 import FilePreviewPanel from './_components/FilePreviewPanel';
-import NewSessionDialog from './_components/NewSessionDialog';
+import WorkspaceEmpty from './_components/WorkspaceEmpty';
 import {
-  type WorkspaceSession, type FileEntry,
+  type WorkspaceSession, type FileEntry, type CreatedSession,
   fetchWorkspaceSessions, uploadFiles, fetchSandboxMode, setSandboxMode,
 } from './_components/useWorkspace';
 
@@ -36,7 +37,9 @@ export default function WorkspacePage() {
   const [sessions, setSessions] = useState<WorkspaceSession[]>([]);
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [active, setActive] = useState<ActiveSession | null>(null);
-  const [showNewDialog, setShowNewDialog] = useState(false);
+  // 空态发出首问后交接给 WorkspaceChat 的一条待发消息。key = 新 session_id，
+  // 供聊天侧认领时去重（StrictMode 恰好一次，见 WorkspaceChat 的首问 effect）。
+  const [pendingQuestion, setPendingQuestion] = useState<{ text: string; key: string } | null>(null);
   // 右栏
   const [tab, setTab] = useState<'files' | 'preview'>('files');
   const [selFile, setSelFile] = useState<{ path: string; entry: FileEntry } | null>(null);
@@ -84,34 +87,33 @@ export default function WorkspacePage() {
     });
   }
 
+  /** 侧栏「新建」：清空选中回到空态（聊天框居中显示，在那里选 agent + 文件夹）。 */
   function newSession() {
-    setShowNewDialog(true);   // 选 agent + 选文件夹 → 后端真正建会话
+    setActive(null);
+    setSelFile(null);
+    // 一并清掉持久化的选中：否则刷新会复活旧会话，回不到空态
+    try { localStorage.removeItem(LS_KEY); } catch { /* ignore */ }
   }
 
-  function handleSessionCreated(s: { session_id: string; conversation_id: number; agent_key: string; label: string }) {
-    setShowNewDialog(false);
+  /** 空态提交首问：会话已在后端建好（cwd 已绑定所选文件夹），切到聊天并交出这条消息。 */
+  function handleFirstQuestion(s: CreatedSession, question: string) {
     setActive({
       agent_key: s.agent_key,
       conversation_id: s.conversation_id,
       session_id: s.session_id,
       label: s.label,
     });
+    setPendingQuestion({ text: question, key: s.session_id });
     refreshSessions();
     setSelFile(null);
   }
 
-  // 每轮对话完成：刷新侧栏 + 文件树；草稿首问带回正式 id → 升级
-  function handleTurnDone(ids?: { conversation_id: number | null; session_id: string | null }) {
+  // 每轮对话完成：刷新侧栏（label/时间/文件数可能变了）+ 文件树（模型落了文件）。
+  // 早先这里还有「草稿会话首问带回正式 id → 升级」一支，现在会话一律先在后端建好
+  // （空态的 POST /sessions）再进聊天，不存在没有 id 的活动会话，故已移除。
+  function handleTurnDone() {
     refreshSessions();
     setTreeRefresh(v => v + 1);
-    if (ids?.session_id && active && active.session_id === null) {
-      const upgraded: ActiveSession = {
-        ...active,
-        conversation_id: ids.conversation_id ?? active.conversation_id,
-        session_id: ids.session_id,
-      };
-      setActive(upgraded);
-    }
   }
 
   async function handleUpload(files: File[]) {
@@ -145,7 +147,12 @@ export default function WorkspacePage() {
   }
 
   return (
-    <div style={{ display: 'flex', height: '100%', background: W.bg, color: W.text, fontFamily: W.font, overflow: 'hidden' }}>
+    <div className="ws-root" style={{ display: 'flex', height: '100%', background: W.bg, color: W.text, fontFamily: W.font, overflow: 'hidden' }}>
+      {/* 主题变量：由 theme.ts 的 W 生成，workspace.css 消费。走 dangerouslySetInnerHTML
+          是因为 <style>{str}</style> 的文本子节点 SSR 端会转义引号、客户端不转义，
+          两边文本不一致会 hydrate 崩页（font/mono 里有引号）。 */}
+      <style dangerouslySetInnerHTML={{ __html: wsThemeCss }} />
+
       {/* 左栏 */}
       <WorkspaceSidebar
         sessions={sessions}
@@ -156,39 +163,37 @@ export default function WorkspacePage() {
         loading={loadingSessions}
       />
 
-      {/* 中栏（minWidth 保底：窄视口下宁可挤右栏也不压扁对话） */}
-      <div style={{ flex: 1, minWidth: 420, minHeight: 0, display: 'flex', flexDirection: 'column', borderLeft: `1px solid ${W.border}`, borderRight: `1px solid ${W.border}` }}>
-        <WorkspaceChat
-          session={active}
-          onTurnDone={handleTurnDone}
-          uploading={uploading}
-          uploadError={uploadError}
-          onUpload={handleUpload}
-          sandboxMode={sandboxMode}
-          onModeChange={handleModeChange}
-          rightOpen={rightOpen}
-          onToggleRight={() => setRightOpen(v => !v)}
-        />
+      {/* 中栏（minWidth 保底：窄视口下宁可挤右栏也不压扁对话）。
+          左右 16px 是内容轴的最小呼吸位——对话页的居中轴按这个盒宽算 64%。 */}
+      <div style={{ flex: 1, minWidth: 420, minHeight: 0, display: 'flex', flexDirection: 'column', padding: `0 ${WS.base}px`, borderLeft: `0.5px solid ${W.borderSoft}`, borderRight: `0.5px solid ${W.borderSoft}` }}>
+        {active ? (
+          <WorkspaceChat
+            session={active}
+            onTurnDone={handleTurnDone}
+            uploading={uploading}
+            uploadError={uploadError}
+            onUpload={handleUpload}
+            sandboxMode={sandboxMode}
+            onModeChange={handleModeChange}
+            rightOpen={rightOpen}
+            onToggleRight={() => setRightOpen(v => !v)}
+            pendingQuestion={pendingQuestion}
+            onPendingQuestionConsumed={() => setPendingQuestion(null)}
+          />
+        ) : (
+          <WorkspaceEmpty onCreated={handleFirstQuestion} />
+        )}
       </div>
 
-      {/* 新建会话对话框 */}
-      {showNewDialog && (
-        <NewSessionDialog
-          onClose={() => setShowNewDialog(false)}
-          onCreated={handleSessionCreated}
-        />
-      )}
-
-      {/* 右栏：文件 / 预览 tab + 内容（顶栏头像点击收起/展开） */}
+      {/* 右栏：文件 / 预览 tab + 内容（顶栏按钮收起/展开） */}
       <div style={{ width: rightOpen ? 380 : 0, flexShrink: 0, minHeight: 0, display: 'flex', flexDirection: 'column', background: W.panel, overflow: 'hidden', transition: 'width .18s ease' }}>
-        <div style={{ display: 'flex', gap: WS.xs, padding: `${WS.sm}px ${WS.base}px 0`, borderBottom: `1px solid ${W.border}` }}>
+        <div style={{ display: 'flex', gap: WS.xs, padding: `${WS.sm}px ${WS.md}px`, flexShrink: 0 }}>
           {(['files', 'preview'] as const).map(t => (
             <button key={t} onClick={() => setTab(t)}
+              className="ws-item ws-round" data-active={tab === t}
               style={{
-                padding: '6px 14px', border: 'none', background: 'transparent', cursor: 'pointer',
+                height: 28, padding: '0 12px', borderRadius: 16,
                 color: tab === t ? W.text : W.tertiary, fontSize: 13, fontFamily: 'inherit',
-                borderBottom: tab === t ? `2px solid ${W.accent}` : '2px solid transparent',
-                fontWeight: tab === t ? 600 : 400,
               }}>
               {t === 'files' ? '文件' : '预览'}
             </button>

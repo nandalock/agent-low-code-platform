@@ -1,0 +1,220 @@
+/* 工作区样式 —— 只被 workspace/ 的页面 import，作用域限定在 .ws-root 子树内，
+   不污染 dashboard 其余浅色页。
+
+   为什么这里需要真 CSS：内联 style 表达不了 :hover / ::after / 动画 / 滚动条 /
+   容器查询，而这些正是参考实现的观感来源（半透明蒙层、扫光、发丝线、渐变遮罩）。
+   颜色一律走 var(--ws-*)，由 theme.ts 的 W 生成注入，不在本文件里写字面色值。 */
+
+/* ── 滚动条：8px 胶囊、透明轨道，让滑块「浮」在内容上 ── */
+.ws-root ::-webkit-scrollbar { width: 8px; height: 8px; }
+.ws-root ::-webkit-scrollbar-track { background: transparent; }
+.ws-root ::-webkit-scrollbar-thumb {
+  background: var(--ws-scrollbar);
+  border-radius: 999px;
+  corner-shape: round;
+}
+.ws-root ::-webkit-scrollbar-thumb:hover { background: var(--ws-scrollbar-hover); }
+.ws-root ::-webkit-scrollbar-corner { background: transparent; }
+/* Firefox 走标准属性；与上面的 webkit 路径互斥，避免两边同时生效 */
+@supports not selector(::-webkit-scrollbar) {
+  .ws-root { scrollbar-color: var(--ws-scrollbar) transparent; scrollbar-width: thin; }
+}
+
+/* ── 超椭圆圆角：参考实现的「软而不方」就来自这里；全圆形态要显式退出 ── */
+@supports (corner-shape: superellipse(1.5)) {
+  .ws-root * { corner-shape: superellipse(1.5); }
+  .ws-root .ws-round { corner-shape: round; }   /* 圆形按钮 / 胶囊 / 滚动条滑块 */
+}
+
+/* ── 动画 ── */
+@keyframes wsSpin { to { transform: rotate(360deg); } }
+@keyframes wsBlink { 50% { opacity: 0; } }
+/* 运行中状态的扫光：一道窄高光掠过整行。固定 300px 宽、从左外侧扫到右侧之外 */
+@keyframes wsSweep { from { left: -300px; } to { left: 100%; } }
+@keyframes wsFadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+.ws-spin { animation: wsSpin 0.9s linear infinite; }
+.ws-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: var(--ws-accent);
+  margin-left: 2px;
+  vertical-align: -2px;
+  animation: wsBlink 1s steps(1) infinite;
+}
+.ws-fade-in { animation: wsFadeIn 0.16s var(--ws-ease, ease-out); }
+
+/* 扫光层：宿主元素需 position:relative + overflow:hidden */
+.ws-sweep::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 300px;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.07), transparent);
+  animation: wsSweep 2.6s ease-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ws-spin { animation-duration: 2.4s; }
+  .ws-sweep::after { display: none; }
+  .ws-fade-in { animation: none; }
+}
+
+/* ── 交互：hover / active 一律半透明蒙层，不换边框、不加阴影 ──
+   注意：行内 style 的优先级高于任何选择器（含 :hover）。凡是同时写了
+   className="ws-hover" 又写内联 background 的元素，蒙层会被**静默压死**。
+   所以需要背景的元素一律下面这几个类来持有背景，别在自己的 style 里写。 */
+.ws-hover:hover { background: var(--ws-hover); }
+.ws-hover:active { background: var(--ws-active); }
+
+/* 透明底按钮 */
+.ws-btn { background: transparent; border: none; cursor: pointer; }
+.ws-btn:hover { background: var(--ws-hover); }
+.ws-btn:active { background: var(--ws-active); }
+.ws-btn:disabled { cursor: not-allowed; }
+.ws-btn:disabled:hover { background: transparent; }
+
+/* 实底按钮（表面色）：hover 抬到上一层表面。用实色而不是半透明蒙层——
+   半透明会让下层内容透出来，实底按钮上看得很明显 */
+.ws-btn-solid { background: var(--ws-surface); border: none; cursor: pointer; }
+.ws-btn-solid:hover { background: var(--ws-surface-hi); }
+
+/* 列表行（会话项 / 文件树行 / tab）：选中态靠表面色差 + 内描边。
+   background/border 必须显式重置——用在 <button> 上时，不重置就会露出浏览器
+   默认的浅灰底（#F0F0F0），深色页里是一块刺眼的亮斑。 */
+.ws-item { cursor: pointer; background: transparent; border: none; }
+.ws-item:hover { background: var(--ws-hover); }
+.ws-item[data-active='true'] {
+  background: var(--ws-surface);
+  box-shadow: inset 0 0 0 0.5px var(--ws-border-soft);
+}
+.ws-item[data-active='true']:hover { background: var(--ws-surface-hi); }
+
+/* 胶囊按钮（用量 pill / chip） */
+.ws-pill { background: transparent; border: none; cursor: pointer; }
+.ws-pill:hover { background: var(--ws-hover); }
+
+/* 黑白反转的主 CTA（参考实现里品牌蓝只留给链接与信息态） */
+.ws-btn-primary {
+  background: var(--ws-primary); color: var(--ws-primary-text);
+  border: none; cursor: pointer;
+}
+.ws-btn-primary:hover { background: var(--ws-primary-hover); }
+.ws-btn-primary:disabled { cursor: not-allowed; }
+
+/* 主发送键：品牌蓝实底，禁用时落到表面色 */
+.ws-send { background: var(--ws-accent); border: none; transition: background 0.12s var(--ws-ease); }
+.ws-send:hover { background: var(--ws-accent-hover); }
+.ws-send:disabled { background: var(--ws-surface); cursor: not-allowed; }
+.ws-send:disabled:hover { background: var(--ws-surface); }
+
+/* 次要动作默认隐形，宿主 hover 才浮现（旧消息时间戳、更多操作等） */
+.ws-on-hover { opacity: 0; transition: opacity 0.12s ease; }
+.ws-hover-host:hover .ws-on-hover,
+.ws-on-hover:focus-visible { opacity: 1; }
+/* 触屏没有 hover：藏起来就等于永久不可见，一律常显 */
+@media (hover: none) {
+  .ws-on-hover { opacity: 1; }
+}
+
+/* ── 焦点可见：键盘用户必须看得见，且不破坏鼠标观感 ── */
+.ws-root :focus-visible {
+  outline: 2px solid var(--ws-accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+.ws-root input:focus-visible,
+.ws-root textarea:focus-visible { outline: none; }
+
+/* ── 输入卡上方 36px 渐变遮罩：淡化滚上去的消息，让 sticky 卡片「浮」得住 ── */
+.ws-composer-seat { position: sticky; bottom: 0; z-index: 7; }
+.ws-composer-seat::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: 36px;
+  pointer-events: none;
+  background: linear-gradient(180deg, transparent, var(--ws-bg) 100%);
+}
+
+/* ── Markdown（聊天正文 + 右栏文件预览共用一套排版）──
+   字号阶梯取参考实现：正文 14/24、标题 700、表格 13/22、code 12/19 */
+.ws-md { font-size: 14px; line-height: 24px; color: var(--ws-text); word-break: break-word; }
+.ws-md > *:first-child { margin-top: 0; }
+.ws-md > *:last-child { margin-bottom: 0; }
+.ws-md p { margin: 0 0 16px; }
+.ws-md h1, .ws-md h2, .ws-md h3, .ws-md h4 { margin: 24px 0 12px; font-weight: 700; }
+.ws-md h1 { font-size: 21px; line-height: 30px; }
+.ws-md h2 { font-size: 19px; line-height: 28px; }
+.ws-md h3 { font-size: 18px; line-height: 26px; }
+.ws-md h4 { font-size: 14px; line-height: 24px; font-weight: 600; }
+.ws-md ul, .ws-md ol { margin: 0 0 16px; padding-left: 1.5em; }
+.ws-md li { margin: 4px 0; }
+.ws-md li > p { margin: 0; }
+.ws-md blockquote {
+  margin: 0 0 16px;
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--ws-border);
+  color: var(--ws-secondary);
+}
+.ws-md a { color: var(--ws-accent); font-weight: 500; text-decoration: none; }
+.ws-md a:hover { text-decoration: underline dotted; text-underline-offset: 3px; }
+.ws-md code {
+  font-family: var(--ws-mono);
+  font-size: 12px;
+  line-height: 19px;
+  background: var(--ws-surface-hi);
+  padding: 2px 5px;
+  border-radius: 5px;
+}
+.ws-md pre {
+  margin: 0 0 16px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 0.5px solid var(--ws-border-soft);
+  background: var(--ws-bg);
+  overflow: auto;
+  max-height: 480px;
+}
+.ws-md pre code { background: transparent; padding: 0; font-size: 11px; line-height: 19px; }
+.ws-md hr { border: none; border-top: 0.5px solid var(--ws-border); margin: 20px 0; }
+.ws-md img { max-width: 100%; border-radius: 8px; }
+.ws-md table {
+  border-collapse: collapse;
+  margin: 0 0 16px;
+  font-size: 13px;
+  line-height: 22px;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.ws-md th, .ws-md td { border: 0.5px solid var(--ws-border); padding: 6px 12px; text-align: left; }
+.ws-md th { background: var(--ws-surface); font-weight: 600; }
+.ws-md input[type='checkbox'] { margin-right: 6px; vertical-align: -1px; }
+
+/* 代码高亮（highlight.js token → 参考实现深色 shiki 配色）
+   .ws-md 覆盖聊天正文与 markdown 预览，.ws-code 覆盖右栏的原样代码预览 */
+.ws-md .hljs-keyword, .ws-code .hljs-keyword,
+.ws-md .hljs-selector-tag, .ws-code .hljs-selector-tag,
+.ws-md .hljs-literal, .ws-code .hljs-literal { color: #faa2c1; }
+.ws-md .hljs-string, .ws-code .hljs-string,
+.ws-md .hljs-attr, .ws-code .hljs-attr,
+.ws-md .hljs-regexp, .ws-code .hljs-regexp { color: #69db7c; }
+.ws-md .hljs-comment, .ws-code .hljs-comment,
+.ws-md .hljs-quote, .ws-code .hljs-quote { color: #adb5bd; font-style: italic; }
+.ws-md .hljs-number, .ws-code .hljs-number,
+.ws-md .hljs-built_in, .ws-code .hljs-built_in,
+.ws-md .hljs-type, .ws-code .hljs-type { color: #4dabf7; }
+.ws-md .hljs-title, .ws-code .hljs-title,
+.ws-md .hljs-function .hljs-title, .ws-code .hljs-function .hljs-title { color: #b197fc; }
+.ws-md .hljs-params, .ws-code .hljs-params,
+.ws-md .hljs-variable, .ws-code .hljs-variable { color: #ffa94d; }
+.ws-md .hljs-attribute, .ws-code .hljs-attribute,
+.ws-md .hljs-tag, .ws-code .hljs-tag { color: #74c0fc; }
+.ws-md .hljs-meta, .ws-code .hljs-meta,
+.ws-md .hljs-section, .ws-code .hljs-section { color: #ced4da; }
