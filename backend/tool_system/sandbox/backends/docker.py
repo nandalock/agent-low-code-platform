@@ -27,7 +27,6 @@ Landlock 授权 / Seatbelt SBPL，本后端用 ``docker run`` 的参数。
 镜像、python 用带科学栈的镜像），需要扩展 seam（provider 每镜像一个实例，
 或给 policy 加一个后端配置字段），阶段 1b 再定。
 """
-import os
 from typing import Sequence
 
 from backend.tool_system.sandbox.errors import SandboxUnavailableError
@@ -37,6 +36,7 @@ from backend.tool_system.sandbox.workspace import (
     CONTAINER_WORKSPACE,
     build_read_mounts,
     build_write_mounts,
+    normalize_host_path,
 )
 
 #: 默认沙箱镜像。
@@ -125,9 +125,19 @@ class DockerProvider(SandboxProvider):
             raise ValueError("argv 不能为空")
         assert_no_isolation_injection(argv)
 
-        root = policy.workspace_root
-        if not os.path.isabs(root):
-            raise SandboxUnavailableError(policy.mode, f"workspace_root 必须是绝对路径: {root!r}")
+        # 绝对性判定走 normalize_host_path 而不是 os.path.isabs：backend 跑在
+        # Linux 容器里，而会话 cwd 可能是**宿主的 Windows 路径**（文件夹绑定
+        # 会话把 cwd 设成 D:/jk/Nexus/proj，由 daemon 侧解析）。os.path.isabs
+        # 会把盘符路径判成相对路径 → 整类会话的沙箱工具全部 fail-closed。
+        # 该函数同时归一化反斜杠，与读/写根用同一套规则。
+        try:
+            root = normalize_host_path(policy.workspace_root)
+        except ValueError:
+            raise SandboxUnavailableError(
+                policy.mode,
+                f"workspace_root 必须是绝对路径: {policy.workspace_root!r}；"
+                "相对路径会被 docker 当成 named volume 静默挂成空卷",
+            ) from None
 
         # 工作区挂载随模式变化——绑定挂载会覆盖根文件系统的只读属性，因此
         # read-only 必须显式以 :ro 挂载，否则工作区仍然可写（同 bwrap 只在

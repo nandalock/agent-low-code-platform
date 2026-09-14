@@ -94,6 +94,20 @@
 `-v <root>:/mnt/read/<name>:ro`。挂载**恒为 `:ro`、与模式无关** —— 它只增加
 「读得到」，不增加「写得进」，因此独立于 `SandboxMode`（模式词汇只描述写效果）。
 
+**读全域**：配成整盘（`SANDBOX_READ_ROOTS=C:/,D:/`）即把宿主每个盘按 `:ro` 挂进来，
+容器内是 `/mnt/read/C`、`/mnt/read/D`。这是**把上游的读语义补齐**：DSH 各后端本就是
+「全文件系统只读授予 + 写限制」（bwrap `--ro-bind / /`、Landlock `readOnly: ['/']`、
+Seatbelt `allow default` + `deny file-write*`），读侧没有轴可配；Docker 后端的读被
+容器边界收窄，整盘只读挂载把这份差距补回来。
+
+整盘配置有两点必须知道：
+
+- **盘符根的挂载名是盘符本身，不带冒号**。`D:/` 的 basename 是 `D:`，冒号进容器路径
+  会让 docker 的 `-v` 分段解析炸掉（`invalid spec: empty section between colons`），
+  整条命令起不来。见 `_mount_name`。
+- **它同时把本仓库的 `.env`、用户目录下的凭据一起挂进去**。这是「读全域」的必然
+  代价，不是 bug —— 上游同世界后端本来就是这个暴露面。要收窄就改成列具体目录。
+
 ---
 
 ## 4. 一次调用的完整链路
