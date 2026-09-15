@@ -22,6 +22,7 @@ from backend.agents.runtime.system_prompt import (  # noqa: E402
 from backend.agents.runtime.system_prompt.platform_sections import (  # noqa: E402
     PLATFORM_TOOL_GUIDANCE,
 )
+from backend.tool_system.sandbox.workspace import CONTAINER_WORKSPACE  # noqa: E402
 
 
 def _assemble(ctx: AssembleContext):
@@ -167,6 +168,61 @@ def test_tool_provider_without_registry_yields_nothing():
     assembly = _assemble(_ctx())
     assert assembly.tools == []
     assert render_system_prompt(assembly) == "你是「PaperAgent」。学术论文研究助手"
+
+
+def _sandbox_tool_descriptions(cwd: str | None) -> dict[str, str]:
+    """用假 Registry 跑一次组装，返回 {工具名: 描述}；``cwd`` 为会话工作区宿主路径。"""
+    from backend.agents.runtime.session import SessionStore
+    from backend.tool_system.registry import registry as registry_mod
+    from backend.tool_system.registry.descriptor import SandboxToolConfig, ToolDescriptor
+
+    tools = [
+        ToolDescriptor(
+            name="bash", type="sandbox", transport="", server_id=0,
+            schema={"name": "bash", "description": "执行命令", "inputSchema": {}},
+            sandbox=SandboxToolConfig(runtime="shell", image="alpine", timeout_s=1.0),
+        ),
+        ToolDescriptor(
+            name="search", type="mcp", transport="http", server_id=1,
+            schema={"name": "search", "description": "检索", "inputSchema": {}},
+        ),
+    ]
+
+    class _FakeRegistry:
+        async def get_descriptors_for(self, agent_key):
+            return tools
+
+    session = SessionStore().create()
+    session.header.cwd = cwd
+
+    saved = registry_mod.get_registry
+    registry_mod.get_registry = lambda: _FakeRegistry()
+    try:
+        assembly = _assemble(_ctx(session=session))
+    finally:
+        registry_mod.get_registry = saved
+    return {t.name: t.function["description"] for t in assembly.tools}
+
+
+def test_sandbox_tool_description_carries_workspace_host():
+    """沙箱工具的描述带上会话工作区的**宿主路径**，与读/写两条轴同格式。
+
+    注册侧拼不了这一段（发生在启动时、没有会话），由 provider 按 ctx.session 补。
+    漏了它，模型只能去挂载表里推——而 Docker Desktop 的 drvfs 只报盘符根
+    （绑 ``D:/jk/Nexus/test1`` 与绑 ``D:/jk/Nexus`` 显示完全相同），推出来必然是
+    「整个 D 盘」，并会这样转述给用户。
+    """
+    descs = _sandbox_tool_descriptions("D:/jk/Nexus/proj")
+    assert f"可写位置：会话工作区 {CONTAINER_WORKSPACE}（宿主 D:/jk/Nexus/proj）" in descs["bash"]
+    # 挂载说明是沙箱工具的专属事实，不该糊到别的工具上
+    assert "可写位置" not in descs["search"]
+
+
+def test_sandbox_tool_description_without_cwd_omits_host():
+    """未绑定文件夹（cwd 为空）时不编造宿主路径 —— 只报容器内路径。"""
+    desc = _sandbox_tool_descriptions(None)["bash"]
+    assert f"可写位置：会话工作区 {CONTAINER_WORKSPACE}。" in desc
+    assert "（宿主 None）" not in desc
 
 
 # ── 运行器 ──

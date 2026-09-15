@@ -270,6 +270,16 @@ def _mount_name(host_path: str, taken: set[str]) -> str:
     return name
 
 
+def mount_name(host_path: str) -> str:
+    """单个根的容器内挂载名（与 :func:`build_read_mounts` / ``build_write_mounts``
+    同一套命名）。
+
+    公开出来是给「文件系统浏览器」用的：它要按同一个名字把宿主路径呈现给用户，
+    两侧名字一致（沙箱里 ``/mnt/read/D`` ↔ 选择器里的根 ``D``）人才不会看晕。
+    """
+    return _mount_name(normalize_host_path(host_path), set())
+
+
 def _build_mounts(roots: Sequence[str], container_root: str) -> list[tuple[str, str]]:
     """把配置的根解析成 ``[(宿主路径, 容器内挂载点), ...]``。
 
@@ -314,6 +324,32 @@ def parse_roots(raw: str | None) -> tuple[str, ...]:
     if not raw:
         return ()
     return tuple(x for x in (p.strip() for p in raw.split(",")) if x)
+
+
+def path_in_roots(path: str, roots: Sequence[str]) -> bool:
+    """``path`` 是否等于或落在任一 ``roots`` 之下（**宿主**路径语义）。
+
+    两侧都过 :func:`normalize_host_path`，并**去掉尾斜杠**再比：整盘根的配置是
+    ``C:/``，而 ``C:/`` 自己与它的子路径 ``C:/jk`` 都要判为"在内"——不归一就会得出
+    「根不在根本内」这种荒谬结论。
+
+    不 resolve、不碰盘：调用方拿的是配置值与会话 cwd，可能是还没落地的路径；
+    这里只做字面前缀判断，inode 层（符号链接逃逸）的校验另有
+    :func:`resolve_workspace_member` 负责。
+
+    非绝对路径一律返回 ``False`` 而不抛异常：本函数在逐工具调用的热路径上
+    （见 ``sandbox/runtime.py`` 的会话默认模式），不该为一个判不出来的路径炸掉
+    整轮对话——那种路径到 docker 那步自会有更明确的报错。
+    """
+    try:
+        p = normalize_host_path(path).rstrip("/")
+    except ValueError:
+        return False
+    for raw in roots:
+        base = normalize_host_path(raw).rstrip("/")
+        if p == base or p.startswith(base + "/"):
+            return True
+    return False
 
 
 def probe_workspace_root(

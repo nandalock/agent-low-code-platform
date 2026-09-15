@@ -515,12 +515,17 @@ async def agent_session_sandbox_mode(session_id: str) -> dict:
 
     生效值 = 覆盖 ?? 部署默认 ?? workspace-write，与执行侧（sandbox/policy.py）
     是同一条优先级链；``override`` 来自 sandbox/mode 事件的投影（find-last）。
+
+    「部署默认」走 ``session_default_mode(cwd)`` 而**不是**裸的 ``default_mode()``：
+    后者只读环境变量，不知道 cwd 落在只读根里的会话会被降为 read-only，页面上
+    于是显示「标准模式」而沙箱实际只读——档位名骗人。两个消费方共用同一个
+    函数（见 sandbox/runtime.py）。
     """
     from backend.tool_system.sandbox.policy import FALLBACK_MODE
-    from backend.tool_system.sandbox.runtime import default_mode
-    events = _session_or_404(session_id).events
-    override = project_sandbox_mode(events)
-    cfg_default = default_mode()
+    from backend.tool_system.sandbox.runtime import session_default_mode
+    session = _session_or_404(session_id)
+    override = project_sandbox_mode(session.events)
+    cfg_default = session_default_mode(session.header.cwd)
     return {
         "session_id": session_id,
         "override": override,

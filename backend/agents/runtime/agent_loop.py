@@ -150,10 +150,10 @@ class AgentLoop:
             if "tenant_id" not in required:
                 required.append("tenant_id")
 
-        # Session 是对话历史的唯一来源：LLM 消息由 session.derive_messages() 派生，
-        # system prompt 由 Runtime 组装后经 __init__ 注入、_get_messages() 前置 ——
-        # 此处不再构造本地 messages（run 的 context 参数不参与，上游输出已在
-        # 组装阶段作为动态上下文进入 system prompt）。
+        # Session 是唯一执行事实来源：init_messages（system prompt / 上游 context）
+        # 由 AgentRuntime 在 Session 创建时注入为 seed 事件（hot restore 的 seed 已在
+        # Event Log 里），LLM 消息全程由 session.derive_messages() 派生 —— 此处不再
+        # 构造本地 messages（context 参数仅在新会话 seed 注入时被 Runtime 消费）。
         self.session.append(TURN_START, {
             "agent": self.key,
             # run 级运行限制入 turn/start 事件（log-only）：TraceProjection 从中投影

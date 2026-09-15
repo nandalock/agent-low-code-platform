@@ -30,6 +30,27 @@ services:
       # 自己看不见 D:/。约定容器内路径 /srv/host-write/<目录名>（api/workspace.py
       # 的 _BACKEND_WRITE_MOUNT_BASE）。多个写根时逐行加。
       - D:/jk/Nexus:/srv/host-write/Nexus
+      # 读根（SANDBOX_READ_ROOTS）同样要挂进 backend 本身：文件系统选择器要把磁盘
+      # 列给用户看，而列举发生在 API 进程里。挂载名与沙箱容器的 /mnt/read/<名> 一致
+      # （同一个 mount_name），整盘根只留盘符（C:/ → C）。
+      #
+      # **backend 侧 rw，沙箱侧 :ro** —— 这条分工是 2026-09-15 拆开的。读轴限制的
+      # 是**模型**能写哪（沙箱容器的挂载，见 sandbox/backends/docker.py 的 read_args，
+      # 那里恒为 :ro，与这里无关）；而用户在界面上自己新建文件夹、上传文件是**人**的
+      # 动作，不该被模型的沙箱规则管。早先这里也是 :ro，于是 D:/ 里除了写根哪都建不了
+      # ——「新建的是人，为什么要限制」，问得对。
+      #
+      # :ro 在这里也从来不是有效防线：本容器已挂 /var/run/docker.sock（等价宿主 root，
+      # 见上），能跟 daemon 说话的人本就能把宿主盘 rw 挂进临时容器随便写。
+      #
+      # 读根仍可被选为工作区，那种会话由 sandbox/runtime.py 的 session_default_mode
+      # 落 read-only —— 限制的依然是**模型**，不是用户。
+      #
+      # 多个读根逐行加，并与 .env 的 SANDBOX_READ_ROOTS
+      # 保持同步：只在这里挂、.env 里没配的根不会出现在选择器里（反之亦然，配了却没
+      # 挂会被 _browse_roots 滤掉，不出现幽灵条目）。改完要 up -d backend 重建容器。
+      - C:/:/srv/host-read/C
+      - D:/:/srv/host-read/D
     environment:
       DATABASE_URL: postgresql://saas:saas@db:5432/saas
       JWT_SECRET: dev-secret
@@ -65,7 +86,13 @@ services:
 
   frontend:
     build: ./frontend
-    command: npx next dev -p 3003 -H 0.0.0.0
+    # 宿主端口不能用 3000 系：Windows 的 Hyper-V/WSL 保留端口段
+    # （netsh int ipv4 show excludedportrange protocol=tcp）在这台机器上连成
+    # 2717-3406，3000/3003/3200 全在里面，Docker 绑定时报 WSAEACCES 起不来
+    # （同 backend 段 9002 的注释）。4000 离保留段顶端有近 600 个端口余量——
+    # 留足余量是因为这段范围**每次重启会重新分配、整体漂移**，贴着边选早晚再撞。
+    # 容器内外统一用它，免得 package.json 的 dev/start 在宿主直跑时又踩同一个坑。
+    command: npx next dev -p 4000 -H 0.0.0.0
     volumes:
       - ./frontend:/app
       - /app/node_modules
@@ -75,7 +102,7 @@ services:
       BACKEND_URL: http://backend:8000
       WATCHPACK_POLLING: "true"
     ports:
-      - "3003:3003"
+      - "4000:4000"
     depends_on:
       - backend
 

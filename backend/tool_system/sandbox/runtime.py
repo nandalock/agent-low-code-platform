@@ -24,6 +24,7 @@ from backend.tool_system.sandbox.workspace import (
     build_read_mounts,
     build_write_mounts,
     parse_roots,
+    path_in_roots,
     probe_workspace_root,
     resolve_workspace_root,
     session_workspace,
@@ -111,6 +112,33 @@ def workspace_for_session(session_id: str) -> str:
     return session_workspace(resolve_workspace_root(), session_id)
 
 
+def session_default_mode(cwd: str | None) -> SandboxMode | None:
+    """本会话的**部署默认**模式（读根 cwd 感知）。
+
+    默认模式本该是纯部署事实（``SANDBOX_DEFAULT_MODE``），这里只有一条例外：
+    ``cwd`` 落在**只读根**内时收窄为 ``read-only``。
+
+    为什么必须收窄：只读根是「可读全域」的授权，**不是写授权**；而 docker 后端
+    把 cwd 直接挂成 ``/workspace``，rw 还是 ro **取决于模式**
+    （``backends/docker.py``）。用户在文件夹选择器里点一下 ``C:/``，若默认模式
+    仍是 workspace-write，整个 C 盘就无声地变成了可写——一个读授权被当成了写授权。
+
+    落在**写根内**的 cwd 不在此列：从只读根 ``D:/`` 一路点进写根 ``D:/jk/Nexus``，
+    那里本就是可写的，那正是写根存在的意义（先判写根，再判读根）。
+
+    **这只是默认值，不是天花板**：模式优先级链（``policy.py``）里
+    ``session_override``（Composer 切换）与 ``explicit_mode``（升权获批）都在它之上，
+    所以"想写就写"的路仍然通畅——只是要过一次人的批准。
+
+    ``cwd`` 为 None（未绑定文件夹，工作区自动落在 ``<root>/<session_id>``）时
+    按部署默认：那种路径由 ``SANDBOX_WORKSPACE_ROOT`` 决定，与读根是两回事，
+    即便两者在磁盘上重叠也不该被读根牵着走。
+    """
+    if cwd and not path_in_roots(cwd, write_roots()) and path_in_roots(cwd, read_roots()):
+        return "read-only"
+    return default_mode()
+
+
 def session_policy(
     session_id: str,
     cwd: str | None = None,
@@ -120,6 +148,10 @@ def session_policy(
 
     ``session_override`` 来自 ``sandbox/mode`` 事件的投影（调用方提供，
     本层不依赖 agents 层）；优先级见 :mod:`backend.tool_system.sandbox.policy`。
+
+    默认值走 :func:`session_default_mode`（读根 cwd → read-only），不是裸的
+    ``default_mode()``——两个消费方（执行侧与 ``api/agents.py`` 的模式端点）
+    必须用同一个函数，否则页面上显示的模式和沙箱实际用的是两回事。
     """
     if _provider is None:
         return None
@@ -128,7 +160,7 @@ def session_policy(
         workspace_root=root,
         session_id=session_id,
         session_override=session_override,
-        config_default=default_mode(),
+        config_default=session_default_mode(cwd),
         read_roots=read_roots(),
         write_roots=write_roots(),
     )
@@ -218,7 +250,7 @@ def _with_escalation(schema: dict) -> dict:
     }
 
 
-def _mounts_note() -> str:
+def mounts_note(workspace_host: str | None = None) -> str:
     """把**可写位置**与两条挂载轴的映射写进工具描述。**恒非空。**
 
     与「不把沙箱模式写进系统提示词」（docs/sandbox-design.md §2 原则 7）不冲突：
@@ -233,8 +265,24 @@ def _mounts_note() -> str:
 
     **两条轴分开写**，各有各的措辞：只报路径不给权限，模型会默认它和只读根
     一样只能看；合并成「可用目录」则会把读写差别整个吞掉。
+
+    ``workspace_host`` 是本会话工作区在**宿主**上的绝对路径（即会话 cwd）；
+    给了就与另外两条轴一样写成 ``/workspace（宿主 D:/jk/Nexus/proj）``。
+
+    为什么要显式给：Docker Desktop 用 9p/drvfs 挂 Windows 盘时，``mount`` 只报
+    **盘符根**（``D:\\ on /workspace type 9p (…aname=drvfs;path=D:\\…)``），子路径
+    无法从挂载表反推——实测绑 ``D:/jk/Nexus/test1`` 与绑 ``D:/jk/Nexus`` 在
+    ``mount`` 里显示一模一样。模型手上没有权威答案时会去挂载表里找，然后必然
+    推断成「整个 D 盘」并这样转述给用户（实际发生过）。本模块在 tool_system 层、
+    拿不到 Session，故 cwd 由组装侧传入（``system_prompt/platform_sections.py``
+    的工具 provider）。
+
+    不给 host（无 cwd 的自动工作区，且首次工具调用之前）时只报容器内路径——
+    与本参数出现之前的行为一致。
     """
-    lines = [f"可写位置：会话工作区 {CONTAINER_WORKSPACE}。"]
+    head = f"可写位置：会话工作区 {CONTAINER_WORKSPACE}"
+    head += f"（宿主 {workspace_host}）。" if workspace_host else "。"
+    lines = [head]
     read = build_read_mounts(read_roots())
     if read:
         items = "、".join(f"{c}（宿主 {h}）" for h, c in read)
@@ -244,11 +292,6 @@ def _mounts_note() -> str:
         items = "、".join(f"{c}（宿主 {h}）" for h, c in write)
         lines.append(f"可写目录（可直接修改，与工作区同等可写）：{items}。")
     return "\n" + "".join(lines)
-
-
-def _schema_with_mounts(schema: dict) -> dict:
-    """返回带读写目录说明的 schema 副本（**恒为副本**，不改动模块级常量）。"""
-    return {**schema, "description": schema["description"] + _mounts_note()}
 
 
 def register_builtin_sandbox_tools(
@@ -277,7 +320,10 @@ def register_builtin_sandbox_tools(
             type="sandbox",
             transport="",
             server_id=0,
-            schema=_with_escalation(_schema_with_mounts(schema)),
+            # 挂载说明**不在这里**拼：工作区那条要写会话 cwd（宿主路径），而注册
+            # 发生在启动时、拿不到会话。由组装侧按会话调用 mounts_note() 补上
+            # （见 system_prompt/platform_sections.py 的工具 provider）。
+            schema=_with_escalation(schema),
             timeout=timeout_s,
             sandbox=SandboxToolConfig(runtime=runtime, image=img, timeout_s=timeout_s),
             usage_guidance=guidance,

@@ -67,6 +67,7 @@ from backend.tool_system.sandbox.provider import (  # noqa: E402
 from backend.tool_system.sandbox.vocabulary import SandboxExecutionPolicy  # noqa: E402
 from backend.tool_system.sandbox.workspace import (  # noqa: E402
     CONTAINER_READ_ROOT,
+    CONTAINER_WORKSPACE,
     CONTAINER_WRITE_ROOT,
     READ_ROOTS_ENV,
     WORKSPACE_ROOT_ENV,
@@ -76,6 +77,7 @@ from backend.tool_system.sandbox.workspace import (  # noqa: E402
     build_write_mounts,
     normalize_host_path,
     parse_roots,
+    path_in_roots,
     probe_workspace_root,
     repo_root,
     resolve_workspace_member,
@@ -423,44 +425,68 @@ def test_resolve_policy_carries_both_root_axes():
     assert bare.read_roots == () and bare.write_roots == ()
 
 
-def test_tool_schema_carries_both_root_axes():
-    """工具描述带上两条轴的映射——不说，模型就不知道那些路径存在，会去猜
+def test_mounts_note_carries_both_root_axes():
+    """挂载说明带上两条轴的映射——不说，模型就不知道那些路径存在，会去猜
     ``D:\\...`` 然后撞 No such file or directory，并误判成「文件不存在」。
 
     **可写轴必须说清「能写」**：只报路径不给权限，模型会默认它和只读根一样
     只能看，于是放着能改的目录不去改。
     """
-    from backend.tool_system.sandbox.runtime import _BASH_SCHEMA, _schema_with_mounts
+    from backend.tool_system.sandbox.runtime import _BASH_SCHEMA, mounts_note
 
     saved = {k: os.environ.get(k) for k in (READ_ROOTS_ENV, WRITE_ROOTS_ENV)}
     try:
         os.environ[READ_ROOTS_ENV] = "D:/jk/Papers"
         os.environ[WRITE_ROOTS_ENV] = "D:/jk/Nexus"
-        s = _schema_with_mounts(_BASH_SCHEMA)
-        desc = s["description"]
+        desc = mounts_note()
         assert f"{CONTAINER_READ_ROOT}/Papers" in desc and "D:/jk/Papers" in desc
         assert f"{CONTAINER_WRITE_ROOT}/Nexus" in desc and "D:/jk/Nexus" in desc
         # 两条轴分开表述：可写的那条不能被读的措辞吞掉
         assert "可读目录" in desc and "可写目录" in desc
-        # 必须是副本：不能污染模块级常量（否则开关切换后残留）
-        assert CONTAINER_READ_ROOT not in _BASH_SCHEMA["description"]
-        assert CONTAINER_WRITE_ROOT not in _BASH_SCHEMA["description"]
 
         # 两条轴都清空后说明**依然在**：「哪儿能写」随配置变，基础描述说不全，
         # 所以可写位置恒要显式列出（只列工作区）。
         for k in (READ_ROOTS_ENV, WRITE_ROOTS_ENV):
             os.environ.pop(k, None)
-        bare = _schema_with_mounts(_BASH_SCHEMA)
-        assert bare is not _BASH_SCHEMA, "必须始终返回副本"
-        assert "可写位置" in bare["description"] and "/workspace" in bare["description"]
-        assert CONTAINER_READ_ROOT not in bare["description"]
-        assert CONTAINER_WRITE_ROOT not in bare["description"]
+        bare = mounts_note()
+        assert "可写位置" in bare and CONTAINER_WORKSPACE in bare
+        assert CONTAINER_READ_ROOT not in bare
+        assert CONTAINER_WRITE_ROOT not in bare
+
+        # 说明**不落进注册的 schema**：它含会话相关的那条（工作区宿主路径），
+        # 注册发生在启动时、没有会话，拼进去只会是第一份会过期的说明。
+        assert CONTAINER_READ_ROOT not in _BASH_SCHEMA["description"]
+        assert CONTAINER_WRITE_ROOT not in _BASH_SCHEMA["description"]
     finally:
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def test_mounts_note_reports_workspace_host():
+    """会话工作区的**宿主路径**要写进说明，与另外两条轴同格式。
+
+    这是补 9p/drvfs 的坑：Docker Desktop 的挂载表只报盘符根（``D:\\ on /workspace``），
+    绑 ``D:/jk/Nexus/test1`` 与绑 ``D:/jk/Nexus`` 显示**完全相同**，模型据 mount
+    推断必然得出「整个 D 盘」并这样转述给用户（实际发生过）。权威答案只有会话 cwd，
+    而 cwd 在组装侧，故由调用方传入。
+    """
+    from backend.tool_system.sandbox.runtime import mounts_note
+
+    # 首句即工作区（整段是一行，句子之间以句号相连）
+    assert mounts_note("D:/jk/Nexus/test1").startswith(
+        f"\n可写位置：会话工作区 {CONTAINER_WORKSPACE}（宿主 D:/jk/Nexus/test1）。"
+    )
+
+    # 不给 host（自动工作区、首次工具调用之前）退回原样，**不编一个猜的**
+    assert mounts_note().startswith(
+        f"\n可写位置：会话工作区 {CONTAINER_WORKSPACE}。"
+    )
+    assert mounts_note(None).startswith(
+        f"\n可写位置：会话工作区 {CONTAINER_WORKSPACE}。"
+    )
 
 
 # ── 工作区 ──
@@ -741,33 +767,308 @@ def test_save_upload_replace_semantics():
         assert not link.is_symlink()
 
 
-def test_write_root_folder_mapping():
-    """写根模式：目录名→宿主路径、宿主 cwd→backend 等价路径的映射与拒绝。
+def test_api_new_name_validation():
+    """新建名字：**不取 basename** —— 带分隔符是错误，不是「帮你去掉前半段」。
 
-    backend 容器看不见 D:/jk/Nexus，读侧文件操作必须走 compose 挂载的
-    /srv/host-write/<名> 等价路径。前缀攻击（NexusEvil）、'..' 段、不在任何
-    写根内 —— 一律拒（None）。
+    与 _sanitize_upload_name 的分工钉在这里：上传剥 basename 是帮忙（浏览器
+    塞来的是 fakepath），新建改名字是背刺（用户以为建在 A，实际建在 B）。
     """
     try:
-        from backend.api.workspace import _backend_visible, _host_cwd_to_backend, _write_root_by_name
+        from fastapi import HTTPException
+        from backend.api.workspace import _sanitize_upload_name, _validate_new_name
     except ImportError:
         return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
 
-    roots = ("D:/jk/Nexus",)
-    assert _write_root_by_name(roots, "Nexus") == "D:/jk/Nexus"
-    assert _write_root_by_name(("D:\\a\\Nexus", "D:/b/Nexus"), "Nexus") == "D:/a/Nexus"  # 重名取第一个
-    expect_raises(ValueError, _write_root_by_name, roots, "Other")
-    expect_raises(ValueError, _write_root_by_name, roots, "")
+    for good in ("a.txt", "报告.md", ".gitignore", "a b.txt", "x" * 200):
+        assert _validate_new_name(good) == good
+    assert _validate_new_name("  spaced.txt  ") == "spaced.txt"
+
+    for bad in (None, "", "   ", ".", "..", "a/b", "a\\b", "a\x00b", "x" * 300):
+        expect_raises(HTTPException, _validate_new_name, bad)
+
+    # 同一个输入，两个函数的语义不同 —— 这正是分成两个函数的原因
+    assert _sanitize_upload_name("a/b") == "b"
+    expect_raises(HTTPException, _validate_new_name, "a/b")
+
+
+def test_api_validate_kind():
+    """type 只认 "file" / "dir"；缺失或拼错一律 400，**不默认成文件**。"""
+    try:
+        from fastapi import HTTPException
+        from backend.api.workspace import _validate_kind
+    except ImportError:
+        return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
+
+    assert _validate_kind("file") == "file"
+    assert _validate_kind("dir") == "dir"
+    for bad in (None, "", "exe", "FILE", "Dir", "directory", 0, ["file"]):
+        expect_raises(HTTPException, _validate_kind, bad)
+
+
+def test_api_create_child_on_disk():
+    """新建 = 空文件（属主可读写、绝不可执行）/ 空目录；重名一律 400 且不动既有条目。"""
+    try:
+        from fastapi import HTTPException
+        from pathlib import Path
+        from backend.api.workspace import _create_child, _entry
+    except ImportError:
+        return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
+
+    with tempfile.TemporaryDirectory() as d:
+        parent = Path(d)
+
+        f = parent / "a.txt"
+        _create_child(f, "file")
+        assert f.is_file() and f.stat().st_size == 0
+        mode = f.stat().st_mode
+        assert mode & 0o600 == 0o600   # 属主可读写（组/其他位随 umask，不断言死）
+        assert mode & 0o111 == 0       # 绝不可执行
+
+        sub = parent / "sub"
+        _create_child(sub, "dir")
+        assert sub.is_dir()
+
+        # 四种重名都拒：同类型、文件上盖目录、目录上盖文件
+        expect_raises(HTTPException, _create_child, f, "file")
+        expect_raises(HTTPException, _create_child, sub, "dir")
+        expect_raises(HTTPException, _create_child, f, "dir")
+        expect_raises(HTTPException, _create_child, sub, "file")
+        assert sorted(os.listdir(d)) == ["a.txt", "sub"]   # 既有条目分毫未动
+
+        # 不建中间目录：拼错的路径报错，不会凭空多出一整条路径
+        expect_raises(HTTPException, _create_child, parent / "no" / "such" / "x.txt", "file")
+        expect_raises(HTTPException, _create_child, parent / "no" / "such", "dir")
+        assert not (parent / "no").exists()
+        assert sorted(os.listdir(d)) == ["a.txt", "sub"]
+
+        # 条目形状与列表端点完全一致：前端 FileEntry 可以直接吃
+        e = _entry(parent, f)
+        assert set(e) == {"name", "is_dir", "size", "mtime", "is_link", "outside"}
+        assert e["name"] == "a.txt" and e["is_dir"] is False and e["outside"] is False
+        assert e["size"] == 0
+
+
+def test_api_create_child_symlink_fail_closed():
+    """重名条目若是符号链接：一律「已存在」，绝不顺着链接写出去。
+
+    ``O_CREAT|O_EXCL`` 对符号链接是**无条件 EEXIST**（不看指向哪、是否悬空），
+    这是 _create_child 敢直接落盘的底气。
+    """
+    try:
+        from fastapi import HTTPException
+        from pathlib import Path
+        from backend.api.workspace import _create_child
+    except ImportError:
+        return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
+
+    with tempfile.TemporaryDirectory() as d:
+        victim = Path(d) / "victim.txt"
+        victim.write_bytes(b"precious")
+        parent = Path(d) / "parent"
+        parent.mkdir()
+
+        link = parent / "evil.txt"
+        try:
+            os.symlink(victim, link)
+        except (OSError, NotImplementedError):
+            return  # Windows 无符号链接权限：跳过（容器内为 Linux，必跑）
+
+        expect_raises(HTTPException, _create_child, link, "file")
+        expect_raises(HTTPException, _create_child, link, "dir")
+        assert victim.read_bytes() == b"precious"   # 指向的文件分毫未动
+        assert link.is_symlink()                    # 链接本身也还在
+
+        # 悬空链接同样拒 —— 不因为「目标不存在」就当成可以建
+        dangling = parent / "dangling.txt"
+        os.symlink(parent / "nope.txt", dangling)
+        expect_raises(HTTPException, _create_child, dangling, "file")
+        assert dangling.is_symlink()
+
+
+def test_api_create_target_prefers_write_mount():
+    """创建目标：**写根优先，读根兜底**，都不在内才 None。
+
+    写根优先不只是相对路径更短 —— 同一份宿主目录挂在两条轴上时选写根那条，
+    将来若有人把读根改回 ``:ro``，从读根点进写根这条路径依然写得进去。
+    读根兜底是 2026-09-15 放开的：读轴限制的是**模型**能写哪，不是用户能不能
+    在界面上建文件夹。
+    """
+    try:
+        from pathlib import Path
+        from backend.api.workspace import _BrowseRoot, _create_target
+    except ImportError:
+        return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
+
+    roots = [
+        _BrowseRoot("Nexus", "D:/jk/Nexus", Path("/srv/host-write/Nexus"), True),
+        _BrowseRoot("C", "C:/", Path("/srv/host-read/C"), False),
+        _BrowseRoot("D", "D:/", Path("/srv/host-read/D"), False),
+    ]
+    wr = Path("/srv/host-write/Nexus")
+    rd_c = Path("/srv/host-read/C")
+    rd_d = Path("/srv/host-read/D")
+
+    # 从写根自己的名字进来
+    assert _create_target(roots, "D:/jk/Nexus") == (wr, "")
+    assert _create_target(roots, "D:/jk/Nexus/sub") == (wr, "sub")
+    # 从读根 D 点进写根：宿主路径看着像 D 盘的深处，相对路径只剩写根内那一段
+    assert _create_target(roots, "D:/jk/Nexus/proj") == (wr, "proj")
+    # 盘符大小写由 normalize_host_path 归一
+    assert _create_target(roots, "d:/jk/Nexus/x") == (wr, "x")
+    # 写根的**上级**落在读根 D 里 —— 走读根挂载，而不是 None
+    assert _create_target(roots, "D:/jk") == (rd_d, "jk")
+    # 只在读根里
+    assert _create_target(roots, "C:/Users") == (rd_c, "Users")
+    assert _create_target(roots, "D:/") == (rd_d, "")
+    # 不在任何根内
+    assert _create_target(roots, "E:/x") is None
+
+
+def test_api_mount_read_only_probe():
+    """只读判定看的是**实际挂载标志**，不是「挂在哪条轴上」。
+
+    早先按容器路径前缀（``/srv/host-read``）判，等于把「读轴上挂的」当成
+    「写不进去」——两者只是当时恰好等价。改按挂载表判之后，compose 放开读根，
+    这里自动跟着放开，代码里不留一句与部署事实不符的断言。
+    """
+    try:
+        from pathlib import Path
+        from backend.api.workspace import _mount_is_read_only
+    except ImportError:
+        return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
+
+    with tempfile.TemporaryDirectory() as d:
+        table = Path(d) / "mounts"
+        table.write_text(
+            "/dev/sda1 / ext4 rw,relatime 0 0\n"
+            "/dev/sdb1 /srv/host-read/C ext4 ro,relatime 0 0\n"
+            "/dev/sdc1 /srv/host-read/D ext4 rw,relatime 0 0\n"
+            "/dev/sdd1 /srv/agent/workspaces ext4 rw,relatime 0 0\n",
+            encoding="utf-8",
+        )
+
+        def m(p: str):
+            return _mount_is_read_only(p, mounts_path=str(table))
+
+        assert m("/srv/host-read/C") is True
+        assert m("/srv/host-read/C/Users") is True       # 挂载点下的子路径
+        assert m("/srv/host-read/D/Users") is False      # 同一条轴上的另一个挂载可以是 rw
+        assert m("/srv/agent/workspaces/x") is False
+        # 前缀按**段**对齐：C2 不在 C 之下，落到根挂载（rw）
+        assert m("/srv/host-read/C2") is False
+        assert m("/srv/host-read/Cx/y") is False
+        # 没被单独挂的路径兜底到最长匹配的 "/"
+        assert m("/srv/host-write/Nexus") is False
+
+        # 挂载表读不到 = 未知 → None（调用方当可写：宁可漏判，不可误拦）
+        assert _mount_is_read_only("/x", mounts_path=str(Path(d) / "nope")) is None
+
+
+def test_path_in_roots():
+    """宿主路径的包含判定：整盘根的尾斜杠、盘符大小写、前缀攻击、相对路径。
+
+    两条轴（读根 / 写根）共用这一个判据——「这个 cwd 落在哪类根里」既决定
+    写入要不要授权（api 侧），也决定会话默认模式（sandbox 侧），两边各写一份
+    迟早漂移。
+    """
+    roots = ("C:/", "D:\\jk\\Nexus")
+    assert path_in_roots("C:/", roots)            # 根自己：尾斜杠归一后才相等
+    assert path_in_roots("C:/Users/jk", roots)
+    assert path_in_roots("c:/Users/jk", roots)    # 盘符大小写归一
+    assert path_in_roots("D:/jk/Nexus", roots)
+    assert path_in_roots("D:/jk/Nexus/proj", roots)
+    assert not path_in_roots("D:/jk/NexusEvil", roots)        # 前缀攻击
+    assert not path_in_roots("C:/UsersEvil", ("C:/Users",))   # 同上，非整盘根
+    assert not path_in_roots("/srv/agent/ws", roots)          # 不在任何根内
+    assert not path_in_roots("relative/path", roots)          # 非绝对路径：False，不抛
+    assert not path_in_roots("C:/Users", ())                  # 未配根
+
+
+def test_session_default_mode_read_root():
+    """读根当工作区 → 会话默认 read-only；写根优先；只给默认值，不设天花板。
+
+    这是「选一个只读盘当工作区」不变成「无声交出整个盘写权限」的那道闸：
+    docker 后端把 cwd 挂成 /workspace，rw/ro 随模式（backends/docker.py），
+    默认不收窄就等于点一下 = 整盘可写（见 sandbox/runtime.py 的 docstring）。
+    """
+    from backend.tool_system.sandbox.policy import DEFAULT_MODE_ENV
+    from backend.tool_system.sandbox.runtime import session_default_mode
+
+    keys = (READ_ROOTS_ENV, WRITE_ROOTS_ENV, DEFAULT_MODE_ENV)
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ[READ_ROOTS_ENV] = "C:/,D:/"
+        os.environ[WRITE_ROOTS_ENV] = "D:/jk/Nexus"
+        os.environ.pop(DEFAULT_MODE_ENV, None)
+
+        assert session_default_mode("C:/") == "read-only"          # 整盘根本身
+        assert session_default_mode("C:/Users/jk") == "read-only"  # 读根内任意深度
+        assert session_default_mode("D:/other") == "read-only"     # 另一个读根
+        # 写根优先：读根 D:/ 包含写根 D:/jk/Nexus，那里本就该可写
+        assert session_default_mode("D:/jk/Nexus") is None
+        assert session_default_mode("D:/jk/Nexus/proj") is None
+        assert session_default_mode("/srv/agent/workspaces/s1") is None   # 不在任何根内
+        assert session_default_mode(None) is None   # 未绑定文件夹：部署默认说了算
+        # 未配读根时完全回到部署默认 —— 扩展对既有部署零影响
+        os.environ[READ_ROOTS_ENV] = ""
+        assert session_default_mode("C:/") is None
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_browse_root_folder_mapping():
+    """浏览根：根名→宿主路径、宿主 cwd→backend 等价路径、宿主路径→folder 值。
+
+    backend 容器看不见宿主的盘，读侧文件操作必须走 compose 挂载的等价路径：
+    写根是 /srv/host-write/<名>，读根是 /srv/host-read/<名>。**读根也要能映射** ——
+    只读根当工作区时会话的工作区文件树、预览、下载读的都是它，漏了就是一片 404。
+    前缀攻击（NexusEvil）、'..' 段、不在任何根内 —— 一律拒（None）。
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    try:
+        from backend.api.workspace import (
+            _BrowseRoot,
+            _backend_visible,
+            _browse_root_by_name,
+            _folder_value,
+            _host_cwd_to_backend,
+        )
+    except ImportError:
+        return  # 本机缺 fastapi 等依赖：跳过（容器内必跑）
+
+    write = _BrowseRoot("Nexus", "D:/jk/Nexus", _backend_visible("D:/jk/Nexus"), True)
+    read = _BrowseRoot("C", "C:/", Path("/srv/host-read/C"), False)
+    roots = [write, read]   # 顺序同 _browse_roots()：写根在前
+
+    assert _browse_root_by_name(roots, "Nexus") is write
+    assert _browse_root_by_name(roots, "C") is read
+    assert _browse_root_by_name(roots, "Other") is None      # 调用方转 400
 
     base = _backend_visible("D:/jk/Nexus")
     assert _host_cwd_to_backend(roots, "D:/jk/Nexus") == base          # 写根本身
     assert _host_cwd_to_backend(roots, "D:/jk/Nexus/proj/a") == base / "proj" / "a"
     assert _host_cwd_to_backend(roots, "D:\\jk\\Nexus\\proj") == base / "proj"  # 反斜杠归一
     assert _host_cwd_to_backend(roots, "D:/jk/NexusEvil/x") is None    # 前缀攻击
-    assert _host_cwd_to_backend(roots, "D:/other/x") is None           # 不在写根内
+    assert _host_cwd_to_backend(roots, "D:/other/x") is None           # 不在任何根内
     assert _host_cwd_to_backend(roots, "D:/jk/Nexus/../evil") is None  # '..' 段
     assert _host_cwd_to_backend(roots, "") is None
-    assert _host_cwd_to_backend((), "D:/jk/Nexus") is None             # 未配写根
+    assert _host_cwd_to_backend([], "D:/jk/Nexus") is None             # 未配根
+
+    # 读根 cwd 的映射：只读根当工作区时全靠这两条
+    assert _host_cwd_to_backend(roots, "C:/") == Path("/srv/host-read/C")
+    assert _host_cwd_to_backend(roots, "C:/Users/jk") == Path("/srv/host-read/C/Users/jk")
+
+    # folder 值 = 浏览根名 + 根内相对路径（前端把浏览路径原样交回来）
+    assert _folder_value("D:/jk/Nexus", roots) == "Nexus"
+    assert _folder_value("D:/jk/Nexus/proj", roots) == "Nexus/proj"
+    assert _folder_value("C:/", roots) == "C"                # 整盘根：尾斜杠归一
+    assert _folder_value("C:/Users", roots) == "C/Users"
+    assert _folder_value("D:/other", roots) is None          # 不在任何根内
 
 
 # ── docker e2e ──
