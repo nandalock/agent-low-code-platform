@@ -75,12 +75,12 @@ long-term memory and MCP tools — no code required.
 docker compose up --build
 
 # 2. Open the dashboard
-open http://localhost:3003
+open http://localhost:4000
 ```
 
 | Service      | URL                    |
 | ------------ | ---------------------- |
-| Frontend     | http://localhost:3003  |
+| Frontend     | http://localhost:4000  |
 | Backend API  | http://localhost:8000  |
 | RedisInsight | http://localhost:5540  |
 
@@ -94,7 +94,7 @@ MCP Server（`:9001` 通用 / `:9002` 论文域）只监听 backend 容器内网
 
 ```mermaid
 flowchart LR
-    U[👤 User] -->|HTTP / SSE / WebSocket| F[Next.js Frontend :3003]
+    U[👤 User] -->|HTTP / SSE / WebSocket| F[Next.js Frontend :4000]
     F -->|REST| G[Gateway]
     G --> A[Agent Runtime]
     A --> SP[System Prompt<br/>sectioned assembly]
@@ -182,8 +182,9 @@ agent-low-code-platform/
 | GET    | `/api/mcp/servers` · POST `…/import` | Manage MCP servers          |
 | GET    | `/api/tools/bindings` · PUT `…/{agent_key}` | Bind tools to an agent |
 | GET    | `/api/workspace/sessions` · POST `/api/workspace/sessions` | List / pre-create workspace sessions |
+| GET    | `/api/workspace/folders` · POST `/api/workspace/folders` | Browse host folders / create an empty entry in one |
 | GET    | `/api/workspace/{id}/files` · `/file` | Browse & preview workspace files |
-| POST   | `/api/workspace/{id}/upload`      | Upload files into a session workspace |
+| POST   | `/api/workspace/{id}/files` · `/upload` | Create an empty file/folder · upload files |
 | GET    | `/api/memory/users`               | Long-term memory profiles      |
 | GET    | `/api/approvals` · POST `…/{id}`  | Pending approvals & decisions  |
 | WS     | `/api/ws/chat`                    | Real-time chat                 |

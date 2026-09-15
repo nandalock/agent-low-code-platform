@@ -160,6 +160,7 @@ async def _platform_tool_provider(ctx: AssembleContext) -> ToolProviderResult:
         _to_openai_function,
         get_registry,
     )
+    from backend.tool_system.sandbox.runtime import mounts_note
 
     try:
         registry = get_registry()
@@ -167,11 +168,22 @@ async def _platform_tool_provider(ctx: AssembleContext) -> ToolProviderResult:
         logger.warning("ToolRegistry 未装配，本次组装不提供工具")
         return ToolProviderResult()
 
+    # 会话工作区在**宿主**上的路径，写进沙箱工具描述（理由见 mounts_note 的
+    # docstring：Docker Desktop 的挂载表只报盘符根，模型自己推不出来）。
+    # 无会话 / 未绑定文件夹时为 None —— 自动分配的工作区要到首次工具调用才回写
+    # header.cwd，在那之前只报容器内路径，不编一个猜的。
+    workspace_host = ctx.session.header.cwd if ctx.session else None
+
     descriptors = await registry.get_descriptors_for(ctx.agent_key)
     schemas: list[ToolSchema] = []
     guidance: dict[str, str] = {}
     for d in descriptors:
         fn = _to_openai_function(d.schema)["function"]
+        if d.sandbox is not None:
+            # 挂载说明只在这里拼：注册发生在启动时、没有会话，两条轴虽说是部署
+            # 事实，工作区那条却随会话变。按 d.sandbox 判而不是按名字——
+            # 沙箱工具将来不止 bash/python。
+            fn["description"] += mounts_note(workspace_host)
         schemas.append(ToolSchema(name=d.name, function=fn))
         # 描述符自带优先（外部 MCP 工具可自行声明），平台表兜底
         text = d.usage_guidance or PLATFORM_TOOL_GUIDANCE.get(d.name)

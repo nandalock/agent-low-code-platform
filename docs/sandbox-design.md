@@ -338,6 +338,15 @@ backend:
 - 工具返回值里的路径要翻译回宿主路径再给模型/前端
 - 系统提示词或工具描述里要说明工作区挂载点（`/workspace`），否则模型会猜错
 
+**说明里要带上工作区在宿主上的位置**，与读/写两条轴同格式（`/workspace（宿主 D:/jk/Nexus/proj）`）。
+不是锦上添花：Docker Desktop 用 9p/drvfs 挂 Windows 盘时，`mount` 只报**盘符根**
+（`D:\ on /workspace type 9p (…aname=drvfs;path=D:\…)`），子路径无法从挂载表反推——
+实测绑 `D:/jk/Nexus/test1` 与绑 `D:/jk/Nexus` 显示完全相同。模型手上没有权威答案时会
+去挂载表里找，然后必然推断成「整个 D 盘」并这样转述给用户（实际发生过）。权威答案只有
+会话 cwd，而它在组装侧，故这段说明由 `system_prompt/platform_sections.py` 的工具 provider
+按会话渲染（`sandbox/runtime.py` 的 `mounts_note()`），**不落进注册时的 schema**——
+注册发生在启动时、没有会话，拼进去只会是第一份会过期的说明。
+
 ## 9. 安全边界
 
 ### 9.1 docker socket 等于宿主机 root
@@ -392,6 +401,13 @@ Seatbelt 的 `allow default` + `deny file-write*`。它们的 `roots.ts` 只派�
 要收窄就列具体目录（`D:/jk/Papers,D:/Documents`）而不是整盘。
 
 只读轴与模式无关，`read-only` 下整盘也是可读的——模式词汇只描述写效果（见 §3）。
+
+**读根可以当工作区**（`api/workspace.py` 的选择器里能列出的目录都能选，读根不例外）。
+这不等于把读授权当写授权：docker 后端把 cwd 挂成 `/workspace`，而它的 rw/ro **由模式
+决定**，所以那种会话的默认模式被收窄为 `read-only`（`sandbox/runtime.py` 的
+`session_default_mode`）——不收窄就等于「在文件夹选择器里点一下 = 整个盘可写」。
+模型要写仍走得通：升权审批（人批准）或 Composer 里显式切模式，两条路在优先级链上
+都压过这个默认值。**默认值不是天花板**（见 §5 的模式优先级）。
 
 进程内工具（fs 工具的跨族强制）仍不在本阶段范围。
 

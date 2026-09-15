@@ -94,6 +94,11 @@
 `-v <root>:/mnt/read/<name>:ro`。挂载**恒为 `:ro`、与模式无关** —— 它只增加
 「读得到」，不增加「写得进」，因此独立于 `SandboxMode`（模式词汇只描述写效果）。
 
+**读根也能当工作区**（选择器里能列出的目录都能选）。这不算把读授权当写授权：cwd 是挂到
+`/workspace` 的，而它的 rw/ro 由**模式**决定，所以那种会话的默认模式被收窄为 `read-only`
+（`runtime.py` 的 `session_default_mode`）——不收窄就等于「点一下 = 整盘可写」。要写仍走得通：
+升权（人批准）或在 Composer 显式切模式，两者在优先级链上都压过这个默认值。
+
 **读全域**：配成整盘（`SANDBOX_READ_ROOTS=C:/,D:/`）即把宿主每个盘按 `:ro` 挂进来，
 容器内是 `/mnt/read/C`、`/mnt/read/D`。这是**把上游的读语义补齐**：DSH 各后端本就是
 「全文件系统只读授予 + 写限制」（bwrap `--ro-bind / /`、Landlock `readOnly: ['/']`、
