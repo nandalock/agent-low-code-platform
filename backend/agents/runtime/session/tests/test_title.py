@@ -327,24 +327,45 @@ def test_project_label_is_last_segment():
     assert label("//server/share") == "share"
 
 
-def test_deleted_project_dir_falls_into_ungrouped():
-    """验收 8：项目目录被删掉 → 会话落「未分组」（project is None），而不是消失"""
-    from backend.api.workspace import _canonical_project_path, _project_of
+def test_project_membership_needs_ledger_and_live_dir():
+    """项目归属 = **账目** + 读时二次校验，两者缺一不可。
+
+    账目是唯一的成员来源：没登记过（或登记已被移除）→ 未分组，绝不会因为「那个
+    目录恰好还在」又自己冒出来 —— 这正是「移除项目」能生效、且旧会话不复活的原因。
+    账目在但目录没了 → 也读作未分组（而不是让会话从列表里消失）。
+    """
+    from pathlib import Path
+    from backend.api.workspace import _canonical_project_path, _project_for
 
     with tempfile.TemporaryDirectory() as tmp:
         alive = os.path.join(tmp, "alive")
         os.makedirs(alive)
-        from pathlib import Path
-        # 目录在 → 有项目归属
-        got = _project_of(alive, Path(alive))
-        assert got is not None and got["key"] == _canonical_project_path(alive)
+        canonical = _canonical_project_path(alive)
+        row = {"id": 7, "canonical_path": canonical, "title": "alive", "sort_order": 10.0}
+        ledger = {"s1": row}
+        alive_path = Path(alive)
+
+        # 账目在 + cwd 对得上 + 目录还在 → 有归属
+        got = _project_for("s1", alive, alive_path, ledger)
+        assert got is not None and got["id"] == 7 and got["key"] == canonical
         assert got["label"] == "alive"
-        # 目录被删 → 未分组
+
+        # 账目里没有这个会话（没登记过 / 登记被移除）→ 未分组
+        assert _project_for("s2", alive, alive_path, ledger) is None
+
+        # 目录已被删（账目还在）→ 未分组
         gone = os.path.join(tmp, "gone")
-        assert _project_of(gone, Path(gone)) is None
-        # 没有 cwd（自动工作区）→ 也是未分组：目录名是 session_id，当项目名没意义
-        assert _project_of(None, Path(alive)) is None
-        assert _project_of("", Path(alive)) is None
+        gone_ledger = {"s1": {**row, "canonical_path": _canonical_project_path(gone)}}
+        assert _project_for("s1", gone, Path(gone), gone_ledger) is None
+        # 目录解析不出来（调用方给 None）同样未分组
+        assert _project_for("s1", alive, None, ledger) is None
+
+        # 账目在，但会话现在的 cwd 不是这个目录（目录被改名 / 换了工作区）→ 未分组
+        assert _project_for("s1", os.path.join(tmp, "moved"), alive_path, ledger) is None
+
+        # 没有 cwd（自动工作区 <root>/<session_id>）→ 未分组：目录名是会话 id
+        assert _project_for("s1", None, alive_path, ledger) is None
+        assert _project_for("s1", "", alive_path, ledger) is None
 
 
 def test_project_identity_is_path_not_label():

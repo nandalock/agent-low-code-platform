@@ -6,6 +6,8 @@
 
 边界（第一原则）：**工作区是沙箱的地盘**。浏览器不提供删除 / 改名 / 移动 / 写
 内容的接口 —— 少一个写接口，就少一整类「模型正在写、用户正在删」的竞态。
+（唯一带「删」字的接口是 :func:`api_delete_workspace_project` 移除**项目登记**
+—— 它删的是本应用自己的一行账目，不碰目录、不碰文件、不碰会话。）
 
 写入口只有两个，都是**窄**的：
 
@@ -19,6 +21,18 @@
 两者因此走与读不同的防护链：路径经 :func:`resolve_workspace_member` 挡「事前
 种下的」符号链接，落盘经临时文件 + ``os.replace``（上传）或 ``O_EXCL``（新建）
 挡「写入瞬间换上的」，且都**不覆盖任何既有条目**。
+
+项目注册表（``/api/workspace/projects``）—— 侧栏第二层「文件夹」的**账目**：
+
+  - 项目 = 本应用对**一个已存在目录**的登记，**不代表所有权**。移除 = 撤销登记：
+    删掉注册表那一行（成员行随外键级联），目录 / 文件 / 会话行 / ``session_events``
+    一律不动，其会话随即落进「未分组」这个虚拟桶。
+  - 移除**可逆**（能重新登记同一目录），代价是旧会话不复活 —— 重新登记只收养
+    **之后**创建的会话，手工排序也不再保留。
+  - 成员关系是**存下来的**，不是每次按 cwd 实时推导（推导制表达不了「移除」：
+    下一次刷新又按 cwd 分回来了）。读的时候仍要二次校验（账目说属于这个项目、
+    但会话当前 cwd 对不上 / 目录已被删 → 这条读作未分组），且**留到下一次写入**
+    才落库清理 —— 读路径绝不产生写。
 
 安全模型：工作区内容是**模型**写的，模型不可信。因此：
 
@@ -36,6 +50,8 @@
 HTTP chat 创建并回写该映射（见 ``api/agents.py``），因此不会漏掉真实会话。
 """
 import itertools
+import json
+import logging
 import os
 import stat
 import time
@@ -76,6 +92,8 @@ from backend.tool_system.sandbox.workspace import (
     resolve_workspace_root,
     session_workspace_path,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/workspace", tags=["Workspace"])
 
@@ -295,28 +313,294 @@ def _project_label(canonical: str) -> str:
     return segments[-1] if segments else canonical
 
 
-def _project_of(cwd: str | None, ws: Path | None) -> dict | None:
-    """会话的**项目归属**（= 用户选的工作文件夹）；没有归属返回 ``None``。
+def _project_payload(row: dict) -> dict:
+    """项目行的 JSON 形状（``/sessions`` 的 ``project`` 与 ``/projects`` 的条目共用）。
+
+    ``key`` 是**规范化路径字符串**，不是 id：侧栏拿它当折叠状态的键，而这个键在
+    重新登记后应当仍指向同一个位置（id 变了，目录没变）。身份始终是路径 —— 两个
+    不同目录可以同名（都叫 ``test1``），它们仍是两个项目。
+
+    ``path`` 给了同一个值：它是**宿主**路径的规范形式，也正是用户认得出来的那个
+    串（``D:/jk/Nexus/proj``）；容器内的 ``/srv/host-write/Nexus/proj`` 不是给人看的。
+    """
+    return {
+        "id": row["id"],
+        "key": row["canonical_path"],
+        "label": row["title"],
+        "path": row["canonical_path"],
+        "sort_order": float(row["sort_order"]),
+    }
+
+
+def _ledger_for(tenant_id: int, session_ids: list[str]) -> dict[str, dict]:
+    """批量查这些会话的项目**账目**：``session_id → 项目行``。
+
+    一趟 SQL（不是每会话一趟）：侧栏一次最多 100 条，逐个查就是 100 次往返。
+    租户也在这里收口 —— ``workspace_projects`` 有 tenant_id 列，查出来的行必然
+    属于本租户，调用方不必再判（``session_headers`` 自己没有 tenant 列，这一步
+    是 JOIN 而不是 WHERE 在 session 上）。
+    """
+    if not session_ids:
+        return {}
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT wps.session_id, wp.id, wp.canonical_path, wp.title, wp.sort_order
+                   FROM workspace_project_sessions wps
+                   JOIN workspace_projects wp ON wp.id = wps.project_id
+                   WHERE wp.tenant_id = %s AND wps.session_id = ANY(%s)""",
+                (tenant_id, session_ids),
+            )
+            return {r["session_id"]: r for r in cur.fetchall()}
+
+
+def _project_for(
+    session_id: str, cwd: str | None, ws: Path | None, ledger: dict[str, dict],
+) -> dict | None:
+    """会话的**项目归属**（= 账目里记的那一行）；没有归属返回 ``None``。
 
     ``None`` 意味着前端把它归入「未分组」这个**虚拟桶** —— 它不是一个项目，
     没有实体，因此没有 hover / 右键菜单（见 WorkspaceSidebar）。
 
-    两条判据：
+    三条判据，缺一不可（第一条查账，后两条是**读时二次校验**）：
 
-      - ``cwd`` 为 NULL → 没有项目。这类会话的工作区是自动的
-        ``<root>/<session_id>``，目录名就是会话 id，拿来当项目名毫无意义。
-      - ``cwd`` 解析不出来 / **目录已被删掉** → 未分组。项目目录被删后它的会话
-        不该从侧栏消失（那是会话丢失），而是落进未分组等用户处理。
+      - **账目里有它**（``workspace_project_sessions`` 那一行）。没登记过的目录
+        没有项目 —— 这正是「移除项目」能生效的地方：行删了，这里就再也查不到。
+      - ``cwd`` 规范化后仍等于项目的 ``canonical_path``。对不上说明账目过期了：
+        会话换了目录，或者项目目录被改名（规范化后的串跟着变）。
+      - 目录还在（``ws.is_dir()``）。目录被删后它的会话不该从侧栏消失（那是会话
+        丢失），而是落进未分组等用户处理。
+
+    后两条不成立 → **读作未分组**，并留到下一次写入时由
+    :func:`_prune_project_members` 落库清理。读路径绝不产生写：GET 不该因为
+    有人打开了一下页面就去删数据。
 
     Args:
+        session_id: 会话 id。
         cwd: ``session_headers.cwd``（宿主绝对路径，可能是 NULL）。
         ws: :func:`_resolve_session_workspace` 解析出的容器内路径（调用方已算过，
             这里只做存在性判断，避免二次 resolve）。
+        ledger: ``session_id → 项目行``，由 :func:`_ledger_for` 批量查出。
     """
-    if not cwd or ws is None or not ws.is_dir():
+    if not cwd:
         return None
-    canonical = _canonical_project_path(cwd)
-    return {"key": canonical, "label": _project_label(canonical), "path": cwd}
+    row = ledger.get(session_id)
+    if row is None or ws is None or not ws.is_dir():
+        return None
+    if _canonical_project_path(cwd) != row["canonical_path"]:
+        return None
+    return _project_payload(row)
+
+
+# ── 项目注册表的写路径 ──
+#
+# 四个函数：取或建项目 / 收养会话 / 清理过期账目 / 引导。前三个都在调用方的
+# 事务里跑（``with get_conn()`` 内），彼此之间不会看到对方的半成品。
+
+#: 引导标记所在的 settings namespace，值形如 ``{"tenants": [1, 2]}``。
+_BOOTSTRAP_NS = "workspace_bootstrap"
+
+
+def _ensure_project(
+    cur, tenant_id: int, canonical: str, title: str | None = None,
+) -> int:
+    """取（没有就建）该目录的项目，返回 id。**已存在则原样返回，不改标题**。
+
+    ``ON CONFLICT DO NOTHING`` + 回查，而不是 ``ON CONFLICT DO UPDATE``：登记
+    是幂等动作，用户改过的名字不该被默认名覆盖掉。并发插入时后到的那条会阻塞到
+    先到的提交、然后 DO NOTHING，随后的回查（READ COMMITTED）看得到胜利者。
+
+    新建的排到**末尾**（``MAX(sort_order) + 10``；步长留出来是为了将来能在中间
+    插值而不重排全表）。
+    """
+    cur.execute(
+        """INSERT INTO workspace_projects (tenant_id, canonical_path, title, sort_order)
+           VALUES (%s, %s, %s,
+                   (SELECT COALESCE(MAX(sort_order), 0) + 10
+                    FROM workspace_projects WHERE tenant_id = %s))
+           ON CONFLICT (tenant_id, canonical_path) DO NOTHING
+           RETURNING id""",
+        (tenant_id, canonical, title or _project_label(canonical), tenant_id),
+    )
+    row = cur.fetchone()
+    if row is not None:
+        return row["id"]
+    cur.execute(
+        "SELECT id FROM workspace_projects WHERE tenant_id = %s AND canonical_path = %s",
+        (tenant_id, canonical),
+    )
+    existing = cur.fetchone()
+    if existing is None:  # 冲突却查不到：只可能是并发删掉了它
+        raise HTTPException(500, f"项目登记失败: {canonical}")
+    return existing["id"]
+
+
+def _adopt_session(cur, project_id: int, session_id: str) -> None:
+    """把这个会话挂进项目（幂等：已经在里面就什么都不做）。"""
+    cur.execute(
+        """INSERT INTO workspace_project_sessions (project_id, session_id, position)
+           VALUES (%s, %s,
+                   (SELECT COALESCE(MAX(position), 0) + 10
+                    FROM workspace_project_sessions WHERE project_id = %s))
+           ON CONFLICT (project_id, session_id) DO NOTHING""",
+        (project_id, session_id, project_id),
+    )
+
+
+def _prune_project_members(cur, project_id: int, canonical: str) -> int:
+    """把这个项目里**已经对不上**的成员从账目里删掉，返回删掉的行数。
+
+    只在**写入路径**调用。读路径的二次校验（见 :func:`_project_for`）发现的过期
+    账目留到这里落库 —— 读不产生写。判据与那里逐条相同，两边分叉就会出现
+    「页面读作未分组、账目却还在」的长期不一致。
+
+    判不出来就**不删**：沙箱工作区根没配好时直接返回 0，因为账目是重建成员关系
+    的唯一依据 —— 宁可留着一行过期的，也不该在某个看不清文件系统的时刻把用户的
+    登记抹掉。
+
+    代价是每个成员一次 ``stat``。可接受：本函数只在写路径跑（建会话、改项目），
+    而一个项目的成员数就是它那个目录下的会话数。
+    """
+    try:
+        deployment_root = Path(resolve_workspace_root()).resolve()
+    except (SandboxUnavailableError, ValueError):
+        return 0
+    cur.execute(
+        """SELECT wps.session_id, sh.cwd
+           FROM workspace_project_sessions wps
+           JOIN session_headers sh ON sh.session_id = wps.session_id
+           WHERE wps.project_id = %s""",
+        (project_id,),
+    )
+    stale: list[str] = []
+    for row in cur.fetchall():
+        cwd = row["cwd"]
+        if not cwd or _canonical_project_path(cwd) != canonical:
+            stale.append(row["session_id"])
+            continue
+        ws = _resolve_session_workspace(cwd, row["session_id"], deployment_root)
+        if ws is None or not ws.is_dir():
+            stale.append(row["session_id"])
+    if stale:
+        cur.execute(
+            """DELETE FROM workspace_project_sessions
+               WHERE project_id = %s AND session_id = ANY(%s)""",
+            (project_id, stale),
+        )
+    return len(stale)
+
+
+def _register_and_adopt(tenant_id: int, host_cwd: str, session_id: str) -> int:
+    """登记该目录（没有才建）+ 收养这个会话 + 顺手清理过期账目，返回项目 id。
+
+    整段一个事务：登记与收养要么都成、要么都不成。剪枝放同一个事务里是安全的
+    ——它只删「已经对不上」的成员，删不掉刚收养的这个（目录刚校验过存在）。
+    """
+    canonical = _canonical_project_path(host_cwd)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            project_id = _ensure_project(cur, tenant_id, canonical)
+            _prune_project_members(cur, project_id, canonical)
+            _adopt_session(cur, project_id, session_id)
+    return project_id
+
+
+def _cwd_workspace_path(cwd: str, session_id: str, deployment_root: Path | None) -> Path | None:
+    """宿主 cwd → 容器内工作区路径；解析不出来返回 ``None``。
+
+    与读路径的 :func:`_resolve_session_workspace` 是同一条链，只多容忍一种情况：
+    ``deployment_root`` 为 None（沙箱工作区根没配好）时，浏览根内的 cwd 照样能
+    解析出来 —— 引导不该因为沙箱没配就整个不动。
+    """
+    if deployment_root is None:
+        return _host_cwd_to_backend(_browse_roots(), cwd)
+    return _resolve_session_workspace(cwd, session_id, deployment_root)
+
+
+def _bootstrap_tenant(cur, tenant_id: int, deployment_root: Path | None) -> int:
+    """一个租户的引导：按规范化 cwd 分组存量会话 → 建项目 → 收养成员，返回建的项目数。"""
+    cur.execute(
+        """SELECT sh.session_id, sh.cwd, sh.created_at
+           FROM session_headers sh
+           WHERE sh.cwd IS NOT NULL
+             AND EXISTS (SELECT 1 FROM conversations c
+                         WHERE c.session_id = sh.session_id AND c.tenant_id = %s)""",
+        (tenant_id,),
+    )
+    groups: dict[str, list[dict]] = {}
+    for row in cur.fetchall():
+        ws = _cwd_workspace_path(row["cwd"], row["session_id"], deployment_root)
+        if ws is None or not ws.is_dir():
+            continue
+        groups.setdefault(_canonical_project_path(row["cwd"]), []).append(row)
+
+    # 最近有活动的目录排前面：与侧栏「最近有活动的组排在前面」的观感一致，
+    # 也让 sort_order 的初值有意义（新建的永远排到末尾，见 _ensure_project）
+    ordered = sorted(groups.items(), key=lambda kv: -max(r["created_at"] for r in kv[1]))
+    for canonical, rows in ordered:
+        project_id = _ensure_project(cur, tenant_id, canonical)
+        for row in rows:
+            _adopt_session(cur, project_id, row["session_id"])
+    return len(ordered)
+
+
+def bootstrap_workspace_projects() -> None:
+    """首次启动时把**存量会话**按 cwd 归组，建出项目并收养成员。
+
+    每个租户只跑一次：跑完在 ``settings`` 里留一条 :data:`_BOOTSTRAP_NS` 记录。
+
+    **为什么不能只看「注册表为空」**：用户把项目全删光之后注册表也是空的，那种
+    情况下重跑会把那些会话又收养回一个新项目 —— 「移除后其会话**永久**落在未
+    分组」这条语义就没了。空注册表是「用户删干净了」和「从没引导过」的同一个
+    形状，只有标记能把两者分开。
+
+    不建项目的情形（其会话留未分组）：
+
+      - ``cwd`` 为 NULL：工作区是自动的 ``<root>/<session_id>``，目录名就是会话
+        id，拿来当项目名毫无意义。
+      - 目录解析不出来 / 已经不存在：登记一个看不见的目录没有意义。
+
+    整段跑在一个 ``with get_conn()`` 里（= 一个事务）：标记与账目同生共死，不会
+    留下「标记写了、项目没建」的半截状态。看不清文件系统时（沙箱工作区根没配好
+    **且** cwd 不在任何浏览根内）不写标记、下次启动重试。
+    """
+    try:
+        deployment_root: Path | None = Path(resolve_workspace_root()).resolve()
+    except (SandboxUnavailableError, ValueError):
+        deployment_root = None
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 先占位再 SELECT ... FOR UPDATE：行不存在时 FOR UPDATE 锁不住任何
+            # 东西，两个进程同时启动会各跑一遍引导
+            cur.execute(
+                """INSERT INTO settings (namespace, value) VALUES (%s, '{}'::jsonb)
+                   ON CONFLICT (namespace) DO NOTHING""",
+                (_BOOTSTRAP_NS,),
+            )
+            cur.execute(
+                "SELECT value FROM settings WHERE namespace = %s FOR UPDATE",
+                (_BOOTSTRAP_NS,),
+            )
+            done: list[int] = list((cur.fetchone()["value"] or {}).get("tenants") or [])
+
+            cur.execute(
+                """SELECT DISTINCT c.tenant_id FROM conversations c
+                   JOIN session_headers sh ON sh.session_id = c.session_id"""
+            )
+            pending = [r["tenant_id"] for r in cur.fetchall() if r["tenant_id"] not in done]
+            if not pending:
+                return
+
+            for tenant_id in pending:
+                created = _bootstrap_tenant(cur, tenant_id, deployment_root)
+                logger.info(f"项目注册表引导: 租户 {tenant_id} 归出 {created} 个项目")
+                done.append(tenant_id)
+
+            cur.execute(
+                "UPDATE settings SET value = %s::jsonb, updated_at = now() WHERE namespace = %s",
+                (json.dumps({"tenants": done}), _BOOTSTRAP_NS),
+            )
 
 
 def _titles_for(session_ids: list[str]) -> dict[str, dict]:
@@ -706,9 +990,10 @@ def api_list_workspace_sessions(x_tenant_id: int = Header(alias="X-Tenant-ID")) 
     每条会话带上三层导航需要的字段（前端据此渲染「智能体 → 文件夹 → 对话」）：
 
       ``agent_key`` / ``agent_name``  第一层。非 ``agent:`` 通道解不出 key（None）。
-      ``project``                     第二层。``{key, label, path}`` 或 **null**
-                                      —— null 表示落「未分组」这个虚拟桶
-                                      （见 :func:`_project_of` 的两条判据）。
+      ``project``                     第二层。``{id, key, label, path}`` 或 **null**
+                                      —— null 表示落「未分组」这个虚拟桶。
+                                      **查的是项目注册表的账目**，不是按 cwd 现算
+                                      （见 :func:`_project_for` 的三条判据）。
       ``title`` / ``title_source``    第三层。fold ``session/title`` 事件；没有标题
                                       事件的存量会话按首条消息现算 fallback
                                       （见 :func:`_titles_for`）。
@@ -716,6 +1001,10 @@ def api_list_workspace_sessions(x_tenant_id: int = Header(alias="X-Tenant-ID")) 
     **不再因为「工作区目录不存在」跳过会话**：早先那样做是为了不在侧栏出现死链接，
     但代价是「项目目录一删，会话就从列表里消失」—— 那是会话丢失，比死链接更糟。
     现在它们落进未分组，列表里照样点得开。
+
+    这里的 ``project`` 有两级来源：先查账目（谁登记了这个会话），再**读时二次校验**
+    账目是否还成立。校验不过的一律读作未分组，并留到下一次写入时才清理
+    （读不产生写，见 :func:`_project_for`）。
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -741,7 +1030,9 @@ def api_list_workspace_sessions(x_tenant_id: int = Header(alias="X-Tenant-ID")) 
 
     scanned = len(rows)          # 截断判定要看**切之前**的行数，切完再判就永远不截断
     rows = rows[:MAX_SESSIONS]
-    titles = _titles_for([r["session_id"] for r in rows])
+    session_ids = [r["session_id"] for r in rows]
+    titles = _titles_for(session_ids)
+    ledger = _ledger_for(x_tenant_id, session_ids)
     agent_names = _agent_names()
 
     items: list[dict] = []
@@ -765,7 +1056,7 @@ def api_list_workspace_sessions(x_tenant_id: int = Header(alias="X-Tenant-ID")) 
             # 旧标签。前端因此不用写 `title || label` 这种到处漏的兜底。
             "title": hit["title"] if hit else label,
             "title_source": hit["source"] if hit else None,
-            "project": _project_of(r["cwd"], ws),
+            "project": _project_for(r["session_id"], r["cwd"], ws, ledger),
             "label": label,
             "channel": r["channel"],
             "updated_at": _iso(r["updated_at"].timestamp()) if r["updated_at"] else None,
@@ -1238,6 +1529,19 @@ def api_create_workspace_session(
 
     chat_service.save_conversation_session_id(x_tenant_id, conv.id, sid)
 
+    # 自动登记 + 收养：选中的目录还没登记过就顺手登记一个项目，再把这个会话挂进去。
+    # 没有这一步，账目制下「随便选个文件夹建会话」不再产生分组（那是推导制才有的
+    # 效果），用户看到的是新文件夹永远落未分组 —— 那是回归，不是本意。
+    #
+    # 只收养**刚建的**这个会话：重新登记同一目录时旧会话不复活（见模块 docstring）。
+    # 失败**不阻断建会话** —— 会话已经建好了，分组是次要事实，不能因为注册表一时
+    # 写不进去就把一个已经存在的会话报告成失败。
+    if cwd:
+        try:
+            _register_and_adopt(x_tenant_id, cwd, sid)
+        except Exception as e:
+            logger.warning(f"会话 {sid} 的项目登记失败（会话已建好，不影响对话）: {e}")
+
     return {
         "ok": True,
         "session": {
@@ -1249,6 +1553,215 @@ def api_create_workspace_session(
             "folder": folder or None,
         },
     }
+
+
+# ── 项目注册表端点 ──
+
+#: 项目标题上限（字节）。侧栏第二层是窄列，再长的名字也只会被省略号吃掉。
+MAX_PROJECT_TITLE_BYTES = 200
+
+
+def _validate_project_title(raw: object) -> str:
+    """项目名：去空白、剥控制字符、截到 :data:`MAX_PROJECT_TITLE_BYTES` 字节。
+
+    与会话标题（``PATCH /{sid}/title``）不同，这里**截断而非拒绝**：项目名是纯
+    展示字段，用户粘一整段长路径进来时截断比报错友好（那边拒绝是因为标题是要
+    写进事件日志、要能重放的事实，截断会静默改掉用户的事实）。
+    """
+    cleaned = "".join(c for c in str(raw or "").strip() if ord(c) >= 32)
+    if not cleaned:
+        raise HTTPException(400, "项目名不能为空")
+    encoded = cleaned.encode("utf-8")
+    if len(encoded) > MAX_PROJECT_TITLE_BYTES:
+        cleaned = encoded[:MAX_PROJECT_TITLE_BYTES].decode("utf-8", "ignore")
+    return cleaned
+
+
+def _as_sort_order(raw: object) -> float:
+    """排序值必须是个数，否则 400。
+
+    非数字交给 SQL 隐式转换的话，报出来的是数据库方言而不是用户错误；``bool``
+    单独挡一下 —— 它在 Python 里是 ``int`` 的子类，``true`` 会变成 1.0。
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise HTTPException(400, f"sort_order 必须是数字: {raw!r}")
+    return float(raw)
+
+
+def _visible_host_dir(raw: object) -> str:
+    """登记输入的宿主路径 → 校验通过的原串；不合法 / 看不见 → 400。
+
+    两道校验：
+
+      - **全限定**（:func:`normalize_host_path`）：相对路径一律拒 —— 宿主的相对
+        路径会被 docker 当成 named volume 静默挂成空卷，是最难查的一种失败。
+      - **看得见**（落在某个浏览根内）：宿主的盘只经 compose 挂进 backend，根外的
+        路径本进程 stat 不到，也就无从确认「已存在且是目录」。登记一个自己看不见
+        的目录没有意义 —— 它的会话会一直读作未分组。
+
+    刻意**不做 realpath**：backend 是 Linux 容器，宿主路径它解析不了（见
+    :func:`_canonical_project_path` 的说明）。唯一性因此是**规范化字符串相等**。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        raise HTTPException(400, "path 不能为空")
+    try:
+        host = normalize_host_path(text)
+    except ValueError as e:
+        raise HTTPException(400, f"path 必须是全限定绝对路径（如 D:/jk/Nexus）: {e}")
+    visible = _host_cwd_to_backend(_browse_roots(), host)
+    if visible is None:
+        raise HTTPException(400, f"path 不在任何可浏览的根内，无法确认它存在: {host}")
+    if not visible.is_dir():
+        raise HTTPException(400, f"目录不存在或不是目录: {host}")
+    return host
+
+
+@router.get("/projects")
+def api_list_workspace_projects(x_tenant_id: int = Header(alias="X-Tenant-ID")) -> dict:
+    """列出本租户已登记的项目（按 ``sort_order``，带会话数）。
+
+    ``session_count`` 是**账目**里的行数，不是「读出来有效的会话数」：读时二次
+    校验（目录被删 / cwd 对不上）判掉的过期行要等下一次写入才清理
+    （见 :func:`_project_for`），在那之前它仍算在这一个计数里。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT wp.id, wp.canonical_path, wp.title, wp.sort_order,
+                          wp.created_at, wp.updated_at,
+                          COUNT(wps.session_id) AS session_count
+                   FROM workspace_projects wp
+                   LEFT JOIN workspace_project_sessions wps ON wps.project_id = wp.id
+                   WHERE wp.tenant_id = %s
+                   GROUP BY wp.id
+                   ORDER BY wp.sort_order, wp.id""",
+                (x_tenant_id,),
+            )
+            rows = cur.fetchall()
+    return {"items": [
+        {
+            **_project_payload(r),
+            "session_count": r["session_count"],
+            "created_at": _iso(r["created_at"].timestamp()),
+            "updated_at": _iso(r["updated_at"].timestamp()),
+        }
+        for r in rows
+    ]}
+
+
+@router.post("/projects")
+def api_register_workspace_project(
+    body: dict,
+    x_tenant_id: int = Header(alias="X-Tenant-ID"),
+) -> dict:
+    """登记一个**已存在**的目录为项目（**幂等**）。
+
+    重复登记同一个目录返回既有项目、**不动它的标题**（``_ensure_project`` 的
+    ``DO NOTHING``），也不收养任何存量会话 —— 这正是「重新添加同一目录只收养之后
+    的新会话、旧会话不复活」的落地点：旧会话的账目在移除时已经随着行一起没了。
+
+    新登记的项目排到列表**末尾**（``sort_order``）。
+    """
+    host = _visible_host_dir(body.get("path"))
+    canonical = _canonical_project_path(host)
+    title = _validate_project_title(body["title"]) if body.get("title") else None
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, canonical_path, title, sort_order FROM workspace_projects
+                   WHERE tenant_id = %s AND canonical_path = %s""",
+                (x_tenant_id, canonical),
+            )
+            row = cur.fetchone()
+            created = row is None
+            if row is None:
+                project_id = _ensure_project(cur, x_tenant_id, canonical, title)
+                cur.execute(
+                    """SELECT id, canonical_path, title, sort_order FROM workspace_projects
+                       WHERE id = %s""",
+                    (project_id,),
+                )
+                row = cur.fetchone()
+    return {"ok": True, "created": created, "project": _project_payload(row)}
+
+
+@router.patch("/projects/{project_id}")
+def api_update_workspace_project(
+    project_id: int,
+    body: dict,
+    x_tenant_id: int = Header(alias="X-Tenant-ID"),
+) -> dict:
+    """改项目：**改名 / 排序**。两个字段都可选，但至少要给一个。
+
+    ``sort_order`` 是**直接赋值**（不是「插到 X 前面」）：本接口不知道也不该知道
+    客户端此刻看到的列表顺序，而 DOM 式的 insertBefore 需要服务端把整份顺序读
+    出来重写。将来做拖拽排序时，前端在两个相邻项的 sort_order 之间取中点即可 ——
+    步长 10 就是为这个留的。
+
+    走的是**写路径**，所以顺带清理这个项目里已经对不上的账目
+    （见 :func:`_prune_project_members`）。
+    """
+    title = body.get("title")
+    sort_order = body.get("sort_order")
+    if title is None and sort_order is None:
+        raise HTTPException(400, "至少要给 title 或 sort_order")
+    sets: list[str] = []
+    params: list[object] = []
+    if title is not None:
+        sets.append("title = %s")
+        params.append(_validate_project_title(title))
+    if sort_order is not None:
+        sets.append("sort_order = %s")
+        params.append(_as_sort_order(sort_order))
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT canonical_path FROM workspace_projects WHERE id = %s AND tenant_id = %s",
+                (project_id, x_tenant_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(404, f"项目不存在: {project_id}")
+            _prune_project_members(cur, project_id, row["canonical_path"])
+            cur.execute(
+                f"""UPDATE workspace_projects SET {', '.join(sets)}, updated_at = now()
+                    WHERE id = %s
+                    RETURNING id, canonical_path, title, sort_order""",
+                (*params, project_id),
+            )
+            updated = cur.fetchone()
+    return {"ok": True, "project": _project_payload(updated)}
+
+
+@router.delete("/projects/{project_id}")
+def api_delete_workspace_project(
+    project_id: int,
+    x_tenant_id: int = Header(alias="X-Tenant-ID"),
+) -> dict:
+    """**移除项目登记** —— 只删这一行账目，成员行随外键级联消失。
+
+    目录、目录里的文件、会话行、``session_events`` 一个字节都不动（这是本模块唯一
+    的删除接口，而它删的是应用自己的账，不是用户的数据）。其会话随即落进「未分组」
+    这个虚拟桶 —— 分组是全部存活账目的**补集**，把账目删掉，成员关系自然就没了。
+
+    未知 id（或属于别的租户）→ **404**，不产生任何副作用：重复删除是明确的
+    not-found，不是静默成功。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """DELETE FROM workspace_projects
+                   WHERE id = %s AND tenant_id = %s
+                   RETURNING canonical_path""",
+                (project_id, x_tenant_id),
+            )
+            row = cur.fetchone()
+    if row is None:
+        raise HTTPException(404, f"项目不存在: {project_id}")
+    return {"ok": True, "deleted": True, "project_id": project_id, "path": row["canonical_path"]}
 
 
 def _assert_session_visible(session_id: str, tenant_id: int) -> None:

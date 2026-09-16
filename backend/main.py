@@ -54,6 +54,16 @@ async def startup():
     init_db()
     seed_orders(tenant_id=1)
 
+    # 项目注册表引导：把**存量**会话按 cwd 归组建成项目（每个租户只跑一次）。
+    # 必须在 init_db 之后 —— 两张注册表由它建。失败不阻断启动：会话照常能开，
+    # 只是暂时没有分组，下次启动会重试（标记与账目同事务，不会留半截状态）。
+    try:
+        from backend.api.workspace import bootstrap_workspace_projects
+        bootstrap_workspace_projects()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"项目注册表引导失败（会话不受影响）: {e}")
+
     # 装配 Session Event Log 持久化（PostgreSQL）。默认 NoopPersistence：进程内 Session，
     # 退出即消失；装配后 SessionStore 只做内存热区，Event Log 持久化 + 冷恢复走 Postgres。
     set_session_persistence(PostgresSessionPersistence())

@@ -10,6 +10,10 @@
 //   POST /api/workspace/{sid}/files              会话工作区里新建空文件 / 目录
 //   GET  /api/workspace/{sid}/file?path=&inline=1  预览 / 下载（inline=0）
 //   POST /api/workspace/{sid}/upload             多文件上传 → .dsh-drops/
+//   GET    /api/workspace/projects               项目注册表（含排序 / 会话数）
+//   POST   /api/workspace/projects               登记一个已存在的目录（幂等）
+//   PATCH  /api/workspace/projects/{id}          改名 / 排序
+//   DELETE /api/workspace/projects/{id}          **移除项目登记**（不删任何文件）
 //   GET  /api/agents/sessions/{sid}/sandbox_mode  读会话沙箱模式
 //   POST /api/agents/sessions/{sid}/sandbox_mode  写会话沙箱模式（覆盖）
 //
@@ -30,15 +34,20 @@ async function throwHttp(r: Response): Promise<never> {
 /** 新建条目的类型（后端 ENTRY_KINDS 的镜像）。 */
 export type EntryKind = 'file' | 'dir';
 
-/** 会话的**项目归属**（= 用户建会话时选的工作文件夹）。后端 `_project_of` 的镜像。
+/** 会话的**项目归属**（= 项目注册表里那一行账目）。后端 `_project_for` 的镜像。
  *
  *  身份是 `key`（规范化后的路径**字符串**），不是 `label`：两个不同目录可以同名
  *  （都叫 test1），它们仍是两个项目；同一个目录改了显示名也仍是一个项目。
- *  因此 key 才能拿去当 React key / 折叠状态的键。 */
+ *  因此 key 才能拿去当 React key / 折叠状态的键。
+ *
+ *  `id` 是注册表主键，只用于**改 / 删**这两个动作 —— 别拿它当身份：移除再重新
+ *  登记同一目录会拿到新 id，而 key（路径）不变。 */
 export interface WorkspaceProject {
+  id: number;
   key: string;
   label: string;
   path: string;
+  sort_order: number;
 }
 
 /** 标题来源：fallback = 首条消息前导词；provider = LLM 生成；user = 用户改名（已钉住）。
@@ -110,6 +119,29 @@ export async function renameWorkspaceSession(sessionId: string, title: string): 
   });
   if (!r.ok) await throwHttp(r);
   return (await r.json()).title as string;
+}
+
+/** 给项目改名。返回**服务端规范化之后**的标题 —— 显示必须用它，不能拿用户输入
+ *  顶替，否则会出现「刚打完是一回事、刷新后变样」。 */
+export async function renameWorkspaceProject(projectId: number, title: string): Promise<string> {
+  const r = await fetch(`${API}/api/workspace/projects/${projectId}`, {
+    method: 'PATCH', headers: { ...H, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+  if (!r.ok) await throwHttp(r);
+  return (await r.json()).project.label as string;
+}
+
+/** **移除项目登记**（后端只删账目那一行）。
+ *
+ *  不删目录、不删文件、不删会话行、不删事件日志 —— 它的会话随即显示在「未分组」
+ *  下。移除可逆（能重新添加同一目录），但旧会话不会回来，手工排序也不再保留。
+ *  未知 id / 别的租户 → 404（后端 `throwHttp` 会把人话带出来）。 */
+export async function deleteWorkspaceProject(projectId: number): Promise<void> {
+  const r = await fetch(`${API}/api/workspace/projects/${projectId}`, {
+    method: 'DELETE', headers: H,
+  });
+  if (!r.ok) await throwHttp(r);
 }
 
 export async function fetchDir(sessionId: string, path: string): Promise<{ entries: FileEntry[]; truncated: boolean; writable: boolean }> {

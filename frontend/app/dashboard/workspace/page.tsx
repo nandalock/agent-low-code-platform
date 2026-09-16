@@ -10,7 +10,7 @@
 // 每轮对话完成 → 刷新侧栏列表（label/时间/文件数变了）+ 文件树（模型落了文件）。
 // 「新建会话」是本地草稿（无 conversation/session id），首问 done 后升级为正式会话。
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { W, WS, wsThemeCss } from './theme';
 import './workspace.css';
 import WorkspaceSidebar from './_components/WorkspaceSidebar';
@@ -21,7 +21,7 @@ import WorkspaceEmpty from './_components/WorkspaceEmpty';
 import {
   type WorkspaceSession, type FileEntry, type CreatedSession,
   fetchWorkspaceSessions, uploadFiles, fetchSandboxMode, setSandboxMode,
-  renameWorkspaceSession,
+  renameWorkspaceSession, renameWorkspaceProject, deleteWorkspaceProject,
 } from './_components/useWorkspace';
 
 const LS_KEY = 'workspace_active_session';
@@ -51,12 +51,32 @@ export default function WorkspacePage() {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [sandboxMode, setSandboxModeState] = useState('workspace-write');
 
+  // ── 本地变更的序号与墓碑 ──
+  //
+  // 这个页面没有服务端推送，列表全靠主动拉。风险因此只剩一种：**移除项目**发出
+  // 去的 DELETE 与一份**更早发起**的列表请求交错 —— 那份响应是在移除之前生成的，
+  // 里面还有这个项目，照它渲染刚删掉的行就「诈尸」了。
+  //
+  // mutationSeq 记本地变更的次数。一份响应回来时，若它**发起时**的序号已经落后
+  // 于当前序号，说明它不认识那次变更，得用 tombstone 把它里面的这个项目压成
+  // 未分组；否则它就是权威，墓碑可以退休（服务端已经不再认得这个 id 了）。
+  const mutationSeq = useRef(0);
+  const tombstones = useRef<Set<number>>(new Set());
+
   /** 落库列表 + 把活动会话的标题同步成服务端值。
    *
    *  同步这步不是锦上添花：标题是**后端异步换的**（fallback 先出，LLM 版随后替换），
-   *  前端不跟着走的话，顶栏会一直显示会话刚打开时那个旧标题。 */
-  const applySessions = useCallback((list: WorkspaceSession[]) => {
-    const items = list.filter(s => s.agent_key);  // 非 agent 通道会话无法续聊，不进列表
+   *  前端不跟着走的话，顶栏会一直显示会话刚打开时那个旧标题。
+   *
+   *  `startedAt` 是这份响应**发起时**的 mutationSeq，见上面的墓碑说明。 */
+  const applySessions = useCallback((list: WorkspaceSession[], startedAt: number) => {
+    let items = list.filter(s => s.agent_key);  // 非 agent 通道会话无法续聊，不进列表
+    if (startedAt < mutationSeq.current) {
+      items = items.map(s => s.project && tombstones.current.has(s.project.id)
+        ? { ...s, project: null } : s);
+    } else {
+      tombstones.current.clear();
+    }
     setSessions(items);
     setActive(prev => {
       if (!prev) return prev;
@@ -65,19 +85,25 @@ export default function WorkspacePage() {
     });
   }, []);
 
-  // 挂载：拉会话列表 + 恢复上次选中会话
-  useEffect(() => {
-    fetchWorkspaceSessions()
-      .then(applySessions)
-      .catch(() => {})
-      .finally(() => setLoadingSessions(false));
-    const saved = loadSavedActive();
-    if (saved?.agent_key) setActive(saved);
+  const loadSessions = useCallback(async () => {
+    const startedAt = mutationSeq.current;
+    try {
+      applySessions(await fetchWorkspaceSessions(), startedAt);
+    } catch {
+      /* 拉不到就保持现状，下一次刷新会补上 */
+    } finally {
+      setLoadingSessions(false);
+    }
   }, [applySessions]);
 
-  const refreshSessions = useCallback(() => {
-    fetchWorkspaceSessions().then(applySessions).catch(() => {});
-  }, [applySessions]);
+  // 挂载：拉会话列表 + 恢复上次选中会话
+  useEffect(() => {
+    loadSessions();
+    const saved = loadSavedActive();
+    if (saved?.agent_key) setActive(saved);
+  }, [loadSessions]);
+
+  const refreshSessions = loadSessions;
 
   // 选中会话变化：持久化 + 拉它的沙箱模式；清掉右栏旧选中
   useEffect(() => {
@@ -113,6 +139,35 @@ export default function WorkspacePage() {
     // 改的正是当前打开的会话 → 顶栏标题也跟上
     setActive(prev => (prev && prev.session_id === sessionId ? { ...prev, label: saved } : prev));
     refreshSessions();
+  }
+
+  /** 项目改名：只改登记里的显示名（目录、会话都不动）。改完本地先同步上，
+   *  再拉一次列表对齐（其它标签页 / 别人的改动也一并带回来）。 */
+  async function handleRenameProject(projectId: number, title: string) {
+    const saved = await renameWorkspaceProject(projectId, title);
+    setSessions(prev => prev.map(s => (s.project && s.project.id === projectId
+      ? { ...s, project: { ...s.project, label: saved } }
+      : s)));
+    loadSessions();
+  }
+
+  /** **移除项目登记**。后端只删账目那一行；这里把本地投影一起改掉。
+   *
+   *  两件事的次序是有意的：先发 DELETE（失败就直接抛给弹窗，本地一个字节都不动），
+   *  成功后**立即本地摘掉**这个分组 —— 它的会话改成未分组，而不是从列表里消失
+   *  （会话还在，只是没有归属了）。不等服务端推送也不等重新拉列表：那样中间会有
+   *  一帧「点了确认但行还在」。
+   *
+   *  然后给这个 id 立墓碑，挡住那些更早发起、此刻才回来的列表响应（见 mutationSeq）。
+   */
+  async function handleRemoveProject(projectId: number) {
+    await deleteWorkspaceProject(projectId);
+    mutationSeq.current += 1;
+    tombstones.current.add(projectId);
+    setSessions(prev => prev.map(s => (s.project && s.project.id === projectId
+      ? { ...s, project: null }
+      : s)));
+    loadSessions();
   }
 
   /** 侧栏「新建」：清空选中回到空态（聊天框居中显示，在那里选 agent + 文件夹）。 */
@@ -189,6 +244,8 @@ export default function WorkspacePage() {
         onNew={newSession}
         onRefresh={refreshSessions}
         onRename={handleRename}
+        onRenameProject={handleRenameProject}
+        onRemoveProject={handleRemoveProject}
         loading={loadingSessions}
       />
 
