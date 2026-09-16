@@ -366,8 +366,7 @@ def test_parallel_batch_survives_projections():
     一并钉死三件事：轨迹投影按 call_id 回填（不依赖到达顺序）、trace 投影
     的 usage/step 结构不变、derive_messages() 的消息序与 assistant.tool_calls 对齐。
     """
-    from backend.agents.runtime.session.trace_projection import TraceProjection
-    from backend.agents.runtime.session.trajectory_projection import TrajectoryProjection
+    from backend.agents.runtime.session.projections import TraceProjection, TrajectoryProjection
 
     session = Session()
     session.append(TURN_START, {"agent": "a", "limits": {"max_steps": 5}})

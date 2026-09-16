@@ -261,7 +261,11 @@ interaction/approval    怎么问人、怎么等回答      ← Channel / Servic
    交给模型」。当前靠人工把关，语义上应当由 `ConfinedSandboxMode` 在词汇层划死。
 6. **孤儿容器**。`docker CLI` 被 SIGKILL 时容器可能残留（`--rm` 依赖 CLI 存活）。
    需要更强保证时改用 `cidfile` + `docker kill`。
-7. **镜像无 digest pin**。`python:3.12-slim` 是可变 tag。
+7. **镜像无 digest pin**。默认 `agent-sandbox:1`（`sandbox/Dockerfile` 的自建
+   tag，见 compose 的 `sandbox-image` 服务），且 `SANDBOX_IMAGE` 可指向任意
+   可变 tag —— 换镜像不必动代码，因此也没有地方强制校验它。
+   （注意沙箱镜像与 backend/frontend 镜像职责不同：装沙箱内依赖要改
+   `sandbox/Dockerfile`，不要改 `backend/Dockerfile`。）
 8. **`read_roots` 不进事件**。`tool/result` 的 sandbox 事实只有 `{mode, enforcement,
    outcome}` —— 事后审计无法回答「这次会话读到了哪些宿主目录」。
 9. **读路径有 TOCTOU 窗口**。`resolve_workspace_member` 先 `resolve()` 判越界，

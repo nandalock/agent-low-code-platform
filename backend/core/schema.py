@@ -248,6 +248,34 @@ TABLES_DDL = {
             UNIQUE(session_id, seq)
         )
     """,
+    # 项目（工作区）注册表：本应用对**已存在的目录**的登记，不是对目录的所有权。
+    # 移除只撤销登记 —— 目录、文件、会话行、session_events 一律不动（见 api/workspace.py）。
+    #
+    # 成员关系是**存下来的账目**，不是每次按会话 cwd 实时推导：推导制下「移除项目」
+    # 无从表达（下一次刷新又按 cwd 分回来了）。账目制下删除就是删行。
+    #
+    # 两张表排在 session_headers **之后**：TABLES_DDL 按 dict 插入序建表，
+    # workspace_project_sessions 的外键指向 session_headers，放前面会在全新库上建失败。
+    "workspace_projects": """
+        CREATE TABLE IF NOT EXISTS workspace_projects (
+            id             SERIAL PRIMARY KEY,
+            tenant_id      INTEGER NOT NULL,
+            canonical_path TEXT NOT NULL,
+            title          TEXT NOT NULL,
+            sort_order     DOUBLE PRECISION NOT NULL DEFAULT 0,
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE (tenant_id, canonical_path)
+        )
+    """,
+    "workspace_project_sessions": """
+        CREATE TABLE IF NOT EXISTS workspace_project_sessions (
+            project_id INTEGER NOT NULL REFERENCES workspace_projects(id) ON DELETE CASCADE,
+            session_id TEXT    NOT NULL REFERENCES session_headers(session_id) ON DELETE CASCADE,
+            position   DOUBLE PRECISION NOT NULL DEFAULT 0,
+            PRIMARY KEY (project_id, session_id)
+        )
+    """,
 }
 
 INDEXES_DDL = [
@@ -281,6 +309,9 @@ INDEXES_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_router_history_embedding ON router_history USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10)",
     "CREATE INDEX IF NOT EXISTS idx_l1_router_key ON router_l1_keywords(router_key)",
     "CREATE INDEX IF NOT EXISTS idx_l1_keywords_gin ON router_l1_keywords USING GIN(keywords)",
+    # workspace 项目注册表
+    "CREATE INDEX IF NOT EXISTS idx_workspace_projects_tenant ON workspace_projects(tenant_id)",
+    "CREATE INDEX IF NOT EXISTS idx_wps_session ON workspace_project_sessions(session_id)",
 ]
 
 EXTENSIONS = [

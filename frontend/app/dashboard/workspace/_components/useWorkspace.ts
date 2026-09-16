@@ -10,6 +10,10 @@
 //   POST /api/workspace/{sid}/files              会话工作区里新建空文件 / 目录
 //   GET  /api/workspace/{sid}/file?path=&inline=1  预览 / 下载（inline=0）
 //   POST /api/workspace/{sid}/upload             多文件上传 → .dsh-drops/
+//   GET    /api/workspace/projects               项目注册表（含排序 / 会话数）
+//   POST   /api/workspace/projects               登记一个已存在的目录（幂等）
+//   PATCH  /api/workspace/projects/{id}          改名 / 排序
+//   DELETE /api/workspace/projects/{id}          **移除项目登记**（不删任何文件）
 //   GET  /api/agents/sessions/{sid}/sandbox_mode  读会话沙箱模式
 //   POST /api/agents/sessions/{sid}/sandbox_mode  写会话沙箱模式（覆盖）
 //
@@ -30,10 +34,39 @@ async function throwHttp(r: Response): Promise<never> {
 /** 新建条目的类型（后端 ENTRY_KINDS 的镜像）。 */
 export type EntryKind = 'file' | 'dir';
 
+/** 会话的**项目归属**（= 项目注册表里那一行账目）。后端 `_project_for` 的镜像。
+ *
+ *  身份是 `key`（规范化后的路径**字符串**），不是 `label`：两个不同目录可以同名
+ *  （都叫 test1），它们仍是两个项目；同一个目录改了显示名也仍是一个项目。
+ *  因此 key 才能拿去当 React key / 折叠状态的键。
+ *
+ *  `id` 是注册表主键，只用于**改 / 删**这两个动作 —— 别拿它当身份：移除再重新
+ *  登记同一目录会拿到新 id，而 key（路径）不变。 */
+export interface WorkspaceProject {
+  id: number;
+  key: string;
+  label: string;
+  path: string;
+  sort_order: number;
+}
+
+/** 标题来源：fallback = 首条消息前导词；provider = LLM 生成；user = 用户改名（已钉住）。
+ *  null = 还没生成过（新会话 / 首条是纯图片），此时 title 回落成旧标签。 */
+export type TitleSource = 'fallback' | 'provider' | 'user' | null;
+
 export interface WorkspaceSession {
   session_id: string;
   agent_key: string | null;
+  /** 智能体的显示名（后端查 agent_definitions）；查不到时后端回落成 key */
+  agent_name: string | null;
   conversation_id: number;
+  /** 会话标题，**恒非空**（后端保证）：侧栏第三层显示的就是它 */
+  title: string;
+  title_source: TitleSource;
+  /** null = 落「未分组」虚拟桶（没有 cwd / 项目目录已被删掉） */
+  project: WorkspaceProject | null;
+  /** 旧标签（customer_name / channel / sid 前 8 位）。标题没生成过时的回落值，
+   *  现在只在提示里用得到 —— 显示一律走 title。 */
   label: string;
   channel: string | null;
   updated_at: string | null;
@@ -71,6 +104,44 @@ export async function fetchWorkspaceSessions(): Promise<WorkspaceSession[]> {
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const d = await r.json();
   return d.items || [];
+}
+
+/** 给会话改名。后端写一条 `user` 源的 `session/title` 事件 —— **改名即钉住**，
+ *  此后自动生成（fallback / LLM）都不再改它。
+ *
+ *  返回的是**规范化之后**的标题（去了控制符、截到 80 字节），不是传进去的原串：
+ *  显示必须用返回值，否则会出现「刚打完是一回事、刷新后变样」。
+ *  标题里塞 ANSI / 零宽字符是预期内的输入，后端清洗后 400 才是真错误（净化为空）。 */
+export async function renameWorkspaceSession(sessionId: string, title: string): Promise<string> {
+  const r = await fetch(`${API}/api/workspace/${sessionId}/title`, {
+    method: 'PATCH', headers: { ...H, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+  if (!r.ok) await throwHttp(r);
+  return (await r.json()).title as string;
+}
+
+/** 给项目改名。返回**服务端规范化之后**的标题 —— 显示必须用它，不能拿用户输入
+ *  顶替，否则会出现「刚打完是一回事、刷新后变样」。 */
+export async function renameWorkspaceProject(projectId: number, title: string): Promise<string> {
+  const r = await fetch(`${API}/api/workspace/projects/${projectId}`, {
+    method: 'PATCH', headers: { ...H, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+  if (!r.ok) await throwHttp(r);
+  return (await r.json()).project.label as string;
+}
+
+/** **移除项目登记**（后端只删账目那一行）。
+ *
+ *  不删目录、不删文件、不删会话行、不删事件日志 —— 它的会话随即显示在「未分组」
+ *  下。移除可逆（能重新添加同一目录），但旧会话不会回来，手工排序也不再保留。
+ *  未知 id / 别的租户 → 404（后端 `throwHttp` 会把人话带出来）。 */
+export async function deleteWorkspaceProject(projectId: number): Promise<void> {
+  const r = await fetch(`${API}/api/workspace/projects/${projectId}`, {
+    method: 'DELETE', headers: H,
+  });
+  if (!r.ok) await throwHttp(r);
 }
 
 export async function fetchDir(sessionId: string, path: string): Promise<{ entries: FileEntry[]; truncated: boolean; writable: boolean }> {

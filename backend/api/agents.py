@@ -9,10 +9,18 @@ from pydantic import BaseModel
 from backend.agents import list_agents, get_agent, register
 from backend.agents.base import AgentReply
 from backend.agents.runtime import AgentRuntime
-from backend.agents.runtime.session import Session, get_session_persistence, get_session_store
+from backend.agents.runtime.session import (
+    Session,
+    flush_session_events,
+    get_session_persistence,
+    get_session_store,
+)
 from backend.agents.runtime.session.events import SANDBOX_MODE
-from backend.agents.runtime.session.sandbox_projection import project_sandbox_mode
-from backend.agents.runtime.session.trajectory_projection import TrajectoryProjection, project_trajectory
+from backend.agents.runtime.session.projections import (
+    TrajectoryProjection,
+    project_sandbox_mode,
+    project_trajectory,
+)
 from backend.agents.runtime.system_prompt import (
     AssembleContext,
     assemble,
@@ -541,7 +549,6 @@ async def agent_set_sandbox_mode(session_id: str, body: SandboxModeBody) -> dict
     词汇封闭性在写入侧校验（非法值 400）。覆盖不持久化到任何配置存储——
     它就是日志里的一条事件，冷恢复后由投影重新折叠出同一值。
     """
-    from backend.agents.runtime.agent_runtime import _flush_session_events
     from backend.tool_system.sandbox.policy import validate_mode
     try:
         mode = validate_mode(body.mode)
@@ -549,7 +556,7 @@ async def agent_set_sandbox_mode(session_id: str, body: SandboxModeBody) -> dict
         raise HTTPException(400, str(e))
     session = _session_or_404(session_id)
     session.append(SANDBOX_MODE, {"mode": mode})
-    _flush_session_events(get_session_persistence(), session)
+    flush_session_events(get_session_persistence(), session)
     return {"session_id": session_id, "override": mode}
 
 

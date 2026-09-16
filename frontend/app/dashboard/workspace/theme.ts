@@ -42,8 +42,12 @@ export const W = {
   // ── 状态 ──
   success:     '#22C55E',
   danger:      '#F25A5A',
+  dangerSoft:  'rgba(242,90,90,0.14)',       // 危险动作的 hover 蒙层（移除项目）
   warning:     '#F59E0B',
   ongoing:     '#5686FE',
+
+  // ── 遮罩（模态弹窗压住整页的那层）──
+  scrim:       'rgba(0,0,0,0.5)',
 
   // ── 阴影（发丝描边画在 box-shadow 首层，配 border:0 不占布局）──
   elevSoft:     '0 0 0 0.5px rgba(255,255,255,0.10), 0 2px 8px 0 rgba(0,0,0,0.35)',

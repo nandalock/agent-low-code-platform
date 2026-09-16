@@ -8,8 +8,8 @@ Event Log 是唯一事实源；本模块把 ``sandbox/mode`` 事件 fold 成「�
     调用方回落到部署默认（优先级链见 tool_system/sandbox/policy.py）。
   - ``project_sandbox_mode(events)`` 与增量 ``handle`` 严格同构。
 
-与 trace_projection / trajectory_projection 并列：三者都消费同一 Event Log、
-互不依赖；命名 = "<用途>_projection"。
+与同目录的 trace.py / trajectory.py 并列：三者都消费同一 Event Log、互不依赖。
+文件名不再带 `_projection` 后缀 —— 文件夹名已经说了这件事（见本包 ``__init__.py``）。
 """
 from backend.agents.runtime.session.events import SANDBOX_MODE, SessionEvent
 from backend.tool_system.sandbox.vocabulary import ALL_MODES

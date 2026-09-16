@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { T, S, btnPrimary } from '@/app/theme';
-import { Wrench, Plus, X, Box, ShoppingCart, FileText, Truck, BookOpen, Tags, User, Search } from 'lucide-react';
+import { Wrench, Plus, X, Box, ShoppingCart, FileText, Truck, BookOpen, Tags, User, Search, ChevronDown, ChevronRight } from 'lucide-react';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -58,6 +58,9 @@ export default function McpListPage() {
 
   const [importJson, setImportJson] = useState('');
   const [importError, setImportError] = useState('');
+  // 只记**展开**的来源：默认空集 = 全部收起。一个 MCP 导入几十个工具，
+  // 平铺会让页面变成几千像素的长条，反而找不到要看的那个服务
+  const [open, setOpen] = useState<Set<string>>(new Set());
 
   const MCP_EXAMPLES = [
     {
@@ -158,6 +161,18 @@ export default function McpListPage() {
     groups.get(key)!.push(t);
   }
 
+  function toggleOpen(source: string) {
+    setOpen(prev => {
+      const next = new Set(prev);
+      if (next.has(source)) next.delete(source);
+      else next.add(source);
+      return next;
+    });
+  }
+
+  const sources = [...groups.keys()];
+  const allOpen = sources.length > 0 && sources.every(s => open.has(s));
+
   return (
     <div style={{ height: '100vh', background: T.bg, color: T.text, fontFamily: "system-ui,-apple-system,'Segoe UI',sans-serif", overflow: 'auto' }}>
       <div style={{ maxWidth: 1080, margin: '0 auto', padding: `${S.huge}px ${S.xl}px` }}>
@@ -165,6 +180,14 @@ export default function McpListPage() {
           <Wrench size={22} color={T.accent} />
           <h2 style={{ margin: 0, fontSize: 20, fontWeight: 600 }}>工具</h2>
           <div style={{ flex: 1 }} />
+          {sources.length > 0 && (
+            <button onClick={() => setOpen(allOpen ? new Set<string>() : new Set(sources))} style={{
+              padding: '8px 14px', borderRadius: 6, border: `1px solid ${T.border}`, background: T.surface,
+              color: T.text, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit',
+            }}>
+              {allOpen ? '全部收起' : '全部展开'}
+            </button>
+          )}
           <button onClick={() => setShowModal(true)} style={{
             ...btnPrimary, display: 'flex', alignItems: 'center', gap: 5, padding: '8px 16px', fontSize: 13,
           }}>
@@ -175,9 +198,18 @@ export default function McpListPage() {
           平台所有可用的 MCP 工具，共 {tools.length} 个
         </p>
 
-        {[...groups.entries()].map(([serverName, serverTools]) => (
+        {[...groups.entries()].map(([serverName, serverTools]) => {
+          const isOpen = open.has(serverName);
+          return (
           <div key={serverName} style={{ marginBottom: S.xxl }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: S.sm, marginBottom: S.md }}>
+            <div
+              onClick={() => toggleOpen(serverName)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: S.sm,
+                marginBottom: isOpen ? S.md : 0, cursor: 'pointer', userSelect: 'none',
+              }}
+            >
+              {isOpen ? <ChevronDown size={15} color={T.secondary} /> : <ChevronRight size={15} color={T.secondary} />}
               <span style={{ fontSize: 13, fontWeight: 600, color: T.text }}>{serverName}</span>
               <span style={{
                 fontSize: 10, padding: '1px 8px', borderRadius: 10,
@@ -186,6 +218,7 @@ export default function McpListPage() {
                 {serverTools.length} 个工具
               </span>
             </div>
+            {isOpen && (
             <div style={{
               display: 'grid',
               gridTemplateColumns: 'repeat(3, 1fr)',
@@ -235,8 +268,10 @@ export default function McpListPage() {
                 );
               })}
             </div>
+            )}
           </div>
-        ))}
+          );
+        })}
 
         {tools.length === 0 && (
           <div style={{ textAlign: 'center', padding: '80px 0', color: T.tertiary }}>

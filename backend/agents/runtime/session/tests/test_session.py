@@ -3,13 +3,13 @@
 纯内存，不需要 docker / DB / 网络。
 
 Usage:
-    docker compose exec backend python backend/agents/runtime/session/test_session.py
+    docker compose exec backend python backend/agents/runtime/session/tests/test_session.py
 """
 import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".."))
 
 from backend.agents.runtime.session import (  # noqa: E402
     ASSISTANT_MESSAGE,

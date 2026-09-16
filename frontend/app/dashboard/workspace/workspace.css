@@ -103,7 +103,32 @@
   border: none; cursor: pointer;
 }
 .ws-btn-primary:hover { background: var(--ws-primary-hover); }
-.ws-btn-primary:disabled { cursor: not-allowed; }
+/* 禁用要看得出来：实底按钮不降透明度就等于没禁用 */
+.ws-btn-primary:disabled { cursor: not-allowed; opacity: 0.5; }
+.ws-btn-primary:disabled:hover { background: var(--ws-primary); }
+
+/* 次要动作按钮（弹窗的「取消」等）：透明底 + 发丝描边 */
+.ws-btn-outline {
+  background: transparent; color: var(--ws-text);
+  border: 0.5px solid var(--ws-border-strong); cursor: pointer;
+}
+.ws-btn-outline:hover { background: var(--ws-hover); }
+.ws-btn-outline:disabled { cursor: not-allowed; opacity: 0.5; }
+.ws-btn-outline:disabled:hover { background: transparent; }
+
+/* 危险动作按钮（移除项目）：红字 + 红描边，hover 加深红蒙层。
+   与普通按钮的区别必须**一眼可辨** —— 这是唯一会撤销登记的动作。 */
+.ws-btn-danger {
+  background: transparent; color: var(--ws-danger);
+  border: 0.5px solid var(--ws-danger); cursor: pointer;
+}
+.ws-btn-danger:hover { background: var(--ws-danger-soft); }
+.ws-btn-danger:disabled { cursor: not-allowed; opacity: 0.5; }
+.ws-btn-danger:disabled:hover { background: transparent; }
+
+/* 菜单里的危险项（移除项目）：红字 + hover 红蒙层 */
+.ws-danger-item { color: var(--ws-danger); }
+.ws-danger-item:hover { background: var(--ws-danger-soft); }
 
 /* 主发送键：品牌蓝实底，禁用时落到表面色 */
 .ws-send { background: var(--ws-accent); border: none; transition: background 0.12s var(--ws-ease); }

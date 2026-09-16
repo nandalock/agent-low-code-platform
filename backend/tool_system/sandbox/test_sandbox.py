@@ -18,11 +18,11 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 from backend.agents.runtime.session.events import SANDBOX_MODE, TOOL_CALL, TOOL_RESULT, SessionEvent  # noqa: E402
-from backend.agents.runtime.session.sandbox_projection import (  # noqa: E402
+from backend.agents.runtime.session.projections import (  # noqa: E402
     SandboxModeProjection,
+    TrajectoryProjection,
     project_sandbox_mode,
 )
-from backend.agents.runtime.session.trajectory_projection import TrajectoryProjection  # noqa: E402
 from backend.tool_system.context import ToolContext  # noqa: E402
 from backend.tool_system.events import APPROVAL_REQUEST as APPROVAL_REQUEST_EVENT  # noqa: E402
 from backend.tool_system.events import SANDBOX_ESCALATION as SANDBOX_ESCALATION_EVENT  # noqa: E402
@@ -1756,7 +1756,7 @@ def test_escalation_event_lands_in_session_log():
     """装配层出口：sandbox.escalation → Event Log（**记录**，不被任何投影折叠）。"""
     from backend.agents.runtime.session import SessionStore
     from backend.agents.runtime.session.events import SANDBOX_ESCALATION
-    from backend.agents.runtime.session.sandbox_projection import project_sandbox_mode
+    from backend.agents.runtime.session.projections import project_sandbox_mode
     from backend.agents.runtime.tool_event_sink import SessionToolEventSink
 
     session = SessionStore().create()

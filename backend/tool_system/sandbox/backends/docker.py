@@ -23,10 +23,14 @@ Landlock 授权 / Seatbelt SBPL，本后端用 ``docker run`` 的参数。
 配置：没有它，宿主目录只能看不能改；有了它，模型能改的就只有你点名的那几个。
 
 **已知缺口**：``confine(argv, policy)`` 的签名里没有镜像——DeepSeek 的词汇
-也没有。本后端因此在构造时固定一个镜像。将来要按工具切换镜像（bash 用通用
-镜像、python 用带科学栈的镜像），需要扩展 seam（provider 每镜像一个实例，
-或给 policy 加一个后端配置字段），阶段 1b 再定。
+也没有。本后端因此在构造时固定一个镜像，该镜像由 ``SANDBOX_IMAGE`` 在**部署
+层**选定（默认 ``agent-sandbox:1``，即 ``sandbox/Dockerfile`` 的构建产物）。
+将来要按工具切换镜像（bash 用通用镜像、python 用带科学栈的镜像），需要扩展
+seam（provider 每镜像一个实例，或给 policy 加一个后端配置字段），阶段 1b 再定。
+在那之前 ``SandboxToolConfig.image`` 是**死字段**：descriptor 声明了、
+``register_builtin_sandbox_tools()`` 也填了，但 executor 从头到尾不读它。
 """
+import os
 from typing import Sequence
 
 from backend.tool_system.sandbox.errors import SandboxUnavailableError
@@ -39,8 +43,11 @@ from backend.tool_system.sandbox.workspace import (
     normalize_host_path,
 )
 
-#: 默认沙箱镜像。
-DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
+#: 默认沙箱镜像。由 ``SANDBOX_IMAGE`` 配置（compose 的 backend.environment 传入，
+#: 默认值为本仓库自建镜像，见 ``sandbox/Dockerfile`` 与 compose 的
+#: ``sandbox-image`` 服务）。装依赖要改 **沙箱镜像**，不要改 backend/frontend
+#: 镜像 —— 那是应用镜像，职责不同。
+DEFAULT_SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "agent-sandbox:1")
 
 #: 本后端的**拒绝方言**：``--read-only`` 下写工作区外触发。
 #: 容器内的 ``permission denied`` 太通用（任何命令都可能打印），不能作为签名。

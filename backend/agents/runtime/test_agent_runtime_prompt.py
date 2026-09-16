@@ -21,6 +21,7 @@ from backend.agents.runtime import agent_runtime as runtime_mod  # noqa: E402
 from backend.agents.runtime.agent_runtime import AgentRuntime  # noqa: E402
 from backend.agents.runtime.session import (  # noqa: E402
     NoopPersistence,
+    get_session_title_service,
     set_session_persistence,
 )
 from backend.agents.runtime.session import store as store_mod  # noqa: E402
@@ -59,6 +60,8 @@ def _install_fakes():
     loop_mod.get_http_session = fake
     set_session_persistence(NoopPersistence())
     store_mod._store = store_mod.SessionStore()  # 每个用例干净的 SessionStore
+    # 标题服务的在飞状态也是进程级单例，同样每用例清一遍
+    get_session_title_service().forget_all()
 
 
 def _async_return(value):
@@ -72,7 +75,16 @@ def _runtime(agent_key: str = "test_agent", **config) -> AgentRuntime:
         "name": "测试助手",
         "description": "用于自检的 agent",
         "status": "active",
-        "config": {"api_key": "k", "base_url": "http://fake", "model": "m", **config},
+        "config": {
+            "api_key": "k", "base_url": "http://fake", "model": "m",
+            # **关掉 LLM 标题**：本文件测的是 system prompt 的组装，而标题生成是
+            # 第三个 LLM 调用方（AgentLoop / AgentRuntime 之外的 title.service），
+            # 它不认上面那份 fake，会真的发 HTTP 并在 asyncio.run 收尾时炸出
+            # 「Event loop is closed」。fallback 标题照常补（纯函数、无 IO），
+            # 标题本身的逻辑在 session/tests/test_title.py 里单独测。
+            "session_title_enabled": False,
+            **config,
+        },
     }
     agent = AgentRuntime(key=agent_key, definition=definition)
     return agent
