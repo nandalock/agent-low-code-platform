@@ -1,6 +1,17 @@
 name: agent-low-code-platform
 
 services:
+  # 沙箱镜像：**只 build，不起服务**。沙箱不是常驻服务，每次工具调用由 backend
+  # 经 docker.sock `docker run --rm` 起一个临时容器（sandbox/backends/docker.py）。
+  # 这里存在的唯一理由是让 `docker compose build` 把它一起构建出来 —— 否则
+  # SANDBOX_IMAGE 指向的镜像在本地不存在，沙箱工具会以 "no such image" 失败。
+  # command 让 `docker compose up` 拉起它时立即退出，不留空转容器。
+  sandbox-image:
+    build:
+      context: ./sandbox
+    image: agent-sandbox:1
+    command: ["true"]
+
   db:
     image: pgvector/pgvector:pg16
     environment:
@@ -69,6 +80,13 @@ services:
       # 模型看到的路径是 /mnt/write/<目录名>，可直接修改其中的文件。
       # 例：SANDBOX_WRITE_ROOTS: "D:/jk/Nexus"
       SANDBOX_WRITE_ROOTS: ${SANDBOX_WRITE_ROOTS:-}
+      # 沙箱镜像：模型执行 bash / python 时 docker run 用的执行环境。默认是
+      # 上面 sandbox-image 服务的构建产物（sandbox/Dockerfile）；要换镜像
+      # （自带工具链的公共镜像、内部 registry 的 tag）改这里或 .env 即可，
+      # 不必动代码。注意 backend 容器**不需要**预装它，镜像由宿主 daemon 解析。
+      # 宿主的 docker 没有这个镜像时，沙箱工具会以 runner_failed 收敛
+      # （docker.py 的 RUNNER_FAILURE_RULES 认 "no such image"），不是静默失败。
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-agent-sandbox:1}
       # 论文域 MCP 内部总结用 LLM（OpenAI 兼容网关，在 .env 中填写）
       PAPER_LLM_BASE_URL: ${PAPER_LLM_BASE_URL:-}
       PAPER_LLM_API_KEY: ${PAPER_LLM_API_KEY:-}

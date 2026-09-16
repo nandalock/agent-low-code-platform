@@ -46,7 +46,12 @@ class SandboxToolConfig:
     """
 
     runtime: str                   # "shell" | "python" —— 决定 argv 形状
-    image: str                     # 沙箱镜像
+    # 注意：本字段当前**未被读取**。真正决定镜像的是 DockerProvider 构造时的
+    # self._image（由 init_sandbox() 用 SANDBOX_IMAGE 环境变量填）。接通这条
+    # 通路需要扩展 confine(argv, policy) 签名或 provider 构造方式，属于接口
+    # 扩展，阶段 1b 再定。见 sandbox/backends/docker.py 模块 docstring 的
+    # 「已知缺口」。
+    image: str
     timeout_s: float = 30.0        # 单次执行超时（秒）
     memory: str = "1g"
     cpus: float = 1.0
