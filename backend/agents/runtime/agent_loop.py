@@ -16,7 +16,7 @@ Tool 调度边界（见 tool_system/runtime/scheduler.py）：
 
 事实记录原则：Session Event Log 是 Agent 执行事实的唯一 Source of Truth ——
   Loop 只 session.append(...) 产生事实，不再维护任何第二套执行 trace
-  （Trace / Telemetry 由 TraceProjection 从 Event Log 投影派生，见 trace_projection.py）。
+  （Trace / Telemetry 由 TraceProjection 从 Event Log 投影派生，见 projections/trace.py）。
 
 防失控（简化版 harness，职责划分）：
   max_steps      — LLM→Tool 循环轮数上限（AgentRuntime._llm_params 配置）
@@ -404,7 +404,7 @@ class AgentLoop:
         沙箱工具在策略缺失时 fail-closed。
         """
         try:
-            from backend.agents.runtime.session.sandbox_projection import project_sandbox_mode
+            from backend.agents.runtime.session.projections import project_sandbox_mode
             from backend.tool_system.sandbox.runtime import session_policy
             header = self.session.header
             policy = session_policy(

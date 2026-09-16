@@ -21,6 +21,7 @@ import WorkspaceEmpty from './_components/WorkspaceEmpty';
 import {
   type WorkspaceSession, type FileEntry, type CreatedSession,
   fetchWorkspaceSessions, uploadFiles, fetchSandboxMode, setSandboxMode,
+  renameWorkspaceSession,
 } from './_components/useWorkspace';
 
 const LS_KEY = 'workspace_active_session';
@@ -50,21 +51,33 @@ export default function WorkspacePage() {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [sandboxMode, setSandboxModeState] = useState('workspace-write');
 
+  /** 落库列表 + 把活动会话的标题同步成服务端值。
+   *
+   *  同步这步不是锦上添花：标题是**后端异步换的**（fallback 先出，LLM 版随后替换），
+   *  前端不跟着走的话，顶栏会一直显示会话刚打开时那个旧标题。 */
+  const applySessions = useCallback((list: WorkspaceSession[]) => {
+    const items = list.filter(s => s.agent_key);  // 非 agent 通道会话无法续聊，不进列表
+    setSessions(items);
+    setActive(prev => {
+      if (!prev) return prev;
+      const hit = items.find(s => s.session_id === prev.session_id);
+      return hit && hit.title !== prev.label ? { ...prev, label: hit.title } : prev;
+    });
+  }, []);
+
   // 挂载：拉会话列表 + 恢复上次选中会话
   useEffect(() => {
     fetchWorkspaceSessions()
-      .then(list => setSessions(list.filter(s => s.agent_key)))   // 非 agent 通道会话（agent_key=null）无法续聊，不进列表
+      .then(applySessions)
       .catch(() => {})
       .finally(() => setLoadingSessions(false));
     const saved = loadSavedActive();
     if (saved?.agent_key) setActive(saved);
-  }, []);
+  }, [applySessions]);
 
   const refreshSessions = useCallback(() => {
-    fetchWorkspaceSessions()
-      .then(list => setSessions(list.filter(s => s.agent_key)))
-      .catch(() => {});
-  }, []);
+    fetchWorkspaceSessions().then(applySessions).catch(() => {});
+  }, [applySessions]);
 
   // 选中会话变化：持久化 + 拉它的沙箱模式；清掉右栏旧选中
   useEffect(() => {
@@ -83,8 +96,23 @@ export default function WorkspacePage() {
       agent_key: s.agent_key || 'paper_agent',
       conversation_id: s.conversation_id,
       session_id: s.session_id,
-      label: s.label || s.session_id.slice(0, 8),
+      // title 恒非空（后端保证），不用再写 label 兜底；label 现在只用于提示
+      label: s.title,
     });
+  }
+
+  /** 侧栏改名：写一条 user 源标题事件（后端会**钉住**它），成功后刷新列表。
+   *
+   *  必须用后端返回的规范化标题刷新，而不是把用户输入直接塞进本地状态 ——
+   *  后端会去掉控制符并截到 80 字节，本地先改会让「显示值」和「库里值」短暂分叉。 */
+  async function handleRename(sessionId: string, title: string) {
+    const saved = await renameWorkspaceSession(sessionId, title);
+    setSessions(prev => prev.map(s => s.session_id === sessionId
+      ? { ...s, title: saved, title_source: 'user' as const }
+      : s));
+    // 改的正是当前打开的会话 → 顶栏标题也跟上
+    setActive(prev => (prev && prev.session_id === sessionId ? { ...prev, label: saved } : prev));
+    refreshSessions();
   }
 
   /** 侧栏「新建」：清空选中回到空态（聊天框居中显示，在那里选 agent + 文件夹）。 */
@@ -160,6 +188,7 @@ export default function WorkspacePage() {
         onSelect={selectSession}
         onNew={newSession}
         onRefresh={refreshSessions}
+        onRename={handleRename}
         loading={loadingSessions}
       />
 

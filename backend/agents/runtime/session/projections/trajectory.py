@@ -5,9 +5,10 @@ node 序列（think / tool / answer），并产出增量 UI 事件（traj/open|d
 usage）供 SSE 实时推送。这是「Session Event → Conversation Node → UI Projection」
 的中间层：前端 reducer 只按全量字段值更新，不做任何拼装/猜测。
 
-命名（DSH 词汇对齐）：本包内三个派生视图按用途并列 —— surface.py（模型消息）、
-trajectory_projection.py（UI/回放，本文件）、trace_projection.py（执行摘要/telemetry）。
-三者都消费同一 Event Log，互不依赖；命名 = "<用途>_projection"。
+命名（DSH 词汇对齐）：本包内派生视图按用途并列 —— ``../surface.py``（模型消息，
+它是**进 LLM 的那一份**，所以留在核心层不在本文件夹）、``trajectory.py``（UI/回放，
+本文件）、``trace.py``（执行摘要/telemetry）。都消费同一 Event Log，互不依赖；
+文件名不再带 `_projection` 后缀（见本包 ``__init__.py``）。
 
 设计约束：
   - 纯状态机：handle(ev) 逐事件消费；project_trajectory(events) == fold(handle)。

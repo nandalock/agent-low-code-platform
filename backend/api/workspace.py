@@ -48,9 +48,21 @@ from fastapi import APIRouter, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
 from backend.agents import get_agent
-from backend.agents.config_service import get_agent_definition
-from backend.agents.runtime.session import get_session_persistence
-from backend.agents.runtime.session.events import SessionHeader, new_session_id
+from backend.agents.config_service import get_agent_definition, list_agent_definitions
+from backend.agents.runtime.session import get_session_persistence, get_session_title_service
+from backend.agents.runtime.session.events import (
+    TITLE,
+    USER_MESSAGE,
+    SessionEvent,
+    SessionHeader,
+    new_session_id,
+)
+from backend.agents.runtime.session.title import (
+    SOURCE_FALLBACK,
+    fallback_session_title,
+    session_title_of,
+    title_message_of,
+)
 from backend.core.connection import get_conn
 from backend.tool_system.sandbox.errors import SandboxUnavailableError
 from backend.tool_system.sandbox.workspace import (
@@ -234,6 +246,154 @@ def _agent_key_from_channel(channel: str | None) -> str | None:
     if channel and channel.startswith(prefix):
         return channel[len(prefix):] or None
     return None
+
+
+def _canonical_project_path(cwd: str) -> str:
+    """项目路径的**规范化字符串** —— 项目唯一性的判据。
+
+    **为什么不是 realpath**（参考实现用的是 ``fs.realpath``）：``cwd`` 存的是
+    **宿主**路径（``D:/jk/Nexus/proj``），而 backend 是 Linux 容器 —— 宿主的盘
+    只经 compose 以 ``/srv/host-write/<名>`` 挂进来，那个路径与 cwd 不是同一个
+    字符串，realpath 既解析不了符号链接，连「存不存在」都判断不了。所以退到
+    **纯字符串规范化**，只做不依赖文件系统的确定变换：
+
+      - 统一分隔符为 ``/``（宿主是 Windows，库里两种都有）
+      - 去 ``.`` / 折叠重复分隔符 / **词法展开** ``..``
+      - 去尾斜杠，但**保留根**（``C:/`` 不能变成 ``C:`` —— 后者是相对路径语义）
+      - 盘符大写（Windows 路径大小写不敏感：``D:/jk`` 与 ``d:/JK`` 是同一个目录）
+
+    唯一性是**路径字符串相等**，不是标题相等 —— 两个不同目录可以同名（都叫
+    ``test1``），它们仍是两个项目；同一个目录换了显示名也仍是一个项目。
+    """
+    raw = cwd.strip().replace("\\", "/")
+    prefix = ""
+    if len(raw) >= 2 and raw[1] == ":":
+        prefix, raw = raw[:2].upper(), raw[2:]
+    elif raw.startswith("//"):
+        prefix, raw = "//", raw[2:]
+    segments: list[str] = []
+    for seg in raw.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if segments:          # 词法出栈；已经在根上则原地不动（与 Path 一致）
+                segments.pop()
+            continue
+        segments.append(seg)
+    return prefix + "/" + "/".join(segments)
+
+
+def _project_label(canonical: str) -> str:
+    """项目显示名 = 规范化路径的**最后一段**（``D:/jk/Downloads`` → ``Downloads``）。
+
+    根目录没有「最后一段」（``C:/``）→ 回落成整串，否则侧栏会出现一个空标题的
+    分组。这与参考实现的 ``defaultWorkspaceTitle`` 一致（那里 ``C:\\`` → ``C:\\``）。
+    重名是允许的：显示名只是显示，身份是 :func:`_canonical_project_path` 的整串。
+    """
+    _, _, rest = canonical.partition("/")
+    segments = [s for s in rest.split("/") if s]
+    return segments[-1] if segments else canonical
+
+
+def _project_of(cwd: str | None, ws: Path | None) -> dict | None:
+    """会话的**项目归属**（= 用户选的工作文件夹）；没有归属返回 ``None``。
+
+    ``None`` 意味着前端把它归入「未分组」这个**虚拟桶** —— 它不是一个项目，
+    没有实体，因此没有 hover / 右键菜单（见 WorkspaceSidebar）。
+
+    两条判据：
+
+      - ``cwd`` 为 NULL → 没有项目。这类会话的工作区是自动的
+        ``<root>/<session_id>``，目录名就是会话 id，拿来当项目名毫无意义。
+      - ``cwd`` 解析不出来 / **目录已被删掉** → 未分组。项目目录被删后它的会话
+        不该从侧栏消失（那是会话丢失），而是落进未分组等用户处理。
+
+    Args:
+        cwd: ``session_headers.cwd``（宿主绝对路径，可能是 NULL）。
+        ws: :func:`_resolve_session_workspace` 解析出的容器内路径（调用方已算过，
+            这里只做存在性判断，避免二次 resolve）。
+    """
+    if not cwd or ws is None or not ws.is_dir():
+        return None
+    canonical = _canonical_project_path(cwd)
+    return {"key": canonical, "label": _project_label(canonical), "path": cwd}
+
+
+def _titles_for(session_ids: list[str]) -> dict[str, dict]:
+    """批量算会话标题：``session_id → {"title": str, "source": str}``。
+
+    **没有条目的会话就是没有标题**（还没说话 / 只说了纯图片），由调用方回落到
+    用户名等旧标签——这里不替它编一个。
+
+    两趟 SQL（不是每会话两趟）：侧栏一次最多 100 条，逐个查就是 200 次往返。
+
+      1. 每个会话的**最后一条** ``session/title``（``DISTINCT ON`` + ``seq DESC``）
+         —— 这就是 fold「取最新」，把折叠下推到 SQL。
+      2. 对**没有标题事件**的会话，取它的**第一条** ``user/message``，在 Python 侧
+         按同一套规则算 fallback。存量会话（标题机制上线前建的）因此也能立刻有
+         标题，而不是要等下一次对话才补上。
+    """
+    if not session_ids:
+        return {}
+    found: dict[str, dict] = {}
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT DISTINCT ON (session_id)
+                          session_id, seq, event_type, event_time, data
+                   FROM session_events
+                   WHERE session_id = ANY(%s) AND event_type = %s
+                   ORDER BY session_id, seq DESC""",
+                (session_ids, TITLE),
+            )
+            latest_rows = cur.fetchall()
+
+            for r in latest_rows:
+                title = session_title_of(_event_of_row(r))
+                if title is not None:
+                    found[r["session_id"]] = {"title": title.title, "source": title.source}
+
+            pending = [sid for sid in session_ids if sid not in found]
+            first_rows = []
+            if pending:
+                cur.execute(
+                    """SELECT DISTINCT ON (session_id)
+                              session_id, seq, event_type, event_time, data
+                       FROM session_events
+                       WHERE session_id = ANY(%s) AND event_type = %s
+                       ORDER BY session_id, seq""",
+                    (pending, USER_MESSAGE),
+                )
+                first_rows = cur.fetchall()
+
+    for r in first_rows:
+        msg = title_message_of(_event_of_row(r))
+        if msg is None:
+            continue  # 纯图片 / 纯空白：没有可用文本，继续等
+        title = fallback_session_title(msg.text)
+        if title:
+            found[r["session_id"]] = {"title": title, "source": SOURCE_FALLBACK}
+    return found
+
+
+def _event_of_row(row: dict) -> SessionEvent:
+    """SQL 行 → :class:`SessionEvent`（读侧复用写侧的折叠逻辑，不另写一套）。"""
+    return SessionEvent(
+        type=row["event_type"], seq=row["seq"], time=row["event_time"], data=row["data"],
+    )
+
+
+def _agent_names() -> dict[str, str]:
+    """``agent_key → 显示名`` 映射（侧栏第一层的标题）。
+
+    一次查全表而不是每个 key 查一次：agent 数量是个位数，而侧栏每次刷新都会
+    要一遍。查不到名字的 key 由调用方回落成 key 本身——**别让一个没登记的
+    agent 从侧栏消失**，那比显示一个丑名字糟得多。
+    """
+    try:
+        return {d["agent_key"]: d["name"] for d in list_agent_definitions() if d.get("name")}
+    except Exception:  # 配置表读不到不该让整个会话列表 500
+        return {}
 
 
 def _resolve_session_workspace(
@@ -543,15 +703,19 @@ def _create_child(target: Path, kind: str) -> None:
 def api_list_workspace_sessions(x_tenant_id: int = Header(alias="X-Tenant-ID")) -> dict:
     """列出本租户**工作区目录存在**的会话（左栏导航用）。
 
-    不能按 ``cwd IS NOT NULL`` 过滤：那一列当前恒为 NULL（见
-    :func:`_resolve_session_workspace`），过滤了就等于永远返回空。判据只能是
-    文件系统本身 —— 目录在不在。目录不在的会话跳过，因为列出来点进去必然报错。
+    每条会话带上三层导航需要的字段（前端据此渲染「智能体 → 文件夹 → 对话」）：
 
-    注意「目录存在」比「沙箱被用过」宽：``session_policy()`` 挂在每次工具调用
-    上，所以会话只要调过任何工具（哪怕只是 MCP），目录就已建好。空工作区照样
-    列出来（UI 有对应的空态），不假装它不存在。
+      ``agent_key`` / ``agent_name``  第一层。非 ``agent:`` 通道解不出 key（None）。
+      ``project``                     第二层。``{key, label, path}`` 或 **null**
+                                      —— null 表示落「未分组」这个虚拟桶
+                                      （见 :func:`_project_of` 的两条判据）。
+      ``title`` / ``title_source``    第三层。fold ``session/title`` 事件；没有标题
+                                      事件的存量会话按首条消息现算 fallback
+                                      （见 :func:`_titles_for`）。
 
-    会话可能有多个 conversation，取最近一个当标签。
+    **不再因为「工作区目录不存在」跳过会话**：早先那样做是为了不在侧栏出现死链接，
+    但代价是「项目目录一删，会话就从列表里消失」—— 那是会话丢失，比死链接更糟。
+    现在它们落进未分组，列表里照样点得开。
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -575,30 +739,42 @@ def api_list_workspace_sessions(x_tenant_id: int = Header(alias="X-Tenant-ID")) 
     except (SandboxUnavailableError, ValueError) as e:
         raise HTTPException(503, f"沙箱工作区未配置: {e}")
 
+    scanned = len(rows)          # 截断判定要看**切之前**的行数，切完再判就永远不截断
+    rows = rows[:MAX_SESSIONS]
+    titles = _titles_for([r["session_id"] for r in rows])
+    agent_names = _agent_names()
+
     items: list[dict] = []
     for r in rows:
+        agent_key = _agent_key_from_channel(r["channel"])
         ws = _resolve_session_workspace(r["cwd"], r["session_id"], deployment_root)
-        if ws is None or not ws.is_dir():
-            continue  # 配置变更后的陈旧 cwd / 还没建过目录：跳过，别让侧栏出现死链接
         try:
-            entry_count = len(os.listdir(ws))
+            entry_count = len(os.listdir(ws)) if ws is not None else 0
         except OSError:
             entry_count = 0
+        label = r["customer_name"] or r["channel"] or r["session_id"][:8]
+        hit = titles.get(r["session_id"])
         items.append({
             "session_id": r["session_id"],
-            "agent_key": _agent_key_from_channel(r["channel"]),
+            "agent_key": agent_key,
+            "agent_name": agent_names.get(agent_key) or agent_key,
             # 前端拿它续聊：带上 conversation_id 后端的 _resolve_conversation 才不会
             # 每轮新建一个会话，session_id 也才能续上同一个工作区
             "conversation_id": r["conversation_id"],
-            "label": r["customer_name"] or r["channel"] or r["session_id"][:8],
+            # title 恒非空：没有标题事件也没有合格消息（新会话 / 纯图片首问）时回落到
+            # 旧标签。前端因此不用写 `title || label` 这种到处漏的兜底。
+            "title": hit["title"] if hit else label,
+            "title_source": hit["source"] if hit else None,
+            "project": _project_of(r["cwd"], ws),
+            "label": label,
             "channel": r["channel"],
             "updated_at": _iso(r["updated_at"].timestamp()) if r["updated_at"] else None,
             "entries": entry_count,
         })
 
     # 扫描触顶或结果超上限，两种截断都要说出来 —— 静默截断会被读成「就这些」
-    truncated = len(rows) >= _SESSION_SCAN_LIMIT or len(items) > MAX_SESSIONS
-    return {"items": items[:MAX_SESSIONS], "truncated": truncated}
+    truncated = scanned >= _SESSION_SCAN_LIMIT or scanned > MAX_SESSIONS
+    return {"items": items, "truncated": truncated}
 
 
 # ── 新建会话（选 agent + 选工作文件夹，对齐 DSH 的「选择工作区」） ──
@@ -1072,6 +1248,69 @@ def api_create_workspace_session(
             "label": label,
             "folder": folder or None,
         },
+    }
+
+
+def _assert_session_visible(session_id: str, tenant_id: int) -> None:
+    """确认会话属于本租户；不属于即 404。
+
+    与其它端点同一套：``session_headers`` 没有 tenant 列，归属写在 chat 域的
+    ``conversations.session_id`` 上。用 404 而非 403 —— 不泄漏会话是否存在。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT 1 FROM session_headers sh
+                   WHERE sh.session_id = %s
+                     AND EXISTS (SELECT 1 FROM conversations c
+                                 WHERE c.session_id = sh.session_id AND c.tenant_id = %s)""",
+                (session_id, tenant_id),
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(404, f"会话不存在或不属于本租户: {session_id}")
+
+
+@router.patch("/{session_id}/title")
+async def api_rename_workspace_session(
+    session_id: str,
+    body: dict,
+    x_tenant_id: int = Header(alias="X-Tenant-ID"),
+) -> dict:
+    """给会话改名 —— 写一条 ``user`` 源的 ``session/title`` 事件。
+
+    **改名即钉住**：此后所有自动生成（fallback 补位、LLM 升级）都不再改动这个
+    会话的标题。这是刻意的——用户刚打的名字被模型下一秒覆盖掉，比没有自动标题
+    更糟。解除钉住需要一个显式动作（本项目暂未提供）。
+
+    **为什么是 ``async def``**：改名要 append 到这个 Session，而它可能正被
+    AgentLoop 驱动（改的正是正在对话的那个会话）。同步端点跑在 FastAPI 的线程池里，
+    与事件循环线程并发 append 会真的踩坏 ``Session._seq``（读-改-写，无锁）；
+    async 端点与 AgentLoop 同在事件循环线程，而 append 内部没有 await 点 ——
+    天然原子。这里面的 psycopg2 调用是阻塞的，但改名是低频人工动作，为它引入
+    线程池不划算。
+
+    **为什么按事件写而不是 UPDATE 列**：标题是可重放事实的一部分，冷恢复 / fork /
+    分页都必须读到同一个值 —— 这些由 Event Log 免费提供（见 title_projection）。
+    另立一张标题表或加一列，就要额外和会话历史对账。
+
+    返回的是**规范化之后**的标题（净化控制符 + 截到 80 字节），不是用户原样输入
+    —— 前端据此显示真正存下去的值，而不是显示一个下次刷新就变样的字符串。
+    """
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(400, "标题不能为空")
+    _assert_session_visible(session_id, x_tenant_id)
+    try:
+        snapshot = get_session_title_service().rename_by_id(session_id, title)
+    except LookupError:
+        raise HTTPException(404, f"会话不存在: {session_id}")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "title": snapshot.title,
+        "title_source": snapshot.source,
     }
 
 

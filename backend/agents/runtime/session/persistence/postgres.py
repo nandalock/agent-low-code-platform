@@ -22,7 +22,7 @@ import json
 import logging
 
 from backend.agents.runtime.session.events import SessionEvent, SessionHeader
-from backend.agents.runtime.session.persistence import SessionPersistence
+from backend.agents.runtime.session.persistence.base import SessionPersistence
 from backend.core.connection import get_conn
 
 logger = logging.getLogger(__name__)

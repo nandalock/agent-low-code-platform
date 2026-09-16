@@ -23,10 +23,12 @@ from backend.agents.runtime.events import EventSink
 from backend.agents.runtime.session import (
     Session,
     SessionEvent,
+    flush_session_events,
     get_session_persistence,
     get_session_store,
+    get_session_title_service,
 )
-from backend.agents.runtime.session.trace_projection import TraceProjection
+from backend.agents.runtime.session.projections import TraceProjection
 from backend.agents.runtime.system_prompt import (
     AssembleContext,
     assemble,
@@ -36,24 +38,6 @@ from backend.core.http import get_http_session
 from backend.tool_system.runtime.scheduler import DEFAULT_MAX_PARALLEL_TOOLS
 
 logger = logging.getLogger(__name__)
-
-
-def _flush_session_events(persistence, session: Session) -> None:
-    """持久化边界（尽力而为）：Session 事件 → append_events(pending) → flush(durable)。
-
-    触发点 = turn 完成（AgentRuntime.reply 收尾）。一次 flush 一个
-    事务（全部成功或全部失败）；失败仅记 error 不打断对话 —— 答案已生成，不让持久化
-    故障影响用户体验；pending 保留在 Persistence 内，下次 flush 幂等重放
-    （ON CONFLICT (session_id, seq) DO NOTHING，不产生重复行）。
-    """
-    try:
-        persistence.append_events(session.header.id, session.events)
-        persistence.flush(session.header.id)
-    except Exception:
-        logger.exception(
-            f"Session [{session.header.id}] 持久化失败（本 turn 事件可能未落库，"
-            f"后续 flush 将重试）"
-        )
 
 
 class AgentRuntime(BaseAgent):
@@ -182,13 +166,25 @@ class AgentRuntime(BaseAgent):
             if attached_sink:
                 session.remove_listener(session_event_sink)
 
+        # 会话标题（会话级事实，不是「本 turn 的产出」）：turn 末**同步**补一条
+        # fallback（首条合格人类消息的前导词）——纯函数，无 IO 无模型，不会拖慢
+        # 收尾；已钉住（用户改过名）或已有标题时它是 no-op。见 session/title/service.py。
+        # 放在 flush **之前**：这条事件就跟本 turn 的其它事件一起落库，不需要额外
+        # 一次事务。LLM 版标题晚点自己补 flush（它刻意跑在主链路之外）。
+        if session_enabled:
+            get_session_title_service().settle(session)
+
         # turn 完成 = 持久化边界（仅正式 Session）：本 turn 的 Event Log
         # （turn/start → user → steps → turn/end）经 append_events + flush 落库
         # （一次 flush = 一个事务）。AgentLoop 不感知任何存储 —— 事件由 Session 收全，
         # 此处一次性交给 Persistence。done 事件在 flush 之后发出，客户端收到 done ≈
-        # 本 turn 事件已 durable（flush 失败仅记日志，语义见 _flush_session_events）。
+        # 本 turn 事件已 durable（flush 失败仅记日志，语义见 flush_session_events）。
         if session_enabled:
-            _flush_session_events(persistence, session)
+            flush_session_events(persistence, session)
+            # 排一次 LLM 标题升级：**不在本函数里 await**（schedule 不返回 awaitable），
+            # 所以它绝不会推迟 done 事件或拖长本轮耗时；生成完自己写事件 + flush。
+            # 只对首条消息、且标题还没被升级/钉住时排得上（见 schedule 的三条判据）。
+            get_session_title_service().schedule(session, config)
 
         # trace = TraceProjection.snapshot()：派生观测视图（steps/limits/usage/stop_reason
         # 全部来自 Event Log 投影），不是第二套事实存储。AgentLoop 只产生事件，不写 trace。

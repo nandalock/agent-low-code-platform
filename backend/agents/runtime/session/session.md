@@ -89,17 +89,25 @@ B——沙箱执行侧的 `cwd or workspace_for_session` 链与读侧 `_resolve_
 
 ### 源码地图
 
+**顶层放的全是「核心」**——事件定义、Session 本身、Surface、Store。其余按用途分到
+四个子包；`__init__.py` 是**整个包对外的唯一界面**，外部一律
+`from backend.agents.runtime.session import X`，不必知道 X 在哪个子包里。
+
 | 文件 | 职责 |
 |---|---|
 | `events.py` | 事件类型常量 · `SessionEvent` · `SessionHeader` · `SURFACE_EVENT_TYPES` |
 | `session.py` | `Session` —— Event Log · Surface · listener 广播 · `derive_messages` |
 | `surface.py` | `SurfaceManager` —— 决定哪些事件对 LLM 可见（规则集中，就一个 `SURFACE_EVENT_TYPES` 判断） |
 | `store.py` | `SessionStore` —— 运行态生命周期 + 进程级单例 |
-| `persistence.py` | `SessionPersistence` 抽象接口 + `NoopPersistence` |
-| `postgres.py` | `PostgresSessionPersistence` —— 生产实现 |
-| `trace_projection.py` | 事件 → 对外兼容的 trace dict（`AgentReply.trace`） |
-| `trajectory_projection.py` | 事件 → 历史会话回放快照 |
-| `sandbox_projection.py` | 事件 → 当前有效的沙箱模式覆盖 |
+
+| 子包 | 职责 |
+|---|---|
+| `persistence/` | 落库 seam：`base.py` 接口 + `NoopPersistence` + 装配 + `flush_session_events`；`postgres.py` 生产实现 |
+| `projections/` | **只读**派生视图：`sandbox.py` 沙箱模式覆盖 · `trace.py` 运行统计 · `trajectory.py` UI 轨迹 |
+| `title/` | 会话标题：`normalize.py` 净化与字节截断 · `projection.py` fold 与合格输入 · `service.py` 接受与钉住 |
+| `tests/` | 自检脚本（`tests/test_session.py` · `tests/test_title.py`） |
+
+四个子包各自的 `__init__.py` 是**该文件夹的界面**：只做 re-export，逻辑留在具体文件里。
 
 Store 与 Persistence 都不感知对方：`store.get()` 只查内存，冷恢复编排由调用方负责。
 

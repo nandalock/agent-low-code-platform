@@ -191,8 +191,8 @@ backend/main.py                                 # 装配：init_sandbox + 注册
 docker-compose.yml / backend/Dockerfile         # socket + docker CLI + 工作区同路径挂载
 ```
 
-阶段 1c 追加：`session/events.py`（`SANDBOX_MODE` 常量）、`session/sandbox_projection.py`
-（find-last fold + 回放同构）、`session/trajectory_projection.py`（tool node 携带 sandbox 事实
+阶段 1c 追加：`session/events.py`（`SANDBOX_MODE` 常量）、`session/projections/sandbox.py`
+（find-last fold + 回放同构）、`session/projections/trajectory.py`（tool node 携带 sandbox 事实
 与状态归类）、`agent_loop.py`（读取覆盖 + `tool/result` 结构化字段）、`api/agents.py`
 （`GET/POST /sessions/{sid}/sandbox_mode`）、`frontend/lib/trajectory.ts` +
 `TrajectoryTimeline.tsx`（轨迹里显示沙箱状态）。
@@ -506,7 +506,7 @@ def classify_outcome(exit_code: int, stderr: str, confined: ConfinedArgv) -> Out
 SANDBOX_MODE = "sandbox/mode"   # data: {"mode": "read-only" | "workspace-write" | "danger-full-access"}
 ```
 
-`session/sandbox_projection.py` 照 `trace_projection.py` 的结构写：
+`session/projections/sandbox.py` 照 `projections/trace.py` 的结构写：
 
 - 增量投影器：`handle(ev)` 逐条消费，fold 形态为 **find-last**
 - `project_sandbox_mode(events)` 给冷恢复回放用

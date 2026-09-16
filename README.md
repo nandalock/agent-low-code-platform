@@ -185,6 +185,7 @@ agent-low-code-platform/
 | GET    | `/api/workspace/folders` · POST `/api/workspace/folders` | Browse host folders / create an empty entry in one |
 | GET    | `/api/workspace/{id}/files` · `/file` | Browse & preview workspace files |
 | POST   | `/api/workspace/{id}/files` · `/upload` | Create an empty file/folder · upload files |
+| PATCH  | `/api/workspace/{id}/title`       | Rename a session (logs `session/title`, pins it) |
 | GET    | `/api/memory/users`               | Long-term memory profiles      |
 | GET    | `/api/approvals` · POST `…/{id}`  | Pending approvals & decisions  |
 | WS     | `/api/ws/chat`                    | Real-time chat                 |

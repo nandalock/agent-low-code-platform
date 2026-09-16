@@ -18,7 +18,7 @@ pending → flush 显式落库。turn 完成是 Persistence 的持久化边界(�
 AgentLoop 不感知任何存储)。
 
 NoopPersistence 保留为默认实现 / 测试替身;生产装配见 PostgresSessionPersistence
-(postgres.py),由 main.py startup 注入,Session / SessionStore / AgentLoop 均不感知具体实现。
+(persistence/postgres.py),由 main.py startup 注入,Session / SessionStore / AgentLoop 均不感知具体实现。
 """
 import abc
 import logging
@@ -26,6 +26,29 @@ import logging
 from backend.agents.runtime.session.events import SessionEvent, SessionHeader
 
 logger = logging.getLogger(__name__)
+
+
+def flush_session_events(persistence: "SessionPersistence", session) -> None:
+    """持久化边界（尽力而为）：Session 事件 → append_events(pending) → flush(durable)。
+
+    触发点 = turn 完成（AgentRuntime.reply 收尾），以及**标题生成在 turn 之后落地时**
+    （title_service：自动标题不阻塞主回复，所以它的事件常常晚于 turn 末那次 flush，
+    必须自己再补一次，否则会一直躺在 pending 里等下一次对话）。一次 flush 一个事务
+    （全部成功或全部失败）；失败仅记 error 不打断对话 —— 答案已生成，不让持久化
+    故障影响用户体验；pending 保留在 Persistence 内，下次 flush 幂等重放
+    （``ON CONFLICT (session_id, seq) DO NOTHING``，不产生重复行）。
+
+    放在 persistence 模块而不是 AgentRuntime：它纯粹是「怎么落库」，与谁触发无关；
+    标题服务也要用同一份逻辑（复制一份出来迟早在去重/重试上漂移）。
+    """
+    try:
+        persistence.append_events(session.header.id, session.events)
+        persistence.flush(session.header.id)
+    except Exception:
+        logger.exception(
+            f"Session [{session.header.id}] 持久化失败（本 turn 事件可能未落库，"
+            f"后续 flush 将重试）"
+        )
 
 
 class SessionPersistence(abc.ABC):

@@ -30,10 +30,34 @@ async function throwHttp(r: Response): Promise<never> {
 /** 新建条目的类型（后端 ENTRY_KINDS 的镜像）。 */
 export type EntryKind = 'file' | 'dir';
 
+/** 会话的**项目归属**（= 用户建会话时选的工作文件夹）。后端 `_project_of` 的镜像。
+ *
+ *  身份是 `key`（规范化后的路径**字符串**），不是 `label`：两个不同目录可以同名
+ *  （都叫 test1），它们仍是两个项目；同一个目录改了显示名也仍是一个项目。
+ *  因此 key 才能拿去当 React key / 折叠状态的键。 */
+export interface WorkspaceProject {
+  key: string;
+  label: string;
+  path: string;
+}
+
+/** 标题来源：fallback = 首条消息前导词；provider = LLM 生成；user = 用户改名（已钉住）。
+ *  null = 还没生成过（新会话 / 首条是纯图片），此时 title 回落成旧标签。 */
+export type TitleSource = 'fallback' | 'provider' | 'user' | null;
+
 export interface WorkspaceSession {
   session_id: string;
   agent_key: string | null;
+  /** 智能体的显示名（后端查 agent_definitions）；查不到时后端回落成 key */
+  agent_name: string | null;
   conversation_id: number;
+  /** 会话标题，**恒非空**（后端保证）：侧栏第三层显示的就是它 */
+  title: string;
+  title_source: TitleSource;
+  /** null = 落「未分组」虚拟桶（没有 cwd / 项目目录已被删掉） */
+  project: WorkspaceProject | null;
+  /** 旧标签（customer_name / channel / sid 前 8 位）。标题没生成过时的回落值，
+   *  现在只在提示里用得到 —— 显示一律走 title。 */
   label: string;
   channel: string | null;
   updated_at: string | null;
@@ -71,6 +95,21 @@ export async function fetchWorkspaceSessions(): Promise<WorkspaceSession[]> {
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const d = await r.json();
   return d.items || [];
+}
+
+/** 给会话改名。后端写一条 `user` 源的 `session/title` 事件 —— **改名即钉住**，
+ *  此后自动生成（fallback / LLM）都不再改它。
+ *
+ *  返回的是**规范化之后**的标题（去了控制符、截到 80 字节），不是传进去的原串：
+ *  显示必须用返回值，否则会出现「刚打完是一回事、刷新后变样」。
+ *  标题里塞 ANSI / 零宽字符是预期内的输入，后端清洗后 400 才是真错误（净化为空）。 */
+export async function renameWorkspaceSession(sessionId: string, title: string): Promise<string> {
+  const r = await fetch(`${API}/api/workspace/${sessionId}/title`, {
+    method: 'PATCH', headers: { ...H, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+  if (!r.ok) await throwHttp(r);
+  return (await r.json()).title as string;
 }
 
 export async function fetchDir(sessionId: string, path: string): Promise<{ entries: FileEntry[]; truncated: boolean; writable: boolean }> {

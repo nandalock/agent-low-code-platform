@@ -4,7 +4,7 @@
   - surface 事件（进入 LLM Context）: user/message, assistant/message, tool/result
     （session/seed 亦在集合内，但已退役、无写入方——见 SEED 注释）
   - 过程事件（仅 Event Log，不进入 LLM）: turn/start, step/start, assistant/chunk,
-    tool/call, tool/progress, step/end, turn/end, llm/usage
+    tool/call, tool/progress, step/end, turn/end, llm/usage, session/title
 
 system prompt 不进 Event Log：它由 SystemPrompt 每轮组装，在 AgentLoop 派生 LLM
 消息时前置为 messages[0]。session_headers.seed_length 是 seed 机制的历史字段，
@@ -42,6 +42,16 @@ APPROVAL_REQUEST = "approval/request"  # 升权申请进入人工裁决（data: 
                                        # 状态可查（UI 显示待批准卡片、冷恢复后清陈旧卡片）。
                                        # 与 sandbox/mode 的区别同 sandbox/escalation：
                                        # 它是记录，不参与策略解析。
+TITLE = "session/title"                   # 会话标题（data: title + message_seqs + source）。
+                                         # **追加型日志事件，不是可变字段**——标题因此和
+                                         # 其它事实一样可重放：fold 取**最后一条**即当前标题
+                                         # （见 title_projection.fold_session_title）。
+                                         # **log-only**：不在 SURFACE_EVENT_TYPES 里，
+                                         # 永远不进模型输入，零 token、不影响前缀缓存。
+                                         # 三个来源（新的赢）：fallback（首条消息前导词）→
+                                         # provider（LLM 生成，至多一次）→ user（用户改名，
+                                         # **一旦改名即钉住**，后续不再自动改）。
+                                         # 写入方只有 title/service.py 一处。
 SANDBOX_ESCALATION = "sandbox/escalation"  # 沙箱升权的批准/拒绝事实（data: from +
                                            # requested + to + granted + reason + justification）
                                            # log-only **记录**事件——刻意不被任何投影折叠成配置：
