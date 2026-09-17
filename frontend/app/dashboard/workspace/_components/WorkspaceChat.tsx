@@ -90,6 +90,8 @@ export default function WorkspaceChat({ session, onTurnDone, uploading, uploadEr
   const { nodes: trajNodes, nodesRef, enqueue, forceFlush, reset } = useTrajectoryBatch();
   const [liveUsage, setLiveUsage] = useState<UsageRow[]>([]);
   const usageRef = useRef<UsageRow[]>([]);
+  // 停止生成：当前在飞的 SSE 请求（abort 它 = 服务端取消本轮）；null = 没有在跑的轮次
+  const stopRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   // 视口是否贴着底：决定新内容到达时跟不跟随（见下方 handleScroll）
@@ -181,6 +183,12 @@ export default function WorkspaceChat({ session, onTurnDone, uploading, uploadEr
 
   const liveAnsText = answerTextOf(trajNodes);
 
+  // 停止生成：断开 SSE 连接本身就是取消信号（服务端生成器关闭 → 取消本轮），
+  // 收尾（收正文、落气泡、清 sending）全在 handleSend 的 finally 里统一走
+  function handleStop() {
+    stopRef.current?.abort();
+  }
+
   async function handleSend(q: string) {
     if (!session || sending) return;
     const now = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
@@ -194,13 +202,19 @@ export default function WorkspaceChat({ session, onTurnDone, uploading, uploadEr
     let doneTrace: TraceSummary | undefined;
     let legacyThink = '';
     let legacyAns = '';
+    // 停止生成：abort 这次 fetch → 服务端连接断开 → AgentLoop 取消本轮（stop_reason=cancelled）。
+    // 只认自己发起的 abort（signal.aborted），避免把网络错误当成「用户停止」。
+    const controller = new AbortController();
+    stopRef.current = controller;
+    let stopped = false;
     try {
       // 两个 id 恒存在：会话一律先在空态经 POST /workspace/sessions 建好再进聊天
       const body: any = { question: q };
       if (session.conversation_id != null) body.conversation_id = session.conversation_id;
       if (session.session_id != null) body.session_id = session.session_id;
       const r = await fetch(`${API}/api/agents/${session.agent_key}/chat/stream`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', ...H }, body: JSON.stringify(body),
+        method: 'POST', headers: { 'Content-Type': 'application/json', ...H },
+        body: JSON.stringify(body), signal: controller.signal,
       });
       if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
       const reader = r.body.getReader();
@@ -260,13 +274,17 @@ export default function WorkspaceChat({ session, onTurnDone, uploading, uploadEr
         }
       }
     } catch {
-      finalAnswer = '请求失败，请稍后重试。';
+      stopped = controller.signal.aborted;
+      // 主动停止不是失败：不说「请求失败」，已收到的正文照常留在气泡里
+      if (!stopped) finalAnswer = '请求失败，请稍后重试。';
     } finally {
+      if (stopRef.current === controller) stopRef.current = null;
       forceFlush();
       setSending(false);
       const nodes = nodesRef.current;
       const ansText = answerTextOf(nodes);
-      const content = finalAnswer || ansText || legacyAns || '抱歉，暂时无法处理。';
+      const content = finalAnswer || ansText || legacyAns
+        || (stopped ? '已停止生成。' : '抱歉，暂时无法处理。');
       setMessages(prev => [...prev, {
         role: 'agent', content,
         time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
@@ -413,6 +431,7 @@ export default function WorkspaceChat({ session, onTurnDone, uploading, uploadEr
           <Composer
             disabled={!session || sending}
             sending={sending}
+            onStop={handleStop}
             uploading={uploading}
             uploadError={uploadError}
             onSend={handleSend}

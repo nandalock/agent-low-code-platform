@@ -9,7 +9,9 @@
 // 28px 胶囊 chip + 浮层菜单，与参考实现的 PermissionSelect 对齐。
 //
 // 模型选择：占位（后端无每会话模型切换，禁用态显示当前模型名）。
-// 停止生成：占位（后端 run cancel 待补），发送中显示为禁用按钮。
+// 停止生成：发送中显示为可点的方块键 —— 前端 abort SSE fetch → 服务端连接断开 →
+// AgentLoop 收到取消信号，在下一个检查点收口（stop_reason=cancelled），
+// 已产出的正文保留。不需要额外的取消端点，断开本身就是取消。
 
 import { useRef, useState } from 'react';
 import { Plus, ArrowUp, Square, Loader2, ShieldCheck, ChevronDown, Check } from 'lucide-react';
@@ -22,6 +24,7 @@ interface Props {
   uploading: boolean;
   uploadError: string | null;
   onSend: (text: string) => void;
+  onStop: () => void;
   onUpload: (files: File[]) => void;
   sandboxMode: string;        // effective
   onModeChange: (mode: string) => void;
@@ -36,7 +39,7 @@ const MODE_HINTS: Record<string, string> = {
   'danger-full-access': '不限制，可读写挂载进来的任意目录',
 };
 
-export default function Composer({ disabled, sending, uploading, uploadError, onSend, onUpload, sandboxMode, onModeChange }: Props) {
+export default function Composer({ disabled, sending, uploading, uploadError, onSend, onStop, onUpload, sandboxMode, onModeChange }: Props) {
   const [text, setText] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -153,9 +156,10 @@ export default function Composer({ disabled, sending, uploading, uploadError, on
           </span>
 
           {sending && (
-            <button title="停止生成（后端待支持）" disabled
+            /* 危险动作配色（方块 = 停止），与发送键同形以便原地切换不跳动 */
+            <button onClick={onStop} title="停止生成"
               className="ws-btn-solid ws-round"
-              style={{ ...circleBtn, color: W.dimmed }}>
+              style={{ ...circleBtn, color: W.danger }}>
               <Square size={12} />
             </button>
           )}
