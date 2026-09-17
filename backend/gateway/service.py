@@ -14,6 +14,7 @@ agent 每次都从注册表现查，不缓存业务对象（DSH: resolve from re
 
 错误只抛 gateway/errors 定义的领域错误，通道层负责翻译。
 """
+import asyncio
 import logging
 from collections.abc import Callable
 
@@ -48,13 +49,15 @@ class AgentGateway:
         question: str,
         on_event: EventSink | None = None,
         session_event_sink: Callable[[SessionEvent], None] | None = None,
+        cancel: asyncio.Event | None = None,
     ) -> AgentReply:
         """运行入口：身份校验 → 解析目标 → 调 AgentRuntime.reply()。
 
         参数形状与各 Agent.reply 的既有约定保持一致：
         context / session_id 所有已注册 Agent 都接受；
-        on_event / session_event_sink 仅 AgentRuntime 系支持 —— 有 sink 才传入，
-        行为与既有调用完全等价。Gateway 只做透传，不解释事件语义。
+        on_event / session_event_sink / cancel 仅 AgentRuntime 系支持 —— 有才传入，
+        行为与既有调用完全等价。Gateway 只做透传，不解释事件语义、也不持有取消信号
+        （信号的持有方是驱动方：HTTP 通道在客户端断开时 set）。
         """
         if not isinstance(rctx, RequestContext):
             raise InvalidGatewayContext("chat() 必须接收 RequestContext")
@@ -63,7 +66,7 @@ class AgentGateway:
 
         agent = self.resolve(rctx.agent_key)
 
-        if on_event is None and session_event_sink is None:
+        if on_event is None and session_event_sink is None and cancel is None:
             return await agent.reply(
                 rctx.tenant_id, question,
                 context=rctx.context, session_id=rctx.session_id,
@@ -73,4 +76,5 @@ class AgentGateway:
             context=rctx.context, session_id=rctx.session_id,
             on_event=on_event,
             session_event_sink=session_event_sink,
+            cancel=cancel,
         )

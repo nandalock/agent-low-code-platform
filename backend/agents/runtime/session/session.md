@@ -119,7 +119,7 @@ Store 与 Persistence 都不感知对方：`store.get()` 只查内存，冷恢�
 |---|---|---|
 | **surface**（进 LLM） | `user/message` · `assistant/message` · `tool/result` | `derive_messages()` |
 | **过程**（log-only） | `turn/start` · `turn/end` · `step/start` · `step/end` · `assistant/chunk` · `tool/call` · `tool/progress` | UI 流式投影 / trace |
-| **观测**（log-only） | `llm/usage` | trace 聚合、缓存命中率 |
+| **观测**（log-only） | `llm/usage` · `llm/error` | trace 聚合、缓存命中率；失败尝试（重试是事实，可回放） |
 | **配置**（log-only） | `sandbox/mode` | `sandbox_projection` 折叠出当前有效覆盖 |
 | **记录**（log-only） | `approval/request` · `sandbox/escalation` | 可查，**不参与策略解析** |
 | **退役** | `session/seed` | 类型保留供内存构造，冷恢复丢弃 |
@@ -141,6 +141,13 @@ session = Session.from_events(header, events)   # 纯内存，不涉及存储
   system 消息（语义重复，且旧 persona 可能已被改过）
 - 丢弃是**既不入 log 也不入 surface**——留着只会在每次 flush 时把死事件重新写库
 - 冷恢复是唯一收口点：进程重启后 SessionStore 热区为空，存量会话必走此路径
+
+紧接着还有一步**语义修复**（`repair.py` 的 `interrupted_turn_closers` → `append_recovered`）：
+持久化只保证日志**物理**合法，上一轮若被中断（进程没了），库里可能留下没有 `turn/end`
+的 turn、或永远等不到结果的 `tool_calls`。装配层（`AgentRuntime._repair_interrupted_tail`）
+补合成 `tool/result`（结论如实写「结果未知 / 未执行」，不假装成功）、`step/end`、
+`turn/end`，seq 续在末尾、**time 复用中断那一刻**（用恢复时的钟会把陈年崩溃渲染成巨大 latency）。
+补记的事件随下一次 flush 落库，`stop_reason=interrupted`（与 `cancelled` 区分：前者是进程没了，后者是有人让它停）。
 
 ### 持久化边界
 

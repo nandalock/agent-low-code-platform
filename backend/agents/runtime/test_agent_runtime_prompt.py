@@ -30,11 +30,18 @@ captured: list[dict] = []
 
 
 class _FakeResp:
+    """假 aiohttp 响应：status/headers 是 AgentLoop 判失败码要读的字段，必须照实提供"""
+
     def __init__(self, payload: dict):
         self._payload = payload
+        self.status = 200
+        self.headers: dict = {}
 
     async def json(self):
         return self._payload
+
+    async def text(self):
+        return json.dumps(self._payload)
 
     async def __aenter__(self):
         return self

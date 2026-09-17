@@ -4,7 +4,7 @@
   - surface 事件（进入 LLM Context）: user/message, assistant/message, tool/result
     （session/seed 亦在集合内，但已退役、无写入方——见 SEED 注释）
   - 过程事件（仅 Event Log，不进入 LLM）: turn/start, step/start, assistant/chunk,
-    tool/call, tool/progress, step/end, turn/end, llm/usage, session/title
+    tool/call, tool/progress, step/end, turn/end, llm/usage, llm/error, session/title
 
 system prompt 不进 Event Log：它由 SystemPrompt 每轮组装，在 AgentLoop 派生 LLM
 消息时前置为 messages[0]。session_headers.seed_length 是 seed 机制的历史字段，
@@ -33,6 +33,11 @@ TOOL_PROGRESS = "tool/progress"  # 长耗时 Tool 的阶段进度（data: tool +
                                  # 过程事件（log-only），不进 surface / 不参与 derive_messages
 LLM_USAGE = "llm/usage"   # 每次 LLM 调用的 usage（provider 返回；data: step + prompt/cache token 统计），
                           # log-only 观测事件（Step 1），不进 surface / 不参与 derive_messages
+LLM_ERROR = "llm/error"   # 一次**失败**的 LLM 尝试（data: step + attempt + code + status +
+                          # message + retry_in）。对齐 A 的 assistant/attempt：重试是事实，
+                          # 该能在 Event Log 里回放（问了几次、为什么重试、等了多久），
+                          # 而不是只存在于应用日志文本里。log-only：失败的尝试没有产出任何
+                          # LLM 可见内容，不进 surface / 不参与 derive_messages
 SANDBOX_MODE = "sandbox/mode"  # 会话级沙箱模式覆盖（data: mode），log-only 配置事件：
                                # 「日志即存储」——SandboxModeProjection 折叠出当前有效覆盖，
                                # 生效值 = 覆盖 ?? 部署默认（见 tool_system/sandbox/policy.py）

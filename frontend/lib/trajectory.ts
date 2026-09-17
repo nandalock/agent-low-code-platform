@@ -225,6 +225,9 @@ export const STOP_REASON_LABELS: Record<string, string> = {
   max_wall_time: '超时停止',
   repeat_tool: '重复调用停止',
   tool_timeout: '工具超时停止',
+  max_tokens: '输出被截断停止',
+  cancelled: '已手动停止',
+  interrupted: '上次运行中断',
 };
 
 export function stopReasonLabel(reason?: string | null): string {

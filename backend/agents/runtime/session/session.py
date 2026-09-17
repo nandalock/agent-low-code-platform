@@ -139,6 +139,21 @@ class Session:
                 logger.exception(f"Session listener 异常（事件 {type} seq={event.seq}），已隔离")
         return event
 
+    def append_recovered(self, events: list[SessionEvent]) -> None:
+        """恢复期补记**修复事件**（seq / time 由修复器按中断点推得，这里不再重写）。
+
+        唯一的非 append() 写入口，只给冷恢复的语义修复用（见 repair.py）。为什么不能走
+        ``append()``：那条路会把 seq 续在末尾、把 time 记成「现在」—— 而合成事件属于
+        **中断发生的那一刻**，用恢复时的钟会把「两天前那次崩溃」渲染成一段巨大的 latency。
+
+        与 ``from_events`` 同规：不广播 listener（重建期没有订阅者，广播只会让「重放不回放
+        listener」这条约定出现例外）。
+        """
+        for ev in events:
+            self._log.append(ev)
+            self._surface.append(ev)
+            self._seq = max(self._seq, ev.seq)
+
     # ── 重建 ──
 
     @classmethod

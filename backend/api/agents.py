@@ -398,9 +398,35 @@ async def agent_chat_stream(
             for uev in projector.handle(ev):
                 queue.put_nowait(uev)
 
+        # 取消信号：生成器被关闭 = 客户端断开（关标签页 / 前端 abort fetch）→ set 信号，
+        # Agent 在下一个检查点收口成 stop_reason=cancelled 的**正常结束**（不是异常），
+        # 于是下面的 flush / 消息落库照常执行：停下来的一轮也留得下事实。
+        cancel = asyncio.Event()
         task = asyncio.create_task(
-            gateway.chat(rctx, body.question, on_event=on_event, session_event_sink=on_session_event),
+            gateway.chat(
+                rctx, body.question,
+                on_event=on_event, session_event_sink=on_session_event, cancel=cancel,
+            ),
         )
+
+        def _persist(reply) -> None:
+            """落库 agent 回复：写回 conversation → session 映射 + 消息（thinking 进 metadata）"""
+            if reply.session_id:
+                chat_service.save_conversation_session_id(x_tenant_id, conv.id, reply.session_id)
+            thinking = "".join(thinking_parts)[:6000]  # 截断保护
+            chat_service.create_message(
+                x_tenant_id, conv.id,
+                chat_service.MessageCreate(
+                    role="agent",
+                    sender_name=agent.name,
+                    content=reply.answer,
+                    metadata={
+                        "tier": reply.tier, "sources": reply.sources, "trace": reply.trace,
+                        "thinking": thinking or None,
+                    },
+                ),
+            )
+
         try:
             while True:
                 try:
@@ -423,28 +449,36 @@ async def agent_chat_stream(
                 if ev.get("type") == "done":
                     break
         finally:
-            # 落库 agent 回复（done 事件后 reply 已完成），思考过程持久化到 metadata
+            # 生成器被关闭（客户端断开 / 前端 abort fetch）= 取消本轮：**同步** set 信号。
+            # Agent 跑在独立的 task 里，它会在下一个检查点收口成 stop_reason=cancelled 的
+            # 正常结束，并由它自己完成 flush（被停止的这轮照样留下事件事实）。
+            #
+            # 这里**刻意不 await task**：断开时外层生成器任务正被取消，而它正等在这个 task
+            # 上 —— asyncio 的 Task.cancel() 会连被等待的任务一起取消（_fut_waiter 就是它），
+            # 协作取消会被换成硬取消，还会多出 "ASGI callable returned without completing
+            # response" 的噪音。同步 set 已经把取消送达，收尾交给下面两条路。
+            cancel.set()
             try:
                 reply = task.result()
             except Exception:
+                # 任务仍在跑（断开，本轮已被取消）或已异常：回复不写进 conversation，
+                # 但轨迹/事件仍在 Session Event Log 里（由 Agent 那边 flush）
                 reply = None
+
             if reply is not None:
-                # 写回 conversation → session 映射：SSE 轮次同样维护，历史会话冷恢复靠它
-                if reply.session_id:
-                    chat_service.save_conversation_session_id(x_tenant_id, conv.id, reply.session_id)
-                thinking = "".join(thinking_parts)[:6000]  # 截断保护
-                chat_service.create_message(
-                    x_tenant_id, conv.id,
-                    chat_service.MessageCreate(
-                        role="agent",
-                        sender_name=agent.name,
-                        content=reply.answer,
-                        metadata={
-                            "tier": reply.tier, "sources": reply.sources, "trace": reply.trace,
-                            "thinking": thinking or None,
-                        },
-                    ),
-                )
+                _persist(reply)
+            elif not task.done():
+                # 被停止的这一轮还没收完口：挂个完成回调补写，别让它刷新后就从对话历史里
+                # 消失（协作取消是毫秒级的，回调马上就会跑）。回调是同步的 —— 不在收尾路径
+                # 上阻塞，也不与连接的取消语义纠缠。
+                def _persist_later(t) -> None:
+                    if t.cancelled():
+                        return
+                    try:
+                        _persist(t.result())
+                    except Exception:
+                        return   # 异常收场：不写消息（与上面的 reply=None 同义）
+                task.add_done_callback(_persist_later)
 
     return StreamingResponse(
         event_gen(),

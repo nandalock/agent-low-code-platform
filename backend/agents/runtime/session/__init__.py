@@ -27,6 +27,7 @@ from backend.agents.runtime.session.events import (
     APPROVAL_REQUEST,
     ASSISTANT_CHUNK,
     ASSISTANT_MESSAGE,
+    LLM_ERROR,
     LLM_USAGE,
     SANDBOX_ESCALATION,
     SANDBOX_MODE,
@@ -51,6 +52,12 @@ from backend.agents.runtime.session.persistence import (
     flush_session_events,
     get_session_persistence,
     set_session_persistence,
+)
+from backend.agents.runtime.session.repair import (
+    STOP_REASON_INTERRUPTED,
+    TOOL_NOT_STARTED,
+    TOOL_OUTCOME_UNKNOWN,
+    interrupted_turn_closers,
 )
 from backend.agents.runtime.session.session import Session
 from backend.agents.runtime.session.store import SessionStore, get_session_store
@@ -83,6 +90,11 @@ __all__ = [
     "SurfaceManager",
     "SessionStore",
     "get_session_store",
+    # ── 崩溃修复（冷恢复补合成闭合事件）──
+    "interrupted_turn_closers",
+    "STOP_REASON_INTERRUPTED",
+    "TOOL_NOT_STARTED",
+    "TOOL_OUTCOME_UNKNOWN",
     # ── 持久化 seam ──
     "SessionPersistence",
     "NoopPersistence",
@@ -118,6 +130,7 @@ __all__ = [
     "ASSISTANT_CHUNK",
     "ASSISTANT_MESSAGE",
     "LLM_USAGE",
+    "LLM_ERROR",
     "APPROVAL_REQUEST",
     "SANDBOX_ESCALATION",
     "SANDBOX_MODE",
