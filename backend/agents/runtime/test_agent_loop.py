@@ -15,6 +15,7 @@ Usage:
 """
 import asyncio
 import json
+import logging
 import os
 import sys
 
@@ -24,6 +25,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 from backend.agents.runtime import agent_loop as loop_mod  # noqa: E402
 from backend.agents.runtime.agent_loop import CANCELLED_REPLY, AgentLoop  # noqa: E402
+from backend.agents.runtime.llm import LoopHooks, RetryDecision  # noqa: E402
+from backend.agents.runtime.llm import retry as retry_mod  # noqa: E402
 from backend.agents.runtime.session import (  # noqa: E402
     ASSISTANT_MESSAGE,
     LLM_ERROR,
@@ -199,7 +202,7 @@ _TOOL_SCHEMA = {
 }
 
 
-def _loop(*, session=None, config=None, llm_params=None, on_event=None, tool_schemas=None):
+def _loop(*, session=None, config=None, llm_params=None, on_event=None, tool_schemas=None, hooks=None):
     session = session if session is not None else Session()
     cfg = {"api_key": "k", "base_url": "http://fake", "model": "m", **(config or {})}
     params = {
@@ -208,7 +211,7 @@ def _loop(*, session=None, config=None, llm_params=None, on_event=None, tool_sch
     }
     loop = AgentLoop(
         key="test_agent", config=cfg, llm_params=params, tool_schemas=tool_schemas or [],
-        tenant_id=1, system_prompt="", on_event=on_event, session=session,
+        tenant_id=1, system_prompt="", on_event=on_event, session=session, hooks=hooks,
     )
     return loop, session
 
@@ -500,15 +503,57 @@ def test_empty_response_is_treated_as_retryable_failure():
 
 def test_retry_delay_is_bounded_and_honors_retry_after():
     """退避：指数增长、上限截断、抖动有界、Retry-After 取较大者"""
-    old = loop_mod.LLM_RETRY_INITIAL_DELAY
-    loop_mod.LLM_RETRY_INITIAL_DELAY = 0.5
+    old = retry_mod.LLM_RETRY_INITIAL_DELAY
+    retry_mod.LLM_RETRY_INITIAL_DELAY = 0.5
     try:
-        assert 0.45 <= loop_mod._retry_delay(0) <= 0.55          # 500ms ± 10%
-        assert 1.8 <= loop_mod._retry_delay(2) <= 2.2            # 2s ± 10%
-        assert 9.0 <= loop_mod._retry_delay(9) <= 11.0           # 上限 10s（不再翻倍）
-        assert 2.7 <= loop_mod._retry_delay(0, retry_after=3.0) <= 3.3   # 认对端建议
+        assert 0.45 <= retry_mod.retry_delay(0) <= 0.55          # 500ms ± 10%
+        assert 1.8 <= retry_mod.retry_delay(2) <= 2.2            # 2s ± 10%
+        assert 9.0 <= retry_mod.retry_delay(9) <= 11.0           # 上限 10s（不再翻倍）
+        assert 2.7 <= retry_mod.retry_delay(0, retry_after=3.0) <= 3.3   # 认对端建议
     finally:
-        loop_mod.LLM_RETRY_INITIAL_DELAY = old
+        retry_mod.LLM_RETRY_INITIAL_DELAY = old
+
+
+# ── 拦截通道（hooks.request_error）──
+
+
+def test_request_error_hook_overrides_builtin_policy():
+    """钩子说了算：401（CLIENT，内置策略本不重试）被钩子放行，重试后成功"""
+    calls: list[tuple[str, int]] = []
+
+    async def hook(error, attempt):
+        calls.append((error.code, attempt))
+        return RetryDecision(delay=0.0, reason="放行") if attempt == 0 else None
+
+    http = _install([_status(401), _answer("钩子放行后成功")])
+    loop, session = _loop(hooks=LoopHooks(request_error=hook))
+
+    assert _run(loop) == "钩子放行后成功"
+
+    assert calls == [("CLIENT", 0)]                  # 只问过一次：第二次钩子自己拒了
+    assert len(http.requests) == 2
+    assert [d["code"] for d in _errors(session)] == ["CLIENT"]
+    assert _stop_reason(session) == "completed"
+    _assert_closed(session)
+
+
+def test_request_error_hook_failure_falls_back_to_builtin_policy():
+    """钩子抛异常：记 exception 后按默认策略继续 —— 拦截器坏掉不打死执行链（规矩 1）"""
+    async def broken_hook(error, attempt):
+        raise RuntimeError("钩子坏了")
+
+    http = _install([_status(429, retry_after=0), _answer("默认策略兜住了")])
+    loop, session = _loop(hooks=LoopHooks(request_error=broken_hook))
+
+    logging.disable(logging.CRITICAL)                # 这条路的 logger.exception 是预期输出
+    try:
+        assert _run(loop) == "默认策略兜住了"
+    finally:
+        logging.disable(logging.NOTSET)
+
+    assert len(http.requests) == 2                   # 429 可重试，默认策略放了行
+    assert [d["code"] for d in _errors(session)] == ["RATE_LIMIT"]
+    assert _stop_reason(session) == "completed"
 
 
 # ── 流式路径 ──
@@ -823,8 +868,8 @@ def test_cancel_signal_does_not_swallow_llm_failure():
 
 
 def main() -> int:
-    # 自检不做真实等待：退避压到 0（_retry_delay 的边界本身由用例单独钉）
-    loop_mod.LLM_RETRY_INITIAL_DELAY = 0.0
+    # 自检不做真实等待：退避压到 0（retry_delay 的边界本身由用例单独钉）
+    retry_mod.LLM_RETRY_INITIAL_DELAY = 0.0
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_")]
     failed = 0
     for name, fn in tests:

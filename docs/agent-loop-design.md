@@ -115,11 +115,20 @@ POST /api/agents/{agent_key}/chat/steer
 |---|---|---|---|
 | `pre_step` | `(view) -> PreStepDecision` | 继续（`{"kind": "enter"}`） | 拒答 / 改写本步输入（合规拦截、注入系统侧上下文） |
 | `request` | `(view) -> dict` | 原样发送 | 改 payload：模型路由、max_tokens 动态升级、工具集裁剪 |
-| `request_error` | `(err, attempt) -> bool` | `RETRYABLE_CODES` + `max_llm_retries` | 重试策略外置（现有策略成为第一个内置消费者） |
+| `request_error` | `(err, attempt) -> RetryDecision \| None` | `RETRYABLE_CODES` + `max_llm_retries` | 重试策略外置（现有策略成为第一个内置消费者） |
 | `turn_stopping` | `(view) -> str \| None` | 收口 | 返回文本 = 注入一条用户消息**继续本轮**（"截断后自动续写"挂这里，Phase 1 商定） |
 
 `hooks` 是**一个 dataclass，每点至多一个可调用对象**（None = 现行为）。B 没有 Cordis 的
 waterfall 洋葱模型，也不需要：多元件要接同一点时，由装配方自己组合。
+
+`request_error` 的返回值**不是 bool 而是决策对象**（`RetryDecision(delay, reason)` /
+None = 放弃）：这样「等多久」和「重不重试」一起外置 —— 否则改退避曲线仍要动
+agent_loop.py，解耦只做了一半。对齐 A 的 `RequestErrorAction`（`{kind:'retry'}` /
+`undefined`），只是把 delay 从策略内部提到了契约上。
+
+**留在 Loop 的两件事**（刻意不外置）：① 循环、`asyncio.sleep`、落 `llm/error` 事实；
+② 截止约束 —— 退避等待不得突破 `max_wall_time`，因为只有 Loop 知道本轮还剩多少时间，
+策略不该猜。
 
 ### 6.3 硬规矩（这些是契约的一部分）
 
@@ -138,6 +147,16 @@ waterfall 洋葱模型，也不需要：多元件要接同一点时，由装配�
 2. **steer 端点**（§5 决策定了之后）：队列事件 + 投影 + 认领 + UI 上屏
 3. **hooks 契约实现**：先做 `request_error`（把现有重试策略搬过去当第一个消费者），
    再用 `turn_stopping` 做"截断后自动续写"验证契约够用
+
+   → `request_error` **已落地**，收在 `backend/agents/runtime/llm/` 子包（对齐 A 的
+   `packages/llm/`：策略与契约独立成包，执行留在循环）：契约在 `llm/hooks.py`
+   （`LoopHooks` / `RetryDecision`），内置策略在 `llm/retry.py`（`retry_delay` /
+   `make_retry_policy`），失败类型与分类在 `llm/errors.py`（`LlmError` / 失败码 /
+   响应校验），门面是 `llm/__init__.py`。agent_loop.py 只剩执行：发请求、
+   收 LlmError、问钩子、按裁决睡、落事实 —— 里头再也搜不到 RETRYABLE_CODES 或退避常数。
+   验证：`test_agent_loop.py` 的 `test_request_error_hook_overrides_builtin_policy`
+   （钩子放行本不重试的 401）与 `test_request_error_hook_failure_falls_back_to_builtin_policy`
+   （钩子抛异常 → 回落默认策略，规矩 1）。
 
 ## 7. 与已落地部分的关系
 
