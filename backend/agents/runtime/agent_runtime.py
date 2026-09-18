@@ -19,8 +19,9 @@ import aiohttp
 
 from backend.agents.base import BaseAgent, AgentReply
 from backend.agents.config_service import get_agent_definition, get_agent_config
-from backend.agents.runtime.agent_loop import DEFAULT_MAX_LLM_RETRIES, AgentLoop
+from backend.agents.runtime.agent_loop import AgentLoop
 from backend.agents.runtime.events import EventSink
+from backend.agents.runtime.llm import DEFAULT_MAX_LLM_RETRIES
 from backend.agents.runtime.session import (
     Session,
     SessionEvent,
