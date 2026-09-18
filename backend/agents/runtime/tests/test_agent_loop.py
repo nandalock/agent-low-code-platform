@@ -9,9 +9,9 @@ mock 掉 LLM HTTP（agent_loop.get_http_session），不连 DB / 网络 / MCP：
   3. 失败的尝试不落 surface 事实 —— 重试后 Event Log 里没有半截 assistant。
 
 Usage:
-    docker compose exec backend python backend/agents/runtime/test_agent_loop.py
+    docker compose exec backend python backend/agents/runtime/tests/test_agent_loop.py
     # 或本机（仓库根目录下）：
-    python backend/agents/runtime/test_agent_loop.py
+    python backend/agents/runtime/tests/test_agent_loop.py
 """
 import asyncio
 import json
@@ -21,12 +21,12 @@ import sys
 
 import aiohttp
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 
-from backend.agents.runtime import agent_loop as loop_mod  # noqa: E402
-from backend.agents.runtime.agent_loop import CANCELLED_REPLY, AgentLoop  # noqa: E402
 from backend.agents.runtime.llm import LoopHooks, RetryDecision  # noqa: E402
 from backend.agents.runtime.llm import retry as retry_mod  # noqa: E402
+from backend.agents.runtime.loop import agent_loop as loop_mod  # noqa: E402
+from backend.agents.runtime.loop.agent_loop import CANCELLED_REPLY, AgentLoop  # noqa: E402
 from backend.agents.runtime.session import (  # noqa: E402
     ASSISTANT_MESSAGE,
     LLM_ERROR,
@@ -36,8 +36,8 @@ from backend.agents.runtime.session import (  # noqa: E402
     TOOL_RESULT,
     TURN_END,
     Session,
+    SessionToolRecorder,
 )
-from backend.agents.runtime.session_tool_recorder import SessionToolRecorder  # noqa: E402
 from backend.tool_system.registry.descriptor import PARALLEL  # noqa: E402
 from backend.tool_system.runtime.scheduler import (  # noqa: E402
     ABORTED_STARTED_MESSAGE,

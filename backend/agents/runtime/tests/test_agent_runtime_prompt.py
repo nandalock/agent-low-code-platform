@@ -7,18 +7,18 @@
 LLM 调用被 monkeypatch 拦截。
 
 Usage:
-    docker compose exec backend python backend/agents/runtime/test_agent_runtime_prompt.py
+    docker compose exec backend python backend/agents/runtime/tests/test_agent_runtime_prompt.py
 """
 import asyncio
 import json
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 
-from backend.agents.runtime import agent_loop as loop_mod  # noqa: E402
 from backend.agents.runtime import agent_runtime as runtime_mod  # noqa: E402
 from backend.agents.runtime.agent_runtime import AgentRuntime  # noqa: E402
+from backend.agents.runtime.loop import agent_loop as loop_mod  # noqa: E402
 from backend.agents.runtime.session import (  # noqa: E402
     NoopPersistence,
     get_session_title_service,

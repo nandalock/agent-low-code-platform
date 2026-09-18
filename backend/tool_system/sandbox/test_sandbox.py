@@ -1757,7 +1757,7 @@ def test_escalation_event_lands_in_session_log():
     from backend.agents.runtime.session import SessionStore
     from backend.agents.runtime.session.events import SANDBOX_ESCALATION
     from backend.agents.runtime.session.projections import project_sandbox_mode
-    from backend.agents.runtime.tool_event_sink import SessionToolEventSink
+    from backend.agents.runtime.session import SessionToolEventSink
 
     session = SessionStore().create()
     sink = SessionToolEventSink(session, "call_1")

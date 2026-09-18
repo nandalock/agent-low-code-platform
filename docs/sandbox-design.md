@@ -185,7 +185,7 @@ backend/tool_system/registry/descriptor.py      # + SandboxToolConfig / sandbox 
 backend/tool_system/registry/registry.py        # Provider 抽象：从所有来源收集工具
 backend/tool_system/registry/providers.py       # ToolProvider / MCPToolProvider / BuiltinToolProvider
 backend/tool_system/context/context.py          # + sandbox_policy（策略下传）
-backend/agents/runtime/agent_loop.py            # 解析策略 + 落地 SessionHeader.cwd
+backend/agents/runtime/loop/agent_loop.py       # 解析策略 + 落地 SessionHeader.cwd
 backend/api/mcp.py                              # 工具列表/详情含原生工具
 backend/main.py                                 # 装配：init_sandbox + 注册 bash/python
 docker-compose.yml / backend/Dockerfile         # socket + docker CLI + 工作区同路径挂载

@@ -22,7 +22,6 @@ from dataclasses import dataclass
 
 import aiohttp
 
-from backend.agents.runtime.events import EventSink
 from backend.agents.runtime.llm import (
     DEFAULT_MAX_LLM_RETRIES,
     LlmError,
@@ -36,6 +35,7 @@ from backend.agents.runtime.llm import (
     transport_failure,
     validate_response,
 )
+from backend.agents.runtime.loop.events import EventSink
 from backend.agents.runtime.session import (
     ASSISTANT_CHUNK,
     ASSISTANT_MESSAGE,
@@ -47,9 +47,9 @@ from backend.agents.runtime.session import (
     TURN_START,
     USER_MESSAGE,
     Session,
+    SessionToolEventSink,
+    SessionToolRecorder,
 )
-from backend.agents.runtime.session_tool_recorder import SessionToolRecorder
-from backend.agents.runtime.tool_event_sink import SessionToolEventSink
 from backend.core.http import get_http_session
 from backend.tool_system.context import ToolContext
 from backend.tool_system.runtime.scheduler import (

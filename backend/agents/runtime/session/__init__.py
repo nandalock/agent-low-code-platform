@@ -12,6 +12,10 @@ import X``，不必知道 X 落在哪个子包里。子包内部怎么分、文�
   title/                 会话标题（净化 + fold + 服务）
   tests/                 自检脚本
 
+本层另有 tool 事实出口两个文件（不属于上述分组，是 tool_system ↔ Event Log 的装配）：
+  tool_recorder.py       ToolScheduler 的调用事实出口（tool/call · tool/result 成对落库）
+  tool_event_sink.py     Tool 生命周期事件出口（进度入 Log，其余转发 UI 流）
+
 职责划分（与 DeepSeek Harness 一致）：
   Session               单个会话的事件管理（SessionStore 创建，AgentLoop 消费）
   SessionStore          进程内运行态 Session 的生命周期管理（内存热区，不感知存储）
@@ -81,6 +85,8 @@ from backend.agents.runtime.session.title import (
     normalize_session_title,
     truncate_title_utf8,
 )
+from backend.agents.runtime.session.tool_event_sink import SessionToolEventSink
+from backend.agents.runtime.session.tool_recorder import SessionToolRecorder
 
 __all__ = [
     # ── 核心 ──
@@ -139,4 +145,7 @@ __all__ = [
     "TOOL_PROGRESS",
     "TOOL_RESULT",
     "SURFACE_EVENT_TYPES",
+    # ── tool 事实出口（写 Event Log / 转发 UI）──
+    "SessionToolRecorder",
+    "SessionToolEventSink",
 ]

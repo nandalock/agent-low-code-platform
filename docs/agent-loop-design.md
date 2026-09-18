@@ -2,7 +2,7 @@
 
 > 状态：**待拍板**（本文只定契约与形态，不含实现；§5、§6.3 的决策定了再动手）
 > 参考：DeepSeek Harness `dsh-agent-loop`（`inbox.ts` 双队列 · `agent.ts` 四个 waterfall）· `dsh-agent`（事件契约）
-> 关联代码：`backend/agents/runtime/agent_loop.py` · `agent_runtime.py` · `backend/api/agents.py`
+> 关联代码：`backend/agents/runtime/loop/agent_loop.py` · `agent_runtime.py` · `backend/api/agents.py`
 > 前置：Phase 1（健壮性：finish_reason / 重试 / 闭合）· Phase 2（取消通道）已落地
 
 ## 1. 问题

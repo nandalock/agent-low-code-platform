@@ -260,7 +260,7 @@ system prompt 每次请求都完整发送，成本随内容增长（固定开销
 docker compose exec backend python backend/agents/runtime/system_prompt/test_system_prompt.py
 docker compose exec backend python backend/agents/runtime/system_prompt/test_platform_sections.py
 docker compose exec backend python backend/agents/runtime/session/test_session.py
-docker compose exec backend python backend/agents/runtime/test_agent_runtime_prompt.py
+docker compose exec backend python backend/agents/runtime/tests/test_agent_runtime_prompt.py
 ```
 
 （容器内没有 pytest，测试文件自带 `main()` 运行器 —— 与仓库其它测试一致。）
