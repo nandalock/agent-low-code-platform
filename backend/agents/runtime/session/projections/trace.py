@@ -22,14 +22,17 @@ from backend.agents.runtime.session.events import (
     TURN_END,
     TURN_START,
     SessionEvent,
+    usage_field,
 )
 
-# LLM_USAGE 事件 data 携带的 token 字段（per-step usage 投影固定取这 4 个）
+# LLM_USAGE 事件 data 携带的 token 字段（per-step usage 投影固定取这 4 个）。
+# 缓存字段是 **canonical 名**（cache_hit_tokens / cache_miss_tokens，见 llm/types.py
+# 的 TokenUsage）—— 存量事件里是 provider 名（prompt_cache_*），用 usage_field 兼容读。
 _USAGE_KEYS = (
     "prompt_tokens",
     "completion_tokens",
-    "prompt_cache_hit_tokens",
-    "prompt_cache_miss_tokens",
+    "cache_hit_tokens",
+    "cache_miss_tokens",
 )
 
 
@@ -48,8 +51,8 @@ class TraceProjection:
         self._step_start_time: float | None = None
         self._tool_calls: dict[str, dict] = {}  # tool_call_id → {tool, args, time}
         self._usage_calls = 0                   # 聚合：LLM_USAGE 事件数
-        self._usage_hits = 0                    # 聚合：prompt_cache_hit_tokens 和
-        self._usage_misses = 0                  # 聚合：prompt_cache_miss_tokens 和
+        self._usage_hits = 0                    # 聚合：cache_hit_tokens 和（兼容旧事件名）
+        self._usage_misses = 0                  # 聚合：cache_miss_tokens 和
         self._stop_reason: str | None = None    # TURN_END data["stop_reason"]
 
     # ── 外部接口 ──
@@ -102,12 +105,13 @@ class TraceProjection:
         elif t == LLM_USAGE:
             # 聚合（复刻旧 usage 汇总：int(x or 0) + ratio 规则）
             self._usage_calls += 1
-            self._usage_hits += int(d.get("prompt_cache_hit_tokens") or 0)
-            self._usage_misses += int(d.get("prompt_cache_miss_tokens") or 0)
+            self._usage_hits += int(usage_field(d, "cache_hit_tokens", "prompt_cache_hit_tokens") or 0)
+            self._usage_misses += int(usage_field(d, "cache_miss_tokens", "prompt_cache_miss_tokens") or 0)
             # per-step：AgentLoop 保证 LLM_USAGE 紧跟同 step 的 assistant/message
+            usage = {k: usage_field(d, k, f"prompt_{k}") for k in _USAGE_KEYS}
             for entry in reversed(self._steps):
                 if entry.get("type") == "llm":
-                    entry["usage"] = {k: d.get(k) for k in _USAGE_KEYS}
+                    entry["usage"] = usage
                     break
         elif t == TURN_END:
             self._stop_reason = d.get("stop_reason")

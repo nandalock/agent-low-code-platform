@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..
 
 from backend.agents.runtime import agent_runtime as runtime_mod  # noqa: E402
 from backend.agents.runtime.agent_runtime import AgentRuntime  # noqa: E402
-from backend.agents.runtime.loop import agent_loop as loop_mod  # noqa: E402
+from backend.agents.runtime.llm import openai_chat as client_mod  # noqa: E402
 from backend.agents.runtime.session import (  # noqa: E402
     NoopPersistence,
     get_session_title_service,
@@ -60,11 +60,10 @@ class _FakeSession:
 
 
 def _install_fakes():
-    """拦截 LLM HTTP 调用（AgentLoop 与 AgentRuntime 各自 import 了 get_http_session）"""
+    """拦截 LLM HTTP 调用（patch 点是**适配器**：唯一 import get_http_session 的地方）"""
     captured.clear()
     fake = _async_return(_FakeSession())
-    runtime_mod.get_http_session = fake
-    loop_mod.get_http_session = fake
+    client_mod.get_http_session = fake
     set_session_persistence(NoopPersistence())
     store_mod._store = store_mod.SessionStore()  # 每个用例干净的 SessionStore
     # 标题服务的在飞状态也是进程级单例，同样每用例清一遍

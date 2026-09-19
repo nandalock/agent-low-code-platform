@@ -67,6 +67,23 @@ SANDBOX_ESCALATION = "sandbox/escalation"  # 沙箱升权的批准/拒绝事实�
 SURFACE_EVENT_TYPES = frozenset({SEED, USER_MESSAGE, ASSISTANT_MESSAGE, TOOL_RESULT})
 
 
+def usage_field(data: dict, *names: str):
+    """llm/usage 事件的 token 字段读取：按顺序取第一个**有值**的名字。
+
+    缓存字段归一后叫 cache_hit_tokens / cache_miss_tokens（canonical 名，见
+    llm/types.py 的 TokenUsage）；存量 Event Log 里落的还是 provider 名
+    （prompt_cache_hit_tokens / prompt_cache_miss_tokens）。读的一方两种都认 ——
+    投影既要能读今天写的事件，也要能读昨天写的事件。
+
+    ``0`` 是合法值（如一次调用完全没命中缓存），所以判据是 ``is not None`` 而不是真值。
+    """
+    for name in names:
+        value = data.get(name)
+        if value is not None:
+            return value
+    return None
+
+
 @dataclass
 class SessionEvent:
     """一条 Session 执行事实。data 结构由事件类型约定（见各 append 调用点）。"""

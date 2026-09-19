@@ -15,11 +15,14 @@ import logging
 import time
 from collections.abc import Callable
 
-import aiohttp
-
 from backend.agents.base import BaseAgent, AgentReply
 from backend.agents.config_service import get_agent_definition, get_agent_config
-from backend.agents.runtime.llm import DEFAULT_MAX_LLM_RETRIES
+from backend.agents.runtime.llm import (
+    DEFAULT_MAX_LLM_RETRIES,
+    LlmRequest,
+    LoopHooks,
+    OpenAiChatClient,
+)
 from backend.agents.runtime.loop import AgentLoop
 from backend.agents.runtime.loop.events import EventSink
 from backend.agents.runtime.session import (
@@ -37,7 +40,6 @@ from backend.agents.runtime.system_prompt import (
     assemble,
     render_system_prompt,
 )
-from backend.core.http import get_http_session
 from backend.tool_system.runtime.scheduler import DEFAULT_MAX_PARALLEL_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -146,16 +148,24 @@ class AgentRuntime(BaseAgent):
         tool_schemas = [t.to_openai() for t in assembly.tools]
 
         # 准备运行环境，创建并驱动 AgentLoop（执行循环在 Loop 内部；Session 与
-        # 组装好的 system prompt 由 Runtime 注入）
+        # 组装好的 system prompt 由 Runtime 注入）。
+        # LLM 出口按契约注入（llm/client.py）：Loop 只发 canonical 请求，端点/凭据/HTTP
+        # 全在客户端后面 —— 换 provider = 在这里换一个客户端，循环一行不改。
+        llm = self._llm_client(config)
         loop = AgentLoop(
             key=self.key,
-            config=config,
             llm_params=self._llm_params(config),
+            llm=llm,
+            model=config.get("model", "") or "",
+            fallback_reply=config.get("fallback_reply", "") or "",
             tool_schemas=tool_schemas,
             tenant_id=tenant_id,
             system_prompt=system_prompt,
             on_event=on_event,
             session=session,
+            # provider 声明的默认重试策略（对齐 A：策略归 provider、执行归循环）。
+            # 装配方要换策略，传自己的 LoopHooks 进来即可 —— 这里只兜「没人给」的情况。
+            hooks=LoopHooks(request_error=llm.retry_policy),
         )
 
         # 派生消费者装配：TraceProjection（→ AgentReply.trace / done.trace）与
@@ -169,7 +179,7 @@ class AgentRuntime(BaseAgent):
         if attached_sink:
             session.add_listener(session_event_sink)
         try:
-            answer = await loop.run(question, context, cancel=cancel)
+            answer = await self._drive(loop, question, cancel)
         finally:
             session.remove_listener(projection.handle)
             if attached_sink:
@@ -253,6 +263,49 @@ class AgentRuntime(BaseAgent):
             logger.exception(f"AgentRuntime [{self.key}] Session {session_id} 崩溃修复失败（按原样继续）")
             return 0
 
+    async def _drive(self, loop: AgentLoop, question: str, cancel: asyncio.Event | None) -> str:
+        """事件驱动的三段式：**投递 → 等 driver 收敛 → 取答案**（Loop 没有一次性入口）。
+
+        投递是同步的（不等待），等待是显式的，答案从 Event Log 的投影里取 —— 中间那段时间
+        正是运行中输入的窗口（steer / inject 随时可以并进来）。
+
+        ``cancel`` 是外部取消信号（SSE 连接断开即 set）：起一个转发任务把它搬成
+        ``loop.cancel`` —— 取消的语义（清队列 + 置本轮 abort 信号）归 Loop，这里只做搬运。
+        转发任务在本次运行结束时撤销（它等的信号可能永远不来）。
+        """
+        bridge = None
+        if cancel is not None:
+            bridge = asyncio.create_task(self._bridge_cancel(loop, cancel))
+        try:
+            loop.followup(question)
+            await loop.when_idle()
+        finally:
+            if bridge is not None:
+                bridge.cancel()      # 不 await：被取消的一方没有收尾要等
+        return loop.answer_text()
+
+    @staticmethod
+    async def _bridge_cancel(loop: AgentLoop, cancel: asyncio.Event) -> None:
+        """外部信号 → ``loop.cancel``：只停这一轮，不动待投递队列。
+
+        ``keep_inbox=True`` 是刻意的：队列归投递方所有，这里只负责「叫停」，不该顺手
+        丢弃别人还没投出去的东西。
+        """
+        await cancel.wait()
+        loop.cancel("外部信号（连接断开）", keep_inbox=True)
+
+    def _llm_client(self, config: dict) -> OpenAiChatClient:
+        """本 agent 的 LLM 客户端：端点 + 凭据 + provider 声明的默认重试策略。
+
+        **凭据只在这里被搬运，不进循环** —— 循环拿到的是一个 LlmClient，它自己不认识
+        api_key / base_url（见 backend/agents/runtime/llm/client.py）。
+        """
+        return OpenAiChatClient(
+            api_key=config.get("api_key", "") or "",
+            base_url=config.get("base_url", "") or "",
+            max_llm_retries=self._llm_params(config)["max_llm_retries"],
+        )
+
     def _llm_params(self, config: dict) -> dict:
         """运行参数（LLM 调用 + 防失控限制），全部从 agent 配置读取，默认值=现行为（零破坏）"""
         return {
@@ -271,24 +324,26 @@ class AgentRuntime(BaseAgent):
         }
 
     async def _call_llm_plain(self, messages: list[dict], config: dict) -> tuple[str, bool]:
-        """简单 LLM 调用（无 tools），FaqAgent RAG 用（非 Agent 循环，留在 Runtime）"""
-        api_key = (config.get("api_key", "") or "").strip()
-        base_url = (config.get("base_url", "") or "").strip()
+        """简单 LLM 调用（无 tools），FaqAgent RAG 用（非 Agent 循环，留在 Runtime）。
+
+        走的是同一个客户端：凭据、端点、失败分类、超时都归它管，这里只做「问一句、
+        取一段文本」。工具与流式都不参与 —— 一次非流式 canonical 请求。
+        """
         model = (config.get("model", "") or "").strip()
-        if not api_key or not base_url or not model:
+        llm = self._llm_client(config)
+        if not llm.configured or not model:
             return "", False
         params = self._llm_params(config)
         try:
-            session = await get_http_session()
-            async with session.post(
-                f"{base_url}/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model, "messages": messages, "temperature": params["temperature"], "max_tokens": params["max_tokens_plain"]},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                result = await resp.json()
-                answer = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                return answer, bool(answer)
+            response = await llm.complete(LlmRequest(
+                model=model,
+                messages=messages,
+                temperature=params["temperature"],
+                max_tokens=params["max_tokens_plain"],
+                timeout=30.0,        # 简单调用最多等 30s（与改造前的 ClientTimeout 同值）
+            ))
+            answer = response.message.get("content", "")
+            return answer, bool(answer)
         except Exception as e:
             logger.warning(f"AgentRuntime [{self.key}] LLM plain 调用失败: {e}")
             return "", False

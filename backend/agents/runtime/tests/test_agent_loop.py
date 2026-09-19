@@ -1,12 +1,15 @@
 """AgentLoop 自检（Phase 1：finish_reason / step 级重试 / 闭合语义）
 
-mock 掉 LLM HTTP（agent_loop.get_http_session），不连 DB / 网络 / MCP：响应按脚本
-逐个给出，覆盖 200 正常 / length 截断 / 429 / 5xx / 4xx / 非法响应 / 中途异常，
-断言三件事：
+mock 掉 LLM HTTP（llm.openai_chat.get_http_session —— 唯一发请求的地方），不连 DB /
+网络 / MCP：响应按脚本逐个给出，覆盖 200 正常 / length 截断 / 429 / 5xx / 4xx / 非法
+响应 / 中途异常，断言三件事：
 
   1. Event Log 闭合 —— 每个 step/start 都有配对的 step/end，turn 有且仅有一条 turn/end；
   2. 消息序列合法 —— assistant.tool_calls 的每一项都有配对的 tool 消息；
   3. 失败的尝试不落 surface 事实 —— 重试后 Event Log 里没有半截 assistant。
+
+驱动方式 = **生产路径**（见 `_drive`）：投递 → 等 driver 收敛 → 取答案，Loop 没有
+``run(question) -> str`` 这种一次性入口。
 
 Usage:
     docker compose exec backend python backend/agents/runtime/tests/test_agent_loop.py
@@ -23,10 +26,25 @@ import aiohttp
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 
-from backend.agents.runtime.llm import LoopHooks, RetryDecision  # noqa: E402
+from backend.agents.runtime.llm import (  # noqa: E402
+    CHUNK_FINISH,
+    CHUNK_TEXT,
+    CHUNK_THINKING,
+    CHUNK_TOOL_CALLS,
+    LoopHooks,
+    OpenAiChatClient,
+    RetryDecision,
+    StreamChunk,
+)
+from backend.agents.runtime.llm import openai_chat as client_mod  # noqa: E402
 from backend.agents.runtime.llm import retry as retry_mod  # noqa: E402
-from backend.agents.runtime.loop import agent_loop as loop_mod  # noqa: E402
 from backend.agents.runtime.loop.agent_loop import CANCELLED_REPLY, AgentLoop  # noqa: E402
+from backend.agents.runtime.loop.assistant_stream import AssistantStream  # noqa: E402
+from backend.agents.runtime.loop.inbox import (  # noqa: E402
+    NEXT_STEP,
+    NEXT_TURN,
+    ReactLoopInbox,
+)
 from backend.agents.runtime.session import (  # noqa: E402
     ASSISTANT_MESSAGE,
     LLM_ERROR,
@@ -35,6 +53,8 @@ from backend.agents.runtime.session import (  # noqa: E402
     TOOL_CALL,
     TOOL_RESULT,
     TURN_END,
+    TURN_START,
+    USER_MESSAGE,
     Session,
     SessionToolRecorder,
 )
@@ -126,13 +146,17 @@ class _FakeHTTP:
 
 
 def _install(responses: list) -> _FakeHTTP:
-    """把 LLM HTTP 调用换成本用例的脚本化假响应"""
+    """把 LLM HTTP 调用换成本用例的脚本化假响应
+
+    patch 点是**适配器**（llm/openai_chat.py）—— 它是唯一 import get_http_session 的地方，
+    循环不再碰 HTTP（见 llm/client.py 的契约）。
+    """
     http = _FakeHTTP(responses)
 
     async def _get_session():
         return http
 
-    loop_mod.get_http_session = _get_session
+    client_mod.get_http_session = _get_session
     return http
 
 
@@ -209,27 +233,63 @@ def _loop(*, session=None, config=None, llm_params=None, on_event=None, tool_sch
         "max_steps": 5, "max_tool_calls": 30, "max_wall_time": 300.0, "max_parallel_tools": 4,
         "max_tokens": 1024, "temperature": 0.3, "max_llm_retries": 2, **(llm_params or {}),
     }
+    # 装配 LLM 出口：循环只拿到一个 LlmClient，凭据与端点在这一层搬完就交出去
+    llm = OpenAiChatClient(
+        api_key=cfg.get("api_key", ""), base_url=cfg.get("base_url", ""),
+        max_llm_retries=params["max_llm_retries"],
+    )
     loop = AgentLoop(
-        key="test_agent", config=cfg, llm_params=params, tool_schemas=tool_schemas or [],
-        tenant_id=1, system_prompt="", on_event=on_event, session=session, hooks=hooks,
+        key="test_agent", llm_params=params, llm=llm, model=cfg.get("model", ""),
+        tool_schemas=tool_schemas or [], tenant_id=1, system_prompt="", on_event=on_event,
+        session=session, hooks=hooks, fallback_reply=cfg.get("fallback_reply", ""),
     )
     return loop, session
 
 
+async def _bridge_cancel(loop: AgentLoop, cancel: asyncio.Event) -> None:
+    """外部信号 → loop.cancel（与 AgentRuntime._bridge_cancel 同形）。
+
+    ``keep_inbox=True``：转发只负责叫停，不替投递方丢弃还没投出去的东西。
+    """
+    await cancel.wait()
+    loop.cancel("测试信号", keep_inbox=True)
+
+
+async def _drive(loop: AgentLoop, question: str = "问题", cancel: asyncio.Event | None = None) -> str:
+    """三段式跑一轮：**投递 → 等 driver 收敛 → 取答案**（与 AgentRuntime._drive 同形）。
+
+    自检跑的就是生产路径：Loop 没有一次性入口，谁用谁自己投递、自己等。
+    """
+    bridge = asyncio.create_task(_bridge_cancel(loop, cancel)) if cancel is not None else None
+    try:
+        loop.followup(question)
+        await loop.when_idle()
+    finally:
+        if bridge is not None:
+            bridge.cancel()          # 不 await：它等的信号可能永远不来
+    return loop.answer_text()
+
+
 def _run(loop: AgentLoop, question: str = "问题") -> str:
-    return asyncio.run(loop.run(question))
+    return asyncio.run(_drive(loop, question))
 
 
-def _run_cancelling(loop: AgentLoop, *, after: float = 0.05, question: str = "问题") -> str:
-    """跑一轮并在 after 秒后 set 协作取消信号，返回 run() 的返回值"""
-    cancel = asyncio.Event()
+def _run_cancelling(
+    loop: AgentLoop, *, after: float = 0.05, question: str = "问题", cancel: asyncio.Event | None = None,
+) -> str:
+    """跑一轮并在 after 秒后 set 协作取消信号（兜底），返回本次运行的答案。
+
+    ``cancel`` 由调用方给时**必须就是交给 driver 的那一个**：取消靠的是「同一个 Event
+    被 set」，钩子 set 一个没人读的 Event 等于没取消（假轮次只有亚毫秒，兜底计时器来不及）。
+    """
+    cancel = asyncio.Event() if cancel is None else cancel
 
     async def scenario():
         async def _fire():
             await asyncio.sleep(after)
             cancel.set()
 
-        answer, _ = await asyncio.gather(loop.run(question, None, cancel), _fire())
+        answer, _ = await asyncio.gather(_drive(loop, question, cancel), _fire())
         return answer
 
     return asyncio.run(scenario())
@@ -239,7 +299,7 @@ def _run_with_hard_cancel(loop: AgentLoop, *, after: float = 0.05, question: str
     """跑一轮并在 after 秒后 task.cancel()（硬取消），返回 CancelledError 是否向上传播"""
 
     async def scenario():
-        task = asyncio.create_task(loop.run(question))
+        task = asyncio.create_task(_drive(loop, question))
         await asyncio.sleep(after)
         task.cancel()
         try:
@@ -271,11 +331,13 @@ def _stop_reason(session: Session) -> str:
 
 
 def _assert_closed(session: Session) -> None:
-    """闭合不变式：step/start 与 step/end 严格成对，turn 闭合一次"""
+    """闭合不变式：step/start 与 step/end 严格成对，每个 turn/start 都有配对的 turn/end"""
     started = [e.data["step"] for e in session.log if e.type == STEP_START]
     ended = [e.data["step"] for e in session.log if e.type == STEP_END]
     assert ended == started, f"step 未配对: start={started} end={ended}"
-    assert [e.type for e in session.log if e.type == TURN_END] == [TURN_END]
+    turns = [e.type for e in session.log if e.type in (TURN_START, TURN_END)]
+    starts, ends = turns.count(TURN_START), turns.count(TURN_END)
+    assert starts == ends >= 1, f"turn 未配对: start={starts} end={ends}"
 
 
 def _assert_messages_legal(session: Session) -> list[dict]:
@@ -705,7 +767,8 @@ def test_cancel_between_steps_stops_before_next_step():
     runtime = _FakeRuntime(on_call=cancel.set)
     _with_fake_tools(loop, session, runtime=runtime)
 
-    answer = _run_cancelling(loop, after=0.05)   # 信号其实由工具钩子 set，after 只是兜底
+    # 信号由工具钩子 set（after 只是兜底）—— 它必须就是交给 run() 的那一个
+    answer = _run_cancelling(loop, after=0.05, cancel=cancel)
 
     assert runtime.calls == ["echo"]
     assert _stop_reason(session) == "cancelled"
@@ -780,15 +843,8 @@ def test_cancel_during_tool_execution_records_synthetic_results():
         loop, session, runtime=_FakeRuntime(delay=5.0, on_call=_on_call), max_parallel=2,
     )
 
-    async def scenario():
-        async def _fire():          # 兜底：钩子没触发也不会挂死用例
-            await asyncio.sleep(2.0)
-            cancel.set()
-
-        answer, _ = await asyncio.gather(loop.run("问题", None, cancel), _fire())
-        return answer
-
-    answer = asyncio.run(scenario())
+    # 信号由工具钩子 set，after=2.0 只是兜底（钩子没触发也不会挂死用例）
+    answer = _run_cancelling(loop, after=2.0, cancel=cancel)
 
     assert _stop_reason(session) == "cancelled"
     _assert_closed(session)
@@ -802,13 +858,17 @@ def test_cancel_during_tool_execution_records_synthetic_results():
 
 
 def test_cancel_before_first_step_closes_turn_without_request():
-    """信号在开跑前就置位：不发请求、不开 step，turn 照常闭合"""
-    cancel = asyncio.Event()
-    cancel.set()
+    """投递后立刻叫停（driver 还没开第一步）：不发请求、不开 step，turn 照常闭合"""
     http = _install([_answer()])
     loop, session = _loop()
 
-    answer = asyncio.run(loop.run("问题", None, cancel))
+    async def scenario():
+        loop.followup("问题")                      # 投递：driver 已排班但还没跑
+        loop.cancel("测试信号", keep_inbox=True)    # 同一 tick 内叫停
+        await loop.when_idle()
+        return loop.answer_text()
+
+    answer = asyncio.run(scenario())
 
     assert _stop_reason(session) == "cancelled"
     _assert_closed(session)
@@ -841,7 +901,7 @@ def test_unset_cancel_signal_is_transparent():
     loop, session = _loop(tool_schemas=[_TOOL_SCHEMA])
     runtime = _with_fake_tools(loop, session)
 
-    answer = asyncio.run(loop.run("问题", None, cancel))
+    answer = asyncio.run(_drive(loop, cancel=cancel))
 
     assert answer == "正常完成"
     assert _stop_reason(session) == "completed"
@@ -856,12 +916,250 @@ def test_cancel_signal_does_not_swallow_llm_failure():
     http = _install([_status(401)])
     loop, session = _loop(llm_params={"max_llm_retries": 0})
 
-    answer = asyncio.run(loop.run("问题", None, cancel))
+    answer = asyncio.run(_drive(loop, cancel=cancel))
 
     assert answer == "服务暂时不可用"
     assert _stop_reason(session) == "error"
     assert [(d["code"], d["status"]) for d in _errors(session)] == [("CLIENT", 401)]
     assert len(http.requests) == 1
+
+
+# ── 运行中输入（Phase 3：followup / steer / inject）──
+
+
+def test_inbox_claim_semantics():
+    """claim：先清空全部 next-step；target=next-turn 时再取队首 1 条 next-turn"""
+    inbox = ReactLoopInbox()
+    inbox.append(NEXT_TURN, "a")
+    inbox.append(NEXT_TURN, "b")
+    inbox.append(NEXT_STEP, "s1")
+    inbox.append(NEXT_STEP, "s2")
+
+    assert inbox.has_pending and inbox.next_step_length == 2
+    assert inbox.claim(NEXT_STEP, 1) == ["s1", "s2"]     # 只认领 next-step，next-turn 一条不动
+    assert inbox.next_step_length == 0
+    assert inbox.claim(NEXT_TURN, 1) == ["a"]            # 队首 1 条 next-turn
+    assert inbox.claim(NEXT_TURN, 2) == ["b"]
+    assert not inbox.has_pending
+    assert inbox.claim(NEXT_TURN, 3) == []               # 空队列认领是幂等的
+
+
+def test_inbox_splice_and_clear():
+    """splice 是唯一的写原语（越界收敛），clear 两条队列一起清"""
+    inbox = ReactLoopInbox()
+    for t in ("t1", "t2"):
+        inbox.append(NEXT_TURN, t)
+    for s in ("s1", "s2", "s3"):
+        inbox.append(NEXT_STEP, s)
+
+    assert inbox.splice(NEXT_STEP, 1, 1, ["s9"]) == ["s2"]        # 标准 splice：删 1 插 1
+    assert inbox.splice(NEXT_STEP, 0, 0, []) == []
+    assert inbox.splice(NEXT_STEP, 99, 1, []) == []               # 越界不报错，按实际长度收敛
+
+    inbox.clear()
+    assert not inbox.has_pending
+
+
+def test_three_step_protocol_is_the_entry():
+    """投递 → 等收敛 → 取答案：三段式就是唯一入口（没有 run() 那种一次性包装）"""
+    _install([_answer("事件驱动的答案")])
+    loop, session = _loop()
+
+    async def scenario():
+        loop.followup("问题")            # 投递是同步的：不阻塞、不用 await
+        await loop.when_idle()           # 等待是显式的
+        return loop.last_assistant_text()
+
+    assert asyncio.run(scenario()) == "事件驱动的答案"
+    assert _stop_reason(session) == "completed"
+    _assert_closed(session)
+    _assert_messages_legal(session)
+
+
+def test_inject_does_not_wake_but_is_delivered_on_the_next_wake():
+    """inject 不唤醒：空闲时投它什么都不会发生；下一次唤醒（run / followup）才被认领"""
+    http = _install([_answer("答案")])
+    loop, session = _loop()
+
+    loop.inject("系统侧上下文")
+    assert session.log == []             # 没有唤醒 → 不开轮、不落任何事件
+
+    assert _run(loop) == "答案"
+
+    # next-step 认领在 next-turn **之前**（照搬 A）：注入的内容排在问句前面
+    assert http.requests[0]["messages"] == [
+        {"role": "user", "content": "系统侧上下文"},
+        {"role": "user", "content": "问题"},
+    ]
+
+
+def test_steer_is_claimed_at_the_next_step():
+    """跑工具期间 steer 一条：当前轮的第 2 步就带着它（不打断本轮）"""
+    first = _answer("", finish_reason="tool_calls", tool_calls=[
+        {"id": "c1", "type": "function", "function": {"name": "echo", "arguments": "{}"}},
+    ])
+    http = _install([first, _answer("按新方向做完了")])
+    loop, session = _loop(tool_schemas=[_TOOL_SCHEMA])
+    _with_fake_tools(loop, session, runtime=_FakeRuntime(on_call=lambda: loop.steer("换个方向")))
+
+    assert _run(loop) == "按新方向做完了"
+
+    assert [e.data["content"] for e in session.log if e.type == USER_MESSAGE] == ["问题", "换个方向"]
+    assert [e.data["step"] for e in session.log if e.type == STEP_START] == [1, 2]
+    assert {"role": "user", "content": "换个方向"} in http.requests[1]["messages"]
+    _assert_closed(session)
+    _assert_messages_legal(session)
+
+
+def test_followup_runs_as_a_second_turn():
+    """跑工具期间 followup 一条：本轮收敛后作为**新的一轮**开始（轮次号与步号都重新计）"""
+    first = _answer("", finish_reason="tool_calls", tool_calls=[
+        {"id": "c1", "type": "function", "function": {"name": "echo", "arguments": "{}"}},
+    ])
+    _install([first, _answer("第一轮答案"), _answer("第二轮答案")])
+    loop, session = _loop(tool_schemas=[_TOOL_SCHEMA])
+    _with_fake_tools(loop, session, runtime=_FakeRuntime(on_call=lambda: loop.followup("顺带再做一件事")))
+
+    assert _run(loop) == "第二轮答案"     # run() 取的是**最后一条** assistant 正文
+
+    assert [e.data["turn"] for e in session.log if e.type == TURN_START] == [1, 2]
+    assert [e.data["stop_reason"] for e in session.log if e.type == TURN_END] == ["completed", "completed"]
+    assert [e.data["step"] for e in session.log if e.type == STEP_START] == [1, 2, 1]
+    assert [e.data["content"] for e in session.log if e.type == USER_MESSAGE] == ["问题", "顺带再做一件事"]
+    _assert_closed(session)
+    _assert_messages_legal(session)
+
+
+def test_steer_after_cancel_runs_as_the_next_turn():
+    """取消生效后投的 steer：本轮兑现不了它 → 落到 next-turn，成为下一轮的第一条输入"""
+    _install([
+        _sse(_text_chunk("半截回答"), _Pause(5.0)),
+        _sse(_text_chunk("按 steer 走的答案"), finish_reason="stop"),
+    ])
+    events, sink = _collect_events()
+    loop, session = _loop(on_event=sink)
+
+    async def scenario():
+        loop.followup("问题")
+        await asyncio.sleep(0.05)
+        loop.cancel("用户点了停止")
+        loop.steer("其实是新的问题")       # 本轮已 abort：并入不了，转成下一轮
+        await loop.when_idle()
+
+    asyncio.run(scenario())
+
+    assert [e.data["stop_reason"] for e in session.log if e.type == TURN_END] == ["cancelled", "completed"]
+    assert [e.data["content"] for e in session.log if e.type == USER_MESSAGE] == ["问题", "其实是新的问题"]
+    _assert_closed(session)
+    _assert_messages_legal(session)
+
+
+def test_cancel_clears_inbox_and_stops_the_turn():
+    """cancel()：清掉还没投递的输入 + 置 abort 信号 —— 本轮正常收口成 cancelled"""
+    _install([_sse(_text_chunk("半截回答"), _Pause(5.0))])
+    events, sink = _collect_events()
+    loop, session = _loop(on_event=sink)
+
+    async def scenario():
+        loop.followup("问题")
+        loop.followup("还没投递的下一个问题")     # 排在队列里，会被 cancel 清掉
+        await asyncio.sleep(0.05)
+        loop.cancel("用户点了停止")
+        await loop.when_idle()
+
+    asyncio.run(scenario())
+
+    assert _stop_reason(session) == "cancelled"      # 有且仅有一轮
+    _assert_closed(session)
+    # 被清掉的那条从没进过 LLM 上下文（它不是事实，也没有人承诺过「已投递」）
+    assert [e.data["content"] for e in session.log if e.type == USER_MESSAGE] == ["问题"]
+    assert loop.last_assistant_text() == "半截回答"   # 半截正文照常落盘
+
+
+def test_cancelled_turn_does_not_reuse_the_previous_turn_answer():
+    """多轮会话：被取消的一轮没有半截正文 → 答案必须是停止文案，而不是上一轮的回答"""
+    _install([
+        _sse(_text_chunk("第一轮的答案"), finish_reason="stop"),
+        _sse(_Pause(5.0)),
+    ])
+    events, sink = _collect_events()
+    loop, session = _loop(on_event=sink)
+
+    assert _run(loop, "第一个问题") == "第一轮的答案"
+
+    cancel = asyncio.Event()
+
+    async def scenario():
+        async def _fire():
+            await asyncio.sleep(0.05)
+            cancel.set()
+
+        answer, _ = await asyncio.gather(_drive(loop, "第二个问题", cancel), _fire())
+        return answer
+
+    assert asyncio.run(scenario()) == CANCELLED_REPLY
+
+    assert [e.data["stop_reason"] for e in session.log if e.type == TURN_END] == ["completed", "cancelled"]
+    # 第二轮确实什么都没落下（上一轮的正文还在，但它不属于本轮）
+    assert [e.data["content"] for e in session.log if e.type == ASSISTANT_MESSAGE] == ["第一轮的答案"]
+    _assert_closed(session)
+
+
+# ── LLM 出口：流式累积器 + usage 归一 ──
+
+
+def test_assistant_stream_merges_fragments_and_records_chunk_events():
+    """累积器：分片按 index 拼成完整 message；每个增量**立刻**落成 assistant/chunk 事实"""
+    session = Session()
+    stream = AssistantStream(session)
+    for chunk in (
+        StreamChunk(kind=CHUNK_THINKING, delta="想"),
+        StreamChunk(kind=CHUNK_TEXT, delta="先查"),
+        StreamChunk(kind=CHUNK_TOOL_CALLS, tool_calls=(
+            {"index": 0, "id": "c1", "name": "echo", "arguments": '{"q"'},
+        )),
+        StreamChunk(kind=CHUNK_TOOL_CALLS, tool_calls=(
+            {"index": 0, "id": "", "name": "", "arguments": ': "hi"}'},   # 后续帧只有参数增量
+        )),
+        StreamChunk(kind=CHUNK_FINISH, finish_reason="tool_calls"),
+    ):
+        stream.push(chunk)
+
+    # 拼出来的就是可落库的 assistant message（id/name 不被后续空串抹掉，参数逐帧追加）
+    assert stream.message() == {
+        "role": "assistant",
+        "content": "先查",
+        "tool_calls": [{
+            "id": "c1", "type": "function",
+            "function": {"name": "echo", "arguments": '{"q": "hi"}'},
+        }],
+    }
+    assert stream.finish_reason == "tool_calls"
+    # 推理过程只广播、不混入正文
+    assert [(e.data["kind"], e.data["delta"]) for e in session.log] == [("thinking", "想"), ("text", "先查")]
+
+
+def test_usage_event_carries_canonical_token_fields():
+    """usage 落库用 canonical 名（cache_hit_tokens），provider 名在适配器里就翻完了"""
+    lines = [
+        f"data: {json.dumps(_text_chunk('好'))}\n".encode("utf-8"),
+        f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n".encode("utf-8"),
+        f"data: {json.dumps({'choices': [], 'usage': {'prompt_tokens': 9, 'completion_tokens': 3, 'prompt_cache_hit_tokens': 7, 'prompt_cache_miss_tokens': 2}})}\n".encode("utf-8"),
+        b"data: [DONE]\n",
+    ]
+    _install([_Resp(lines=lines)])
+    events, sink = _collect_events()
+    loop, session = _loop(on_event=sink)
+
+    assert _run(loop) == "好"
+
+    assert [e.data for e in session.log if e.type == "llm/usage"] == [{
+        "step": 1,
+        "prompt_tokens": 9,
+        "completion_tokens": 3,
+        "cache_hit_tokens": 7,
+        "cache_miss_tokens": 2,
+    }]
 
 
 # ── 运行器 ──

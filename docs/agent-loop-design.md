@@ -1,6 +1,6 @@
 # Agent Loop 设计（第三阶段：运行中输入 + 循环拦截点）
 
-> 状态：**待拍板**（本文只定契约与形态，不含实现；§5、§6.3 的决策定了再动手）
+> 状态：**循环本体已落地**（§2 / §3 的语义，见 §8）；**§4 / §5 待拍板**（投递端点与单飞）
 > 参考：DeepSeek Harness `dsh-agent-loop`（`inbox.ts` 双队列 · `agent.ts` 四个 waterfall）· `dsh-agent`（事件契约）
 > 关联代码：`backend/agents/runtime/loop/agent_loop.py` · `agent_runtime.py` · `backend/api/agents.py`
 > 前置：Phase 1（健壮性：finish_reason / 重试 / 闭合）· Phase 2（取消通道）已落地
@@ -166,3 +166,61 @@ agent_loop.py，解耦只做了一半。对齐 A 的 `RequestErrorAction`（`{ki
 | Phase 2 的取消（`cancel` 信号 / `RunCancelled`） | §4 的 RunRegistry 是它更合适的持有者；取消语义不变 |
 | Phase 2 的硬取消传播 | 钩子不得吞 `CancelledError`（§6.3 规矩 1） |
 | 崩溃修复（`session/repair.py`） | steer 队列也需要 `repair.py` 同款待遇：冷恢复时未投递的输入不该消失（§3 的投影负责） |
+
+## 8. 已落地（本批）：Loop 的事件驱动化
+
+`loop/agent_loop.py` + `loop/inbox.py` 已按 §2 / §3 的语义改造，`run(question) -> str` **已删除** ——
+调用方走三段式：**投递（`followup`/`steer`/`inject`）→ 等待（`when_idle`）→ 取答案
+（`answer_text`）**（AgentRuntime.reply 是第一个消费者，中间那段时间就是运行中输入的窗口）：
+
+- **投递**：`followup` / `steer` / `inject` 三个动作，`next-turn` / `next-step` 两条队列
+  （`ReactLoopInbox`）。认领在**每步开头**（`claim`）：本轮第一步取 next-turn、之后每步取
+  next-step；认领到的消息**立刻**落成 `user/message` 事实，于是本步的 `derive_messages()`
+  自然带上它 —— 队列只是「已受理、还没投递」，不是第二份对话历史。
+- **driver**：相位机 `_Idle` / `_Running(abort, turn, step, wake_requested)`；`wake_driver`
+  空闲时拉起 `_kick`，`_kick` 连续开轮直到队列为空，`when_idle()` 等它收敛。每轮配一个
+  `abort`（上一轮的取消不延续到下一轮）；`cancel(cause, keep_inbox=False)` 清队列 + 置信号。
+  已取消的轮次兑现不了新的唤醒：输入转投 next-turn 并闩住，收敛后重放（§2 的闩锁）。
+- **答案出口**：`answer_text()` = `last_assistant_text()`（从 Session 事件里取最后一条
+  `assistant/message`，按本次 driver 活动划界）+ B 的兜底文案（模型没正文时按 stop_reason
+  说清「为什么停」）。答案不再做成「运行返回值」的第二份状态。
+- **取消的搬运**：外部信号（SSE 连接断开）由调用方转发成 `loop.cancel(...)` —— 取消的
+  语义（清队列 + 置本轮 abort 信号）归 Loop，装配层只搬不解释（AgentRuntime._bridge_cancel）。
+
+**本批刻意没做的部分**：
+
+| 未做 | 现状 / 影响 |
+|---|---|
+| §3 的**持久化**队列（`steer/queued` + `project_pending_input`） | 队列只在内存：进程重启丢待投递输入。还没有对外开放的投递端点，所以这个边界对用户不可见 |
+| §5 的投递端点（`/chat/steer`）与前端「并入当前轮」 | 端点未开 —— §5.1 的三个决策仍未拍板 |
+| §4 的 `RunRegistry` 同 session 单飞 | 优先级**升高**：一轮现在可以连开多个 turn，并发的交错窗口比改造前更大 |
+| §6.2 的 `pre_step` / `request` / `turn_stopping` | 未实现；`_StepDecision` 就是 `pre_step` 的落点 |
+
+## 9. 已落地：LLM 出口抽层（循环不再认识 wire）
+
+对齐 A 的 `packages/llm/`（`llm` 核心 + `llm-deepseek` 适配器）——**循环发出的请求里没有
+凭据、没有端点**，wire 全归适配器：
+
+| 文件 | 职责 |
+|---|---|
+| `llm/types.py` | canonical 词汇：`LlmRequest`（含规范选项 `stream` / `timeout`）· `LlmResponse` · `StreamChunk` · `TokenUsage` |
+| `llm/client.py` | **循环唯一认识的 LLM 出口**：`configured` / `retry_policy` / `complete` / `stream` |
+| `llm/openai_chat.py` | 适配器：`base_url` · `api_key` · HTTP · SSE 组帧 · 状态码→失败码 · usage 字段名翻译 |
+| `loop/assistant_stream.py` | 流式累积器（对齐 A 的 `assistant-stream.ts`）：分片 → 完整 message + `assistant/chunk` 事实 |
+
+- **分层判据**：适配器**不写 Session 事件、不吞取消**；循环**不认识 aiohttp / api_key /
+  base_url / SSE**。「半截正文」语义（`RunCancelled.partial`）随增量落库一起归循环。
+- **策略归 provider、执行归循环**：客户端暴露 `retry_policy`（provider 声明的默认策略，
+  对齐 A 的 `providerRetryPolicy`），装配层在没传 `hooks.request_error` 时用它 ——
+  换 provider 顺带换退避曲线，不用动循环。
+- **usage 归一**：`prompt_cache_hit_tokens` → `cache_hit_tokens`，翻译只在适配器里做一次；
+  投影侧用 `events.usage_field()` 两种名字都认（存量事件还要读得出来），UI 帧暂时两个名字
+  都发（前端迁完可删旧名）。
+- **`_safe_name` / tool name_map 留在循环**：工具名身份不是 wire 问题（模型返回的名字还要
+  反查回真工具），适配器只认「canonical 名字怎么写进 wire」。
+- 验证：`tests/test_llm_client.py`（适配器边界）+ `tests/test_agent_loop.py` 原有 39 项
+  **一条断言未改**即通过（只换了 patch 点：`openai_chat.get_http_session`）。
+
+**还没做的**：`purpose`（辅助调用的分类，title/router 迁移时加）· `tool_choice` 的 canonical
+字段（router 的 `required`）· `resolveModelInfo`（上下文窗口 / 默认 max_tokens）· title /
+router / paper 三个仍在裸发 HTTP 的调用方。
