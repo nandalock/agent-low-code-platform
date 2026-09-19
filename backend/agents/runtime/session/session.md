@@ -73,8 +73,9 @@ session.add_listener(on_event)
 session.remove_listener(on_event)      # 幂等（不存在时静默）
 ```
 
-典型用法见 `agent_runtime.py:174-183`：`TraceProjection` 与 UI 的 `session_event_sink` 只在
-`loop.run()` 期间挂载，`finally` 统一摘除——Session 被 SessionStore 跨轮复用，不摘会跨轮泄漏。
+典型用法见 `agent_runtime.py` 的 `reply()`：`TraceProjection` 与 UI 的 `session_event_sink`
+只在**一次驱动**（`loop.followup()` → `await loop.when_idle()`）期间挂载，`finally` 统一
+摘除——Session 被 SessionStore 跨轮复用，不摘会跨轮泄漏。
 
 ### 预创建会话（工作区场景）
 

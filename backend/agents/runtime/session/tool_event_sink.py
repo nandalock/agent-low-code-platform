@@ -18,13 +18,13 @@ tool_call_id 在构造时绑定（一次 Tool 调用一个 sink）：Session 的
 """
 import logging
 
-from backend.agents.runtime.events import EventSink
-from backend.agents.runtime.session import (
+from backend.agents.runtime.loop.events import EventSink
+from backend.agents.runtime.session.events import (
     APPROVAL_REQUEST,
     SANDBOX_ESCALATION,
     TOOL_PROGRESS,
-    Session,
 )
+from backend.agents.runtime.session.session import Session
 from backend.tool_system.events import APPROVAL_REQUEST as APPROVAL_REQUEST_EVENT
 from backend.tool_system.events import SANDBOX_ESCALATION as SANDBOX_ESCALATION_EVENT
 from backend.tool_system.events import TOOL_PROGRESS as TOOL_PROGRESS_EVENT

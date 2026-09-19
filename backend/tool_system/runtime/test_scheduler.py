@@ -21,7 +21,7 @@ from backend.agents.runtime.session import (  # noqa: E402
     TURN_START,
     Session,
 )
-from backend.agents.runtime.session_tool_recorder import SessionToolRecorder  # noqa: E402
+from backend.agents.runtime.session import SessionToolRecorder  # noqa: E402
 from backend.tool_system.context import ToolContext  # noqa: E402
 from backend.tool_system.registry.descriptor import (  # noqa: E402
     EXCLUSIVE,

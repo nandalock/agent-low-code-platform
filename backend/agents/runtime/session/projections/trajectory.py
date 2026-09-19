@@ -25,7 +25,7 @@ usage）供 SSE 实时推送。这是「Session Event → Conversation Node → 
 import json
 import logging
 
-from backend.agents.runtime.session.events import SessionEvent
+from backend.agents.runtime.session.events import SessionEvent, usage_field
 
 logger = logging.getLogger(__name__)
 
@@ -306,12 +306,23 @@ class TrajectoryProjection:
         return out
 
     def _on_usage(self, d: dict) -> list[dict]:
+        """usage 事件 → UI 帧。
+
+        缓存字段读 canonical 名（cache_hit_tokens / cache_miss_tokens）并兼容存量事件的
+        provider 名（prompt_cache_*，见 events.usage_field）—— 两个名字都发出去：旧名给
+        现有前端（lib/trajectory.ts 的 UsageRow 读的是它），归一后的名字给后续消费方。
+        前端迁到新名后，旧名可以删。
+        """
+        hit = usage_field(d, "cache_hit_tokens", "prompt_cache_hit_tokens")
+        miss = usage_field(d, "cache_miss_tokens", "prompt_cache_miss_tokens")
         u = {
             "step": d.get("step"),
             "prompt_tokens": d.get("prompt_tokens"),
             "completion_tokens": d.get("completion_tokens"),
-            "prompt_cache_hit_tokens": d.get("prompt_cache_hit_tokens"),
-            "prompt_cache_miss_tokens": d.get("prompt_cache_miss_tokens"),
+            "cache_hit_tokens": hit,
+            "cache_miss_tokens": miss,
+            "prompt_cache_hit_tokens": hit,
+            "prompt_cache_miss_tokens": miss,
         }
         self.usage.append(u)
         return [{"type": "usage", **u}]

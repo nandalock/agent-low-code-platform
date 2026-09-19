@@ -19,7 +19,7 @@ import logging
 from collections.abc import Callable
 
 from backend.agents.base import BaseAgent, AgentReply
-from backend.agents.runtime.events import EventSink
+from backend.agents.runtime.loop.events import EventSink
 from backend.agents.runtime.session import SessionEvent
 from backend.gateway.context import RequestContext
 from backend.gateway.errors import AgentNotFound, InvalidGatewayContext

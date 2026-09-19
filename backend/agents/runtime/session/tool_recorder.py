@@ -16,7 +16,8 @@ ToolScheduler（tool_system 层）不依赖 agents 层：它只认
 """
 import json
 
-from backend.agents.runtime.session import TOOL_CALL, TOOL_RESULT, Session
+from backend.agents.runtime.session.events import TOOL_CALL, TOOL_RESULT
+from backend.agents.runtime.session.session import Session
 from backend.tool_system.runtime.scheduler import PlannedCall
 
 
